@@ -1,6 +1,6 @@
 # Guest comparator execution
 
-Status: sort/search models have focused tests; production callback integration and native verification are pending. This document records acceptance requirements, not completed functionality.
+Status: sort/search models and focused native callback execution pass. The matching full startup regression passes: `qsort` and `bsearch` bind, and the next unresolved export is `__stdinp` (`callback-entry.log`). Game main has not executed. The acceptance matrix below is broader than the current native fixtures and must not be read as a list of completed checks.
 
 The isolated model tests can be reproduced from the repository root without a native runtime archive:
 
@@ -10,6 +10,10 @@ rustc --edition=2024 --test -D warnings rust/verification/compare_models.rs -o /
 ```
 
 These six tests verify model behavior only; they do not establish callback execution or safe runtime memory ownership.
+
+Three independent memory-boundary tests pass with warnings denied in an isolated source snapshot (`callback-memory-review.log`). They cover overlapping writes against two return slots, scalar/copy/atomic write paths, slot retirement and owned-backing identity across mapping rebuilds. The integrated runtime must still demonstrate that it installs and retains these guards on every callback path.
+
+The matching callback snapshot passes 323 unit tests, three integration tests and strict all-target Clippy (`callback-snapshot-tests.log`, `callback-snapshot-clippy.log`). Focused native execution passes the actual SDL wrappers and display-mode comparator, signed integer sorting/search, nested callbacks and a rejected active-array free. Exact comparison logs match uninterrupted, forced-quantum and blocking-sleep runs (`sort-search-native.log`). This does not yet cover every mutex/semaphore tail-return combination or second-worker invalidation listed below.
 
 The startup fixture currently stops at `qsort`. Implementing it requires executing the guest's comparator through the ARM64 translator. `bsearch` requires the same mechanism. A guest address must never be invoked as a Rust or host function pointer.
 
@@ -30,6 +34,8 @@ Check array multiplication and end-address arithmetic before nontrivial executio
 No borrowed `Memory` object may survive a callback. Reconstruct mappings on resume. Standalone hosts remain responsible for retaining the exact image backing supplied to the executor; equal bytes at a reused address are insufficient. Arbitrary externally borrowed data is not safe to retain across callback suspension.
 
 A swap is committed only after its request identity, both complete destination ranges, all live return slots and bounded scratch allocation have been checked. Read the records after the preceding comparator finishes. A guard failure must retain the pending swap without rerunning that comparison. A completed request cannot be accepted twice.
+
+The current runtime treats a callback guard failure as a process fault: it retains active frame ownership and rejects further execution. It does not expose a repair-and-retry API for the failed swap. Normal quantum and service suspensions remain resumable; the model's request-retention tests alone do not prove runtime fault recovery.
 
 Trivial sorting of zero or one element, and searching zero elements, requires no array or comparator access. Nontrivial zero-size elements and configured capacity limits currently have explicit unsupported boundaries. Those limits must not be reported as full libc compatibility.
 

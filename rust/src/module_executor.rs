@@ -57,6 +57,14 @@ impl Drop for ExecutionStack {
         }
     }
 }
+fn retained_overlap(
+    semaphores: &crate::guest_semaphore::GuestSemaphore,
+    callbacks: &crate::guest_callback::Registry,
+    address: u64,
+    length: usize,
+) -> bool {
+    semaphores.has_pending_overlap(address, length) || callbacks.overlaps(address, length)
+}
 const ERROR_TEXT: u64 = 0x7fff00000000;
 // Disjoint from the 128-byte ERROR_TEXT buffer. Owned per executor; future
 // multi-thread guest execution will need per-guest-thread network errno slots.
@@ -87,6 +95,61 @@ fn semaphore_storage_owned(
             && end <= s.address + s.length as u64
             && backing == s.backing + (address - s.address) as usize
     }))
+}
+fn callback_stack_slot(
+    sp: u64,
+    stack_address: u64,
+    array: u64,
+    length: usize,
+    key: Option<u64>,
+) -> Result<u64> {
+    let callback_sp = (sp.checked_sub(144).ok_or("Comparator stack underflow")? & !15)
+        .checked_sub(8)
+        .ok_or("Comparator alignment underflow")?;
+    let low = callback_sp
+        .checked_sub(128)
+        .filter(|&low| low >= stack_address)
+        .ok_or("Comparator red zone exceeds owned stack")?;
+    let array_end = array
+        .checked_add(length as u64)
+        .ok_or("Comparator array overflow")?;
+    if (array < sp && low < array_end) || key.is_some_and(|key| key >= low && key < sp) {
+        return Err("Comparator entry/red zone overlaps array or key storage".into());
+    }
+    Ok(callback_sp)
+}
+fn callback_storage(
+    memory: &Memory<'_>,
+    address: u64,
+    length: usize,
+    images: &[(u64, usize)],
+    stacks: &[StackIdentity],
+) -> Result<(u64, usize)> {
+    memory.read(address, length)?;
+    let end = address
+        .checked_add(length as u64)
+        .ok_or("Comparator backing overflow")?;
+    if let Some((base, size)) = memory.owned_region_range(address) {
+        if end <= base + size as u64 {
+            return Ok((base, size));
+        }
+    }
+    if let Some(&(base, size)) = images
+        .iter()
+        .find(|&&(base, size)| address >= base && end <= base + size as u64)
+    {
+        return Ok((base, size));
+    }
+    let backing = memory.read(address, length)?.as_ptr() as usize;
+    if let Some(stack) = stacks.iter().find(|s| {
+        s.lease.strong_count() != 0
+            && address >= s.address
+            && end <= s.address + s.length as u64
+            && backing == s.backing + (address - s.address) as usize
+    }) {
+        return Ok((stack.address, stack.length));
+    }
+    Err("Comparator requires owned allocation, retained stack or retained image backing".into())
 }
 fn guard_semaphore_plan(
     memory: &Memory<'_>,
@@ -254,6 +317,7 @@ mod equeue_return_tests {
                 .register_stack(address, &stack, &stack_lease)
                 .unwrap();
             Continuation {
+                callbacks: None,
                 stack_lease,
                 quantum: None,
                 return_convention: ReturnConvention::WorkerPointer,
@@ -609,6 +673,8 @@ pub enum Service {
     Setenv,
     Wcslen,
     Wcstombs,
+    Qsort,
+    Bsearch,
     Wcsstr,
     Wcscmp,
     Wcsncmp,
@@ -781,6 +847,8 @@ impl Service {
             | Self::Setenv
             | Self::Wcslen
             | Self::Wcstombs
+            | Self::Qsort
+            | Self::Bsearch
             | Self::Wcsstr
             | Self::Wcscmp
             | Self::Wcsncmp
@@ -925,6 +993,7 @@ impl ReturnConvention {
     }
 }
 pub struct Continuation {
+    callbacks: Option<crate::guest_callback::Context>,
     stack_lease: Rc<()>,
     quantum: Option<u64>,
     return_convention: ReturnConvention,
@@ -994,6 +1063,9 @@ impl Continuation {
         }
         if let Some(owner) = allocations {
             memory.attach_owned(owner)?;
+        }
+        if let Some(callbacks) = &self.callbacks {
+            memory.set_write_barriers(callbacks.registry.barriers());
         }
         operation(&mut memory)
     }
@@ -1271,6 +1343,8 @@ enum Flow {
 }
 type EnvironmentCompletion = Option<(u64, Option<i32>, bool)>;
 pub struct NativeExecutor {
+    callback_ranges: crate::guest_callback::Registry,
+    callback_faults: crate::guest_callback::Faults,
     system_profile: Option<crate::guest_system::GuestSystemProfile>,
     system_profile_locked: bool,
     signal_actions: crate::guest_signal_action::Store,
@@ -1361,9 +1435,12 @@ impl NativeExecutor {
         Ok(())
     }
     fn protect_stack(&self, address: u64, bytes: Vec<u8>, lease: Rc<()>) -> ExecutionStack {
-        let pending = Rc::new(Cell::new(
-            self.semaphores.has_pending_overlap(address, bytes.len()),
-        ));
+        let pending = Rc::new(Cell::new(retained_overlap(
+            &self.semaphores,
+            &self.callback_ranges,
+            address,
+            bytes.len(),
+        )));
         ExecutionStack {
             lease,
             bytes,
@@ -1438,7 +1515,15 @@ impl NativeExecutor {
         let terminal = saved.cpu.stop == 3;
         let target = if terminal {
             if return_address != u64::MAX
-                || return_sp != saved.stack_address + saved.stack.len() as u64 - 8
+                || !(saved
+                    .callbacks
+                    .as_ref()
+                    .is_some_and(|context| context.authentic_return(return_sp, return_address))
+                    || (return_sp == saved.stack_address + saved.stack.len() as u64 - 8
+                        && saved
+                            .callbacks
+                            .as_ref()
+                            .is_none_or(|context| context.frames.is_empty())))
                 || saved.cpu.registers[4] != return_sp
             {
                 return Err("Semaphore terminal return changed".into());
@@ -1591,7 +1676,10 @@ impl NativeExecutor {
                             && segment.address < end
                     })
                 });
-            if !data_overlap && !image_overlap {
+            if !data_overlap
+                && !image_overlap
+                && !self.callback_ranges.overlaps(address, self.stack_size)
+            {
                 selected = Some(address);
                 break;
             }
@@ -1620,6 +1708,7 @@ impl NativeExecutor {
         Ok(QuantumYield {
             owner: self.mutex_wait_owner.clone(),
             continuation: Some(Continuation {
+                callbacks: None,
                 stack_lease,
                 quantum: self.worker_quantum,
                 return_convention: ReturnConvention::WorkerPointer,
@@ -1703,11 +1792,8 @@ impl NativeExecutor {
         self.exit_context.as_ref().map(|context| context.cpu.fuel)
     }
     pub(crate) fn require_running(&self) -> Result<()> {
-        if !self.fault_stack.borrow().is_empty() {
-            return Err(
-                "Guest stack retirement blocked by a pending semaphore; process fault pinned"
-                    .into(),
-            );
+        if !self.fault_stack.borrow().is_empty() || !self.callback_faults.borrow().is_empty() {
+            return Err("Guest stack or callback retirement fault pinned".into());
         }
         if let Some(request) = self.exit_request {
             return Err(format!(
@@ -2111,6 +2197,8 @@ impl NativeExecutor {
         let mut tls = crate::guest_tls::GuestTls::default();
         tls.register_thread(MAIN_GUEST_THREAD)?;
         Ok(Self {
+            callback_ranges: crate::guest_callback::Registry::default(),
+            callback_faults: Rc::new(RefCell::new(Vec::new())),
             system_profile: None,
             system_profile_locked: false,
             signal_actions: crate::guest_signal_action::Store::default(),
@@ -2393,7 +2481,21 @@ impl NativeExecutor {
         let cpu = &continuation.cpu;
         let sp = cpu.registers[4];
         let popped = sp.checked_add(8).ok_or("Mutex return stack overflow")?;
+        let callback_terminal = continuation
+            .callbacks
+            .as_ref()
+            .is_some_and(|context| context.authentic_return(sp, wait.ret));
         let target = if wait.terminal {
+            if wait.ret != u64::MAX
+                || (!callback_terminal
+                    && (sp != continuation.stack_address + continuation.stack.len() as u64 - 8
+                        || continuation
+                            .callbacks
+                            .as_ref()
+                            .is_some_and(|context| !context.frames.is_empty())))
+            {
+                return Err("Mutex terminal return changed".into());
+            }
             None
         } else {
             let block = self
@@ -2446,15 +2548,20 @@ impl NativeExecutor {
         let mut continuation = wait.continuation.take().unwrap();
         continuation.cpu.registers[4] = popped;
         continuation.cpu.registers[0] = value as u32 as u64;
-        if terminal {
+        if terminal && callback_terminal {
+            continuation.cpu.registers[4] = sp;
+            continuation.cpu.stop = 3;
+        } else if terminal {
             return Ok(Some(
                 continuation
                     .return_convention
                     .completed(value as u32 as u64),
             ));
         }
-        continuation.cpu.rip = continuation.cpu.next_rip;
-        continuation.cpu.stop = 0;
+        if !callback_terminal {
+            continuation.cpu.rip = continuation.cpu.next_rip;
+            continuation.cpu.stop = 0;
+        }
         self.execute_flow(
             image,
             0,
@@ -2636,7 +2743,16 @@ impl NativeExecutor {
         data: &mut [DataRegion<'_>],
         slice: &mut (Option<u64>, u64),
     ) -> Result<Flow> {
-        let (continuation, environment_completion) = resume;
+        let (mut continuation, environment_completion) = resume;
+        let mut callbacks = continuation
+            .as_mut()
+            .and_then(|saved| saved.callbacks.take())
+            .unwrap_or_else(|| {
+                crate::guest_callback::Context::new(
+                    self.callback_ranges.clone(),
+                    self.callback_faults.clone(),
+                )
+            });
         let (address, arguments, initial_convention) = entry;
         let caller_bias = image.bias;
         let (
@@ -2664,7 +2780,7 @@ impl NativeExecutor {
                     let end = candidate
                         .checked_add(self.stack_size as u64)
                         .ok_or("Guest stack address overflow")?;
-                    let mut overlap = false;
+                    let mut overlap = self.callback_ranges.overlaps(candidate, self.stack_size);
                     for region in data.iter() {
                         let region_end = region
                             .address
@@ -2690,10 +2806,12 @@ impl NativeExecutor {
             }
         };
         let stack_length = stack.len();
-        let pending_stack = Rc::new(Cell::new(
-            self.semaphores
-                .has_pending_overlap(stack_address, stack_length),
-        ));
+        let pending_stack = Rc::new(Cell::new(retained_overlap(
+            &self.semaphores,
+            &self.callback_ranges,
+            stack_address,
+            stack_length,
+        )));
         let mut stack = ExecutionStack {
             lease: stack_lease.clone(),
             bytes: stack,
@@ -2827,6 +2945,7 @@ impl NativeExecutor {
         {
             return Err("Service thunk overlaps mapped guest bytes".into());
         }
+        memory.set_write_barriers(callbacks.registry.barriers());
         let mut cpu = if let Some(cpu) = saved_cpu {
             cpu
         } else {
@@ -2844,11 +2963,14 @@ impl NativeExecutor {
             cpu.registers[6] = arguments.pointer;
             cpu
         };
+        memory.set_write_barriers(callbacks.registry.barriers());
         macro_rules! completed {
             ($value:expr) => {{
                 let value = $value;
+                if !callbacks.frames.is_empty() { return Err("Process return bypasses active comparator frame".into()); }
                 drop(memory);
-                let pinned = self.semaphores.has_pending_overlap(stack_address, stack.len());
+                let pinned = retained_overlap(&self.semaphores, &self.callback_ranges, stack_address, stack.len());
+                pending_stack.set(pinned);
                 if pinned {
                     pending_stack.set(true);
                     return Err("Guest returned while its stack contains a pending semaphore; process fault pinned".into());
@@ -2860,11 +2982,12 @@ impl NativeExecutor {
             if let Some(error) = error {
                 memory.store(errno, error as u64, 4)?;
             }
-            if terminal {
+            if terminal && !callbacks.authentic_return(cpu.registers[4], u64::MAX) {
                 completed!(cpu.registers[0]);
             }
         }
         for transition in 0..remaining {
+            memory.set_write_barriers(callbacks.registry.barriers());
             if slice.0.is_some() && slice.1 == 0 {
                 if cpu.fault != 0 {
                     return Err(format!(
@@ -2884,6 +3007,7 @@ impl NativeExecutor {
                     QuantumYield {
                         owner: self.mutex_wait_owner.clone(),
                         continuation: Some(Continuation {
+                            callbacks: Some(callbacks),
                             stack_lease: stack_lease.clone(),
                             quantum: slice.0,
                             return_convention,
@@ -2916,6 +3040,7 @@ impl NativeExecutor {
                             bias: missing_bias,
                             target: missing_target,
                             continuation: Box::new(Continuation {
+                                callbacks: Some(callbacks),
                                 stack_lease: stack_lease.clone(),
                                 quantum: slice.0,
                                 return_convention,
@@ -2930,6 +3055,102 @@ impl NativeExecutor {
                     }
                 }};
             }
+            if callbacks.frames.last().is_some_and(|frame| !frame.waiting) {
+                use crate::guest_compare::Event;
+                let frame = callbacks.frames.last_mut().unwrap();
+                if frame.pending.is_none() {
+                    frame.pending = Some(frame.engine.next()?);
+                }
+                match frame.pending.as_ref().unwrap() {
+                    Event::Compare { left, right, .. } => {
+                        let (left, right, comparator, callback_sp) =
+                            (*left, *right, frame.comparator, frame.callback_sp);
+                        let target_bias = owner(comparator)?;
+                        let target = comparator
+                            .checked_sub(target_bias)
+                            .ok_or("Comparator below image")?;
+                        if block_at(target_bias, target).is_none() {
+                            translation_miss!(target_bias, target);
+                        }
+                        if !memory.executable(comparator) || block_at(target_bias, target).is_none()
+                        {
+                            return Err("Unregistered comparator target".into());
+                        }
+                        if memory.load(callback_sp, 8)? != u64::MAX {
+                            return Err("Comparator return token changed".into());
+                        }
+                        if cpu.fuel == 0 {
+                            return Err("Comparator dispatch fuel exhausted".into());
+                        }
+                        cpu.fuel -= 1;
+                        self.consumed_instruction_fuel += 1;
+                        slice.1 = slice.1.saturating_sub(1);
+                        callbacks.frames.last_mut().unwrap().waiting = true;
+                        cpu.registers[7] = left;
+                        cpu.registers[6] = right;
+                        cpu.registers[4] = callback_sp;
+                        cpu.bias = target_bias;
+                        cpu.rip = target;
+                        cpu.stop = 0;
+                        continue;
+                    }
+                    Event::Swap {
+                        request,
+                        left,
+                        right,
+                        size,
+                    } => {
+                        frame.engine.validate_swap(request)?;
+                        let (left, right, size) = (*left, *right, *size as usize);
+                        memory.validate_write(left, size)?;
+                        memory.validate_write(right, size)?;
+                        if cpu.fuel == 0 {
+                            return Err("Comparator swap fuel exhausted".into());
+                        }
+                        let mut first = Vec::new();
+                        let mut second = Vec::new();
+                        first
+                            .try_reserve_exact(size)
+                            .map_err(|_| "Cannot reserve first comparator swap snapshot")?;
+                        second
+                            .try_reserve_exact(size)
+                            .map_err(|_| "Cannot reserve second comparator swap snapshot")?;
+                        first.extend_from_slice(memory.read(left, size)?);
+                        second.extend_from_slice(memory.read(right, size)?);
+                        memory.write(left, &second)?;
+                        memory.write(right, &first)?;
+                        let Some(Event::Swap { request, .. }) = frame.pending.take() else {
+                            unreachable!()
+                        };
+                        frame.engine.swapped(request)?;
+                        cpu.fuel -= 1;
+                        self.consumed_instruction_fuel += 1;
+                        slice.1 = slice.1.saturating_sub(1);
+                        continue;
+                    }
+                    Event::Done(value) => {
+                        let value = *value;
+                        if memory.load(frame.return_sp, 8)? != frame.return_address {
+                            return Err("Comparator parent return changed".into());
+                        }
+                        let frame = callbacks.frames.pop().unwrap();
+                        cpu.registers = frame.registers;
+                        cpu.registers[0] = value;
+                        cpu.bias = frame.return_bias;
+                        cpu.next_rip = frame.return_offset;
+                        cpu.registers[4] = frame.return_sp;
+                        if frame.terminal {
+                            cpu.stop = 3;
+                        } else {
+                            cpu.registers[4] += 8;
+                            cpu.rip = frame.return_offset;
+                            cpu.stop = 0;
+                        }
+                        drop(frame);
+                        continue;
+                    }
+                }
+            }
             if cpu.fault != 0 {
                 return Err(format!(
                     "Module guest fault {} at {:#x}",
@@ -2938,6 +3159,11 @@ impl NativeExecutor {
             }
             if cpu.stop == 3 {
                 let target = memory.load(cpu.registers[4], 8)?;
+                if callbacks.authentic_return(cpu.registers[4], target) {
+                    callbacks.accept_return(cpu.registers[0])?;
+                    cpu.stop = 0;
+                    continue;
+                }
                 if target == u64::MAX && cpu.registers[4] == top {
                     completed!(cpu.registers[0]);
                 }
@@ -2977,6 +3203,7 @@ impl NativeExecutor {
                         self.consumed_instruction_fuel += 1;
                         drop(memory);
                         self.exit_context = Some(Box::new(Continuation {
+                            callbacks: Some(callbacks),
                             stack_lease: stack_lease.clone(),
                             quantum: slice.0,
                             return_convention,
@@ -2997,7 +3224,10 @@ impl NativeExecutor {
                             .checked_add(cpu.next_rip)
                             .ok_or("Service return overflow")?
                     };
-                    let terminal = tail && ret == u64::MAX && cpu.registers[4] == top;
+                    let terminal = tail
+                        && ret == u64::MAX
+                        && (callbacks.authentic_return(cpu.registers[4], ret)
+                            || (cpu.registers[4] == top && callbacks.frames.is_empty()));
                     if !terminal {
                         let return_bias = owner(ret)?;
                         let return_offset = ret
@@ -3103,10 +3333,12 @@ impl NativeExecutor {
                             None
                         };
                         let outcome = self.semaphores.commit(&mut memory, plan)?;
-                        pending_stack.set(
-                            self.semaphores
-                                .has_pending_overlap(stack_address, stack_length),
-                        );
+                        pending_stack.set(retained_overlap(
+                            &self.semaphores,
+                            &self.callback_ranges,
+                            stack_address,
+                            stack_length,
+                        ));
                         if let Some(mut request) = pending {
                             if terminal {
                                 cpu.stop = 3;
@@ -3116,6 +3348,7 @@ impl NativeExecutor {
                             cpu.memory = 0;
                             drop(memory);
                             request.continuation = Some(Continuation {
+                                callbacks: Some(callbacks),
                                 stack_lease: stack_lease.clone(),
                                 quantum: slice.0,
                                 return_convention,
@@ -3207,6 +3440,7 @@ impl NativeExecutor {
                                 owner: self.mutex_wait_owner.clone(),
                                 operation,
                                 continuation: Some(Continuation {
+                                    callbacks: Some(callbacks),
                                     stack_lease: stack_lease.clone(),
                                     quantum: slice.0,
                                     return_convention,
@@ -3238,6 +3472,7 @@ impl NativeExecutor {
                         let arguments = [7, 6, 2, 1, 8, 9].map(|i| cpu.registers[i]);
                         drop(memory);
                         let continuation = Box::new(Continuation {
+                            callbacks: Some(callbacks),
                             stack_lease: stack_lease.clone(),
                             quantum: slice.0,
                             return_convention,
@@ -3272,7 +3507,109 @@ impl NativeExecutor {
                             },
                         ));
                     }
-                    let value = if let Some(value) = semaphore_value {
+                    let value = if matches!(service, Service::Qsort | Service::Bsearch) {
+                        let search = matches!(service, Service::Bsearch);
+                        let (base, count, size, comparator, key) = if search {
+                            (
+                                cpu.registers[6],
+                                cpu.registers[2],
+                                cpu.registers[1],
+                                cpu.registers[8],
+                                cpu.registers[7],
+                            )
+                        } else {
+                            (
+                                cpu.registers[7],
+                                cpu.registers[6],
+                                cpu.registers[2],
+                                cpu.registers[1],
+                                0,
+                            )
+                        };
+                        let engine = if search {
+                            crate::guest_callback::Engine::Search(crate::guest_search::Search::new(
+                                key, base, count, size,
+                            )?)
+                        } else {
+                            crate::guest_callback::Engine::Sort(crate::guest_sort::Sort::new(
+                                base, count, size,
+                            )?)
+                        };
+                        if count == 0 || (!search && count == 1) {
+                            0
+                        } else {
+                            if callbacks.frames.len() >= 32 {
+                                return Err("Nested comparator depth exceeds32".into());
+                            }
+                            let length = count
+                                .checked_mul(size)
+                                .ok_or("Comparator extent overflow")?
+                                as usize;
+                            let array = callback_storage(
+                                &memory,
+                                base,
+                                length,
+                                &image_storage,
+                                &self.stack_identities,
+                            )?;
+                            if !search {
+                                validate_net_output(&memory, base, length, sp, ret)?;
+                                memory.validate_write(base, length)?;
+                            }
+                            let mut ranges = vec![array, (stack_address, stack_length)];
+                            if search {
+                                ranges.push(callback_storage(
+                                    &memory,
+                                    key,
+                                    1,
+                                    &image_storage,
+                                    &self.stack_identities,
+                                )?);
+                            }
+                            if !memory.executable(comparator) {
+                                return Err("Comparator is not executable guest code".into());
+                            }
+                            ranges.push(callback_storage(
+                                &memory,
+                                comparator,
+                                1,
+                                &image_storage,
+                                &self.stack_identities,
+                            )?);
+                            let callback_sp = callback_stack_slot(
+                                sp,
+                                stack_address,
+                                base,
+                                length,
+                                search.then_some(key),
+                            )?;
+                            memory.validate_write(callback_sp, 8)?;
+                            callbacks
+                                .frames
+                                .try_reserve(1)
+                                .map_err(|_| "Cannot reserve comparator frame")?;
+                            // All fallible capacity reservations and overlap checks precede
+                            // publishing bytes. Refresh barriers after the frame is installed.
+                            let lease = callbacks.registry.acquire(ranges, [sp, callback_sp])?;
+                            memory.store(callback_sp, u64::MAX, 8)?;
+                            callbacks.frames.push(crate::guest_callback::Frame {
+                                engine,
+                                pending: None,
+                                waiting: false,
+                                comparator,
+                                registers: cpu.registers,
+                                return_sp: sp,
+                                return_address: ret,
+                                return_bias: cpu.bias,
+                                return_offset: cpu.next_rip,
+                                terminal,
+                                callback_sp,
+                                _lease: lease,
+                            });
+                            pending_stack.set(true);
+                            continue;
+                        }
+                    } else if let Some(value) = semaphore_value {
                         value
                     } else if matches!(service, Service::ThreadSelf) {
                         guest_thread
@@ -3430,11 +3767,13 @@ impl NativeExecutor {
                             if let Ok(length) =
                                 memory.anonymous_release_size(cpu.registers[7], cpu.registers[6])
                             {
-                                if self
-                                    .semaphores
-                                    .has_pending_overlap(cpu.registers[7], length)
-                                {
-                                    return Err("Cannot munmap a pending semaphore object".into());
+                                if retained_overlap(
+                                    &self.semaphores,
+                                    &self.callback_ranges,
+                                    cpu.registers[7],
+                                    length,
+                                ) {
+                                    return Err("Cannot munmap storage retained by a semaphore or comparator".into());
                                 }
                             }
                         }
@@ -3558,6 +3897,7 @@ impl NativeExecutor {
                                             MutexWait {
                                                 owner: self.mutex_wait_owner.clone(),
                                                 continuation: Some(Continuation {
+                                                    callbacks: Some(callbacks),
                                                     stack_lease: stack_lease.clone(),
                                                     quantum: slice.0,
                                                     return_convention,
@@ -3841,11 +4181,16 @@ impl NativeExecutor {
                                         sp.checked_add(8).ok_or("Setenv stack overflow")?;
                                     cpu.rip = cpu.next_rip;
                                     cpu.stop = 0;
+                                    if terminal {
+                                        cpu.registers[4] = sp;
+                                        cpu.stop = 3;
+                                    }
                                     cpu.memory = 0;
                                     let overwrite = cpu.registers[2] as u32 as i32;
                                     drop(memory);
                                     return Ok(Flow::EnvironmentSet {
                                         continuation: Box::new(Continuation {
+                                            callbacks: Some(callbacks),
                                             stack_lease: stack_lease.clone(),
                                             quantum: slice.0,
                                             return_convention,
@@ -4356,11 +4701,16 @@ impl NativeExecutor {
                             // Realloc releases the old object on success. It
                             // must not revoke its own live guest return frame.
                             let length = memory.heap_allocation_size(cpu.registers[7])?;
-                            if self
-                                .semaphores
-                                .has_pending_overlap(cpu.registers[7], length)
-                            {
-                                return Err("Cannot realloc a pending semaphore object".into());
+                            if retained_overlap(
+                                &self.semaphores,
+                                &self.callback_ranges,
+                                cpu.registers[7],
+                                length,
+                            ) {
+                                return Err(
+                                    "Cannot realloc storage retained by a semaphore or comparator"
+                                        .into(),
+                                );
                             }
                             validate_net_output(&memory, cpu.registers[7], length, sp, ret)?;
                         }
@@ -4378,12 +4728,17 @@ impl NativeExecutor {
                     } else if matches!(service, Service::Malloc | Service::Calloc | Service::Free) {
                         if matches!(service, Service::Free) {
                             if cpu.registers[7] != 0
-                                && self.semaphores.has_pending_overlap(
+                                && retained_overlap(
+                                    &self.semaphores,
+                                    &self.callback_ranges,
                                     cpu.registers[7],
                                     memory.heap_allocation_size(cpu.registers[7])?,
                                 )
                             {
-                                return Err("Cannot free a pending semaphore object".into());
+                                return Err(
+                                    "Cannot free storage retained by a semaphore or comparator"
+                                        .into(),
+                                );
                             }
                             memory.free(cpu.registers[7])?;
                             0
@@ -4641,7 +4996,12 @@ impl NativeExecutor {
                             .direct_memory
                             .release_mapping(cpu.registers[7], cpu.registers[6])?
                         {
-                            if self.semaphores.has_pending_overlap(address, length) {
+                            if retained_overlap(
+                                &self.semaphores,
+                                &self.callback_ranges,
+                                address,
+                                length,
+                            ) {
                                 return Err("Cannot unmap a pending semaphore object".into());
                             }
                         }
@@ -4780,6 +5140,11 @@ impl NativeExecutor {
                     cpu.registers[4] = sp.checked_add(8).ok_or("Service stack overflow")?;
                     cpu.registers[0] = value;
                     if terminal {
+                        if callbacks.authentic_return(sp, ret) {
+                            cpu.registers[4] = sp;
+                            cpu.stop = 3;
+                            continue;
+                        }
                         completed!(value);
                     }
                     cpu.rip = cpu.next_rip;
@@ -4898,8 +5263,12 @@ impl NativeExecutor {
 impl Executor for NativeExecutor {
     fn validate_image_retirement(&self, image: &Image) -> Result<()> {
         if image.segments.iter().any(|segment| {
-            self.semaphores
-                .has_pending_overlap(segment.address, segment.bytes.len())
+            retained_overlap(
+                &self.semaphores,
+                &self.callback_ranges,
+                segment.address,
+                segment.bytes.len(),
+            )
         }) {
             return Err("Cannot retire an image containing a pending semaphore object".into());
         }
@@ -5083,6 +5452,7 @@ mod exit_request_tests {
         // Tail exit must not dereference a return address, even if RSP is unmapped.
         cpu.registers[4] = if tail { 0 } else { 0x900ff8 };
         Continuation {
+            callbacks: None,
             stack_lease: Rc::new(()),
             quantum: None,
             return_convention: ReturnConvention::ModuleStatus,
@@ -5163,5 +5533,27 @@ mod exit_request_tests {
             .unwrap()
             .contains("fuel"));
         assert_eq!(executor.exit_request(), None);
+    }
+}
+
+#[cfg(test)]
+mod callback_slot_tests {
+    use super::callback_stack_slot;
+    #[test]
+    fn callback_alignment_red_zone_and_live_input_separation() {
+        for sp in [0x2000, 0x2008, 0x2010, 0x2018] {
+            let slot = callback_stack_slot(sp, 0x1000, 0x3000, 32, None).unwrap();
+            assert_eq!(slot % 16, 8);
+            assert!(slot + 8 <= sp - 128);
+            let low = slot - 128;
+            assert!(callback_stack_slot(sp, 0x1000, low, 1, None).is_err());
+            assert!(callback_stack_slot(sp, 0x1000, low - 1, 2, None).is_err());
+            assert!(callback_stack_slot(sp, 0x1000, 0x3000, 1, Some(low)).is_err());
+            assert!(callback_stack_slot(sp, 0x1000, sp, 32, Some(sp)).is_ok());
+            assert!(callback_stack_slot(sp, 0x1000, low - 8, 8, Some(low - 1)).is_ok());
+            assert!(callback_stack_slot(sp, low + 1, 0x3000, 32, None).is_err());
+        }
+        assert!(callback_stack_slot(64, 0, 0x3000, 1, None).is_err());
+        assert!(callback_stack_slot(0x2000, 0x1000, u64::MAX, 2, None).is_err());
     }
 }

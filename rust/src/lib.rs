@@ -96,3 +96,8 @@ pub mod guest_sysctl;
 pub mod guest_signal_action;
 
 pub mod guest_wcstombs;
+
+pub mod guest_compare;
+pub mod guest_sort;
+pub mod guest_search;
+mod guest_callback;

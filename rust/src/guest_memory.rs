@@ -51,6 +51,7 @@ pub struct Memory<'a> {
     regions: Vec<Region<'a>>,
     owned: Option<&'a mut OwnedMappings>,
     reserved: Vec<u64>,
+    write_barriers: Vec<(u64, usize)>,
 }
 impl Drop for Memory<'_> {
     fn drop(&mut self) {
@@ -66,6 +67,20 @@ impl Drop for Memory<'_> {
     }
 }
 impl<'a> Memory<'a> {
+    pub(crate) fn set_write_barriers(&mut self, ranges: Vec<(u64, usize)>) {
+        self.write_barriers = ranges;
+    }
+    pub(crate) fn owned_region_range(&self, address: u64) -> Option<(u64, usize)> {
+        self.regions
+            .iter()
+            .find(|r| {
+                matches!(r.bytes, Bytes::Owned(_))
+                    && address >= r.address
+                    && address - r.address < r.bytes.len() as u64
+            })
+            .map(|r| (r.address, r.bytes.len()))
+    }
+
     /// Validate an owned arena's complete reservation before publishing it.
     pub fn validate_unmapped(&self, address: u64, length: usize) -> crate::Result<()> {
         let end = address
@@ -448,6 +463,16 @@ impl<'a> Memory<'a> {
         if size == 0 {
             return Ok(());
         }
+        let end = address
+            .checked_add(size as u64)
+            .ok_or("Guest write range overflow")?;
+        if self
+            .write_barriers
+            .iter()
+            .any(|&(base, length)| address < base.saturating_add(length as u64) && base < end)
+        {
+            return Err("Guest write overlaps an active comparator return frame".into());
+        }
         let r = &self.regions[self.region(address, size)?];
         if !r.writable || r.executable {
             return Err("Guest write permission failure".into());
@@ -827,11 +852,9 @@ mod tests {
                     &vectors[reg as usize][..size as usize],
                     memory.read(0x1001, size as usize).unwrap()
                 );
-                assert!(
-                    vectors[reg as usize][size as usize..]
-                        .iter()
-                        .all(|&b| b == 0)
-                );
+                assert!(vectors[reg as usize][size as usize..]
+                    .iter()
+                    .all(|&b| b == 0));
                 let before = vectors;
                 for (address, index, width, aligned) in [
                     (0x1001, reg, size, 1),
@@ -881,3 +904,7 @@ mod tests {
         assert!(!memory.executable(0x1000));
     }
 }
+
+#[cfg(test)]
+#[path = "guest_memory_callback_tests.rs"]
+mod callback_tests;
