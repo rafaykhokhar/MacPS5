@@ -967,6 +967,9 @@ impl Modules {
         loop {
             if let Some(execution) = outcome.take() {
                 match execution {
+                    Execution::QuantumYield(_) => {
+                        return Err("Worker quantum cannot complete module initialization".into());
+                    }
                     Execution::WorkerReturned(_) => {
                         return Err("Worker return cannot complete module initialization".into());
                     }

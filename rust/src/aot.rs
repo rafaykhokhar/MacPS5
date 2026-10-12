@@ -327,6 +327,21 @@ impl Emitter {
                 self.emit("ldr w20, [x19, #200]");
                 self.write(i, 0, 32, 20)?;
             }
+            M::Vcvttsd2si => {
+                if i.code() != iced_x86::Code::VEX_Vcvttsd2si_r32_xmmm64 {
+                    return Err("Only signed32 VEX VCVTTSD2SI is implemented".into());
+                }
+                if i.op_kind(1) == OpKind::Register {
+                    let source = vector(i.op_register(1))?;
+                    self.emit(format!("ldr x20, [x19, #{}]", 208 + source * 32));
+                } else {
+                    self.read(i, 1, 64, 20)?;
+                }
+                self.emit("mov x0, x19\nmov x1, x20\nbl _native_ps5_truncate_i32_v1");
+                self.fault();
+                self.emit("mov w20, w0");
+                self.write(i, 0, 32, 20)?;
+            }
             M::Vcvtsi2sd => {
                 if i.code() != iced_x86::Code::VEX_Vcvtsi2sd_xmm_xmm_rm32 {
                     return Err("Only signed32 VEX VCVTSI2SD is implemented".into());
@@ -890,5 +905,21 @@ mod mxcsr_control_tests {
             assert!(supported(&i).is_ok());
         }
         assert!(decode::instruction(&[0xc5, 0xfc, 0xae, 0x17], 0x100).is_err());
+    }
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::*;
+    #[test]
+    fn truncate_exact_vex32_forms() {
+        for bytes in [&[0xc5,0xfb,0x2c,0xc0][..], &[0xc4,0x41,0x7b,0x2c,0xcf][..], &[0xc5,0xfb,0x2c,0x07][..]] {
+            let instruction = decode::instruction(bytes, 0xc3fca).unwrap();
+            assert_eq!(instruction.code(), iced_x86::Code::VEX_Vcvttsd2si_r32_xmmm64);
+            assert!(supported(&instruction).is_ok());
+        }
+        for bytes in [&[0xf2,0x0f,0x2c,0xc0][..], &[0xc4,0xe1,0xfb,0x2c,0xc0][..]] {
+            assert!(translate_rust_memory_region(bytes,0,"unsupported_truncate").is_err());
+        }
     }
 }

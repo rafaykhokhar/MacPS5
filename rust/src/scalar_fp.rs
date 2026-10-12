@@ -5,6 +5,8 @@
 //! Chosen guest feature policy supports DAZ, therefore valid bits are0..15.
 use crate::legacy_cpu::Cpu;
 mod arithmetic;
+mod truncate;
+pub use truncate::{TruncateError, TruncateResult, truncate_binary64_i32};
 pub use arithmetic::{FpResult, FpUnsupported, multiply_binary64};
 pub const MXCSR_RESET: u32 = 0x1f80;
 pub const MXCSR_VALID: u32 = 0xffff;

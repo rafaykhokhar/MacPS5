@@ -1,14 +1,19 @@
 //! Integer-only finite binary64 multiplication. This is not translator support.
 //! MXCSR layout/rounding: Intel SDM vol.1 §10.2.3 and AMD APM vol.4
 //! https://www.amd.com/content/dam/amd/en/documents/processor-tech-docs/programmer-references/26568.pdf
-//! NaN/infinity priority, unmasked exception delivery and ambiguous tiny-result
-//! policy deliberately remain explicit unsupported outcomes, with no state commit.
+//! NaN/infinity priority and unmasked exception delivery remain unsupported.
+//! Tininess uses rounding to53bits with unbounded exponent, Intel vol.1 §4.9.1.5:
+//! https://cdrdv2-public.intel.com/843820/325462-sdm-vol-1-2abcd-3abcd-4-1.pdf
+//! AMD vol.1 §4.2.2: FZ+UM flushes rounded tiny results, even exact ones, and
+//! sets UE+PE; FZ is ignored when UM=0:
+//! https://docs.amd.com/api/khub/documents/68GKiN0gMEd6bMddsmhPwg/content
 use super::MXCSR_VALID;
 const SIGN: u64 = 1 << 63;
 const FRACTION: u64 = (1 << 52) - 1;
 const INFINITY: u64 = 0x7ff0_0000_0000_0000;
 const DENORMAL: u32 = 2;
 const OVERFLOW: u32 = 8;
+const UNDERFLOW: u32 = 16;
 const PRECISION: u32 = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,9 +25,7 @@ pub struct FpResult {
 pub enum FpUnsupported {
     ReservedControl,
     NonFinite,
-    TinyInexact,
     TinyUnmasked,
-    FlushTiny,
     UnmaskedException(u32),
 }
 
@@ -87,18 +90,27 @@ fn round_pack(
     let shift = quantum - scale;
     let (mut rounded, inexact) = round_integer(value, shift, negative, mode);
     if exponent < -1022 {
-        // Tininess-before/after-rounding and FTZ exact-tiny behavior still need
-        // AMD-specific evidence; do not publish guessed exception flags.
-        if control & (1 << 11) == 0 {
+        // This extra rounding determines only tininess; never feed its rounded
+        // value to final packing (which would introduce double rounding).
+        let (unbounded, _) = round_integer(value, top - 52, negative, mode);
+        let unbounded_exponent = exponent + i32::from(unbounded >= 1u128 << 53);
+        let tiny = unbounded_exponent < -1022;
+        if tiny && control & (1 << 11) == 0 {
             return Err(FpUnsupported::TinyUnmasked);
         }
-        if inexact {
-            return Err(FpUnsupported::TinyInexact);
+        if tiny && control & 0x8000 != 0 {
+            return Ok((0, UNDERFLOW | PRECISION));
         }
-        if control & 0x8000 != 0 {
-            return Err(FpUnsupported::FlushTiny);
-        }
-        return Ok((rounded as u64, 0));
+        // rounded can equal1<<52: smallest normal encoded directly. Its final
+        // normal encoding does not itself suppress a detected tiny condition.
+        return Ok((
+            rounded as u64,
+            if inexact {
+                PRECISION | if tiny { UNDERFLOW } else { 0 }
+            } else {
+                0
+            },
+        ));
     }
     let mut output_exponent = exponent;
     if rounded >= 1u128 << 53 {
@@ -205,18 +217,57 @@ mod tests {
         }
     }
     #[test]
+    fn gradual_underflow_ftz_and_unbounded_tininess() {
+        for rc in 0..4 {
+            for sign in [0, SIGN] {
+                let control = MXCSR_RESET | rc << 13;
+                let away = (rc == 1 && sign != 0) || (rc == 2 && sign == 0);
+                let result = multiply_binary64(sign | 1, 0x3fe0_0000_0000_0000, control).unwrap();
+                assert_eq!(result.bits, sign | u64::from(away));
+                assert_eq!(result.mxcsr, control | DENORMAL | UNDERFLOW | PRECISION);
+                let flushed =
+                    multiply_binary64(sign | 1, 0x3ff0_0000_0000_0000, control | 0x8000).unwrap();
+                assert_eq!(flushed.bits, sign);
+                assert_eq!(
+                    flushed.mxcsr,
+                    control | 0x8000 | DENORMAL | UNDERFLOW | PRECISION
+                );
+            }
+        }
+        // Midpoint below smallestnormal is exactly53bits with unbounded
+        // exponent: still tiny, even though gradual rounding gives normal.
+        assert_eq!(
+            round_pack((1u128 << 53) - 1, -1075, false, MXCSR_RESET),
+            Ok((1 << 52, UNDERFLOW | PRECISION))
+        );
+        // Quarterulp below smallestnormal rounds to normal at unbounded53bits:
+        // precision but no underflow, and FTZ must not flush it.
+        for ftz in [0, 0x8000] {
+            assert_eq!(
+                round_pack((1u128 << 54) - 1, -1076, false, MXCSR_RESET | ftz),
+                Ok((1 << 52, PRECISION))
+            );
+        }
+        for ftz in [0, 0x8000] {
+            assert_eq!(
+                multiply_binary64(1, 0x3ff0_0000_0000_0000, (MXCSR_RESET & !(1 << 11)) | ftz),
+                Err(FpUnsupported::TinyUnmasked)
+            );
+        }
+        assert_eq!(
+            multiply_binary64(
+                1,
+                0x3ff0_0000_0000_0000,
+                (MXCSR_RESET & !(1 << 12)) | 0x8000
+            ),
+            Err(FpUnsupported::UnmaskedException(PRECISION))
+        );
+    }
+    #[test]
     fn unsupported_cases_and_sticky_flags_are_explicit() {
         assert_eq!(
             multiply_binary64(INFINITY, 0, MXCSR_RESET),
             Err(FpUnsupported::NonFinite)
-        );
-        assert_eq!(
-            multiply_binary64(1, 0x3fe0_0000_0000_0000, MXCSR_RESET),
-            Err(FpUnsupported::TinyInexact)
-        );
-        assert_eq!(
-            multiply_binary64(1, 0x3ff0_0000_0000_0000, MXCSR_RESET | 0x8000),
-            Err(FpUnsupported::FlushTiny)
         );
         assert_eq!(
             multiply_binary64(0, 0, 0x10000),

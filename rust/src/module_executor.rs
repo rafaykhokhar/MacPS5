@@ -552,6 +552,7 @@ impl ReturnConvention {
     }
 }
 pub struct Continuation {
+    quantum: Option<u64>,
     return_convention: ReturnConvention,
     guest_thread: u64,
     cpu: Cpu,
@@ -702,7 +703,28 @@ impl MutexWait {
         self.continuation.is_none()
     }
 }
+/// One-shot scheduling boundary; never accepts a manufactured service result.
+pub struct QuantumYield {
+    owner: Rc<()>,
+    continuation: Option<Continuation>,
+}
+impl QuantumYield {
+    pub fn guest_thread_id(&self) -> Option<u64> {
+        self.continuation.as_ref().map(|c| c.guest_thread)
+    }
+    pub fn is_consumed(&self) -> bool {
+        self.continuation.is_none()
+    }
+    pub fn stack_region(&mut self) -> Result<DataRegion<'_>> {
+        Ok(self
+            .continuation
+            .as_mut()
+            .ok_or("Quantum already consumed")?
+            .stack_region())
+    }
+}
 pub enum Execution {
+    QuantumYield(Box<QuantumYield>),
     /// Full-width pointer return from an explicitly invoked worker entry.
     WorkerReturned(u64),
     MutexWait(Box<MutexWait>),
@@ -735,6 +757,7 @@ enum Flow {
     },
 }
 pub struct NativeExecutor {
+    worker_quantum: Option<u64>,
     mutex_wait_owner: Rc<()>,
     pub thread_attributes: crate::guest_thread_attr::GuestThreadAttributes,
     pub mutex: crate::guest_mutex::GuestMutex,
@@ -780,6 +803,47 @@ pub struct NativeExecutor {
     stack_size: usize,
 }
 impl NativeExecutor {
+    /// Bound future worker slices; lifetime instruction/transition budgets remain
+    /// independent. Module entries retain their existing synchronous behavior.
+    pub fn set_worker_quantum(&mut self, quantum: Option<u64>) -> Result<()> {
+        if quantum == Some(0) {
+            return Err("Worker quantum must be positive".into());
+        }
+        self.worker_quantum = quantum;
+        Ok(())
+    }
+    pub fn resume_quantum(
+        &mut self,
+        image: &mut Image,
+        dependencies: &mut [&mut Image],
+        wait: &mut QuantumYield,
+        data: &mut [DataRegion<'_>],
+    ) -> Result<Execution> {
+        self.require_running()?;
+        let state = wait
+            .continuation
+            .as_ref()
+            .ok_or("Quantum already consumed")?;
+        if !Rc::ptr_eq(&wait.owner, &self.mutex_wait_owner)
+            || state.guest_thread != self.selected_guest_thread
+            || !self.tls.contains_thread(state.guest_thread)
+            || state.caller_bias != image.bias
+            || state.stack.len() != self.stack_size
+            || state.stack_address < self.stack_address
+            || (state.stack_address - self.stack_address) % self.stack_size as u64 != 0
+        {
+            return Err("Quantum belongs to different executor, thread or mappings".into());
+        }
+        let state = wait.continuation.take().unwrap();
+        self.execute_flow(
+            image,
+            0,
+            Arguments::default(),
+            dependencies,
+            Some(state),
+            data,
+        )
+    }
     /// Identity used by new guest entries. This is never a host thread ID.
     pub fn guest_thread_id(&self) -> u64 {
         self.selected_guest_thread
@@ -1178,6 +1242,7 @@ impl NativeExecutor {
         let mut tls = crate::guest_tls::GuestTls::default();
         tls.register_thread(MAIN_GUEST_THREAD)?;
         Ok(Self {
+            worker_quantum: None,
             mutex_wait_owner: Rc::new(()),
             thread_attributes: crate::guest_thread_attr::GuestThreadAttributes::default(),
             mutex: crate::guest_mutex::GuestMutex::default(),
@@ -1286,6 +1351,9 @@ impl NativeExecutor {
         dependencies: &mut [&mut Image],
     ) -> Result<i32> {
         match self.run(image, address, arguments, dependencies)? {
+            Execution::QuantumYield(_) => {
+                Err("Quantum requires resumable worker orchestration".into())
+            }
             Execution::MutexWait(_) => {
                 Err("Mutex wait requires resumable runtime orchestration".into())
             }
@@ -1558,8 +1626,16 @@ impl NativeExecutor {
         data: &mut [DataRegion<'_>],
     ) -> Result<Execution> {
         self.require_running()?;
+        let quantum = continuation.as_ref().map(|c| c.quantum).unwrap_or_else(|| {
+            if matches!(entry.2, ReturnConvention::WorkerPointer) {
+                self.worker_quantum
+            } else {
+                None
+            }
+        });
+        let mut slice = (quantum, quantum.unwrap_or(u64::MAX));
         loop {
-            match self.execute_step(image, entry, dependencies, continuation, data)? {
+            match self.execute_step(image, entry, dependencies, continuation, data, &mut slice)? {
                 Flow::Finished(execution) => return Ok(execution),
                 Flow::TranslationMiss {
                     bias,
@@ -1604,6 +1680,7 @@ impl NativeExecutor {
         dependencies: &mut [&mut Image],
         continuation: Option<Continuation>,
         data: &mut [DataRegion<'_>],
+        slice: &mut (Option<u64>, u64),
     ) -> Result<Flow> {
         let (address, arguments, initial_convention) = entry;
         let caller_bias = image.bias;
@@ -1758,6 +1835,39 @@ impl NativeExecutor {
             cpu
         };
         for transition in 0..remaining {
+            if slice.0.is_some() && slice.1 == 0 {
+                if cpu.fault != 0 {
+                    return Err(format!(
+                        "Module guest fault {} at {:#x}",
+                        cpu.fault, cpu.rip
+                    ));
+                }
+                if cpu.stop == 3 && cpu.registers[4] == top && memory.load(top, 8)? == u64::MAX {
+                    return Ok(Flow::Finished(
+                        return_convention.completed(cpu.registers[0]),
+                    ));
+                }
+                if cpu.fuel == 0 {
+                    return Err("Module fuel exhausted".into());
+                }
+                cpu.memory = 0;
+                drop(memory);
+                return Ok(Flow::Finished(Execution::QuantumYield(Box::new(
+                    QuantumYield {
+                        owner: self.mutex_wait_owner.clone(),
+                        continuation: Some(Continuation {
+                            quantum: slice.0,
+                            return_convention,
+                            guest_thread,
+                            cpu,
+                            stack,
+                            stack_address,
+                            remaining: remaining - transition,
+                            caller_bias,
+                        }),
+                    },
+                ))));
+            }
             // Invoke only before effects associated with the pending dispatch.
             // Every retry consumes transition budget, but no guest instruction
             // or service is replayed and instruction fuel is unchanged.
@@ -1777,6 +1887,7 @@ impl NativeExecutor {
                             bias: missing_bias,
                             target: missing_target,
                             continuation: Box::new(Continuation {
+                                quantum: slice.0,
                                 return_convention,
                                 guest_thread,
                                 cpu,
@@ -1837,6 +1948,7 @@ impl NativeExecutor {
                         cpu.fuel -= 1;
                         drop(memory);
                         self.exit_context = Some(Box::new(Continuation {
+                            quantum: slice.0,
                             return_convention,
                             guest_thread,
                             cpu,
@@ -1901,6 +2013,7 @@ impl NativeExecutor {
                         let arguments = [7, 6, 2, 1, 8, 9].map(|i| cpu.registers[i]);
                         drop(memory);
                         let continuation = Box::new(Continuation {
+                            quantum: slice.0,
                             return_convention,
                             guest_thread,
                             cpu,
@@ -2056,6 +2169,7 @@ impl NativeExecutor {
                                             MutexWait {
                                                 owner: self.mutex_wait_owner.clone(),
                                                 continuation: Some(Continuation {
+                                                    quantum: slice.0,
                                                     return_convention,
                                                     guest_thread,
                                                     cpu,
@@ -2740,13 +2854,30 @@ impl NativeExecutor {
             // Refresh the raw borrow after Rust-side dispatch accesses, and use
             // it only for this synchronous translated block.
             cpu.memory = (&mut memory as *mut Memory<'_>) as u64;
+            let total_fuel = cpu.fuel;
+            let dispatch_fuel = if slice.0.is_some() {
+                total_fuel.min(slice.1)
+            } else {
+                total_fuel
+            };
+            cpu.fuel = dispatch_fuel;
             // SAFETY: registration contract plus byte verification; CPU and all
             // borrowed mappings remain live and exclusive for this call.
             unsafe {
                 (block.function)(&mut cpu);
             }
+            let spent = dispatch_fuel
+                .checked_sub(cpu.fuel)
+                .ok_or("Translation increased instruction fuel")?;
+            cpu.fuel = total_fuel - spent;
+            if slice.0.is_some() {
+                slice.1 -= spent;
+                if cpu.stop == 4 && cpu.fuel != 0 {
+                    cpu.stop = 0;
+                }
+            }
             cpu.memory = 0;
-            if cpu.stop == 0 && cpu.fault == 0 {
+            if cpu.stop == 0 && cpu.fault == 0 && !(slice.0.is_some() && slice.1 == 0) {
                 return Err("Translation did not stop at a boundary".into());
             }
         }
@@ -2926,6 +3057,7 @@ mod exit_request_tests {
         // Tail exit must not dereference a return address, even if RSP is unmapped.
         cpu.registers[4] = if tail { 0 } else { 0x900ff8 };
         Continuation {
+            quantum: None,
             return_convention: ReturnConvention::ModuleStatus,
             guest_thread: MAIN_GUEST_THREAD,
             cpu,

@@ -7,6 +7,18 @@ cargo run --release --locked --manifest-path tools/fp-oracle/Cargo.toml --bin fi
 cargo run --release --locked --manifest-path tools/fp-oracle/Cargo.toml --bin compare -- /tmp/macps5-fp.tsv
 ```
 
-At the initial repository snapshot the comparison **fails**: 159,752 accepted cases, 9,780 result/status mismatches, and 44,344 explicitly unsupported tiny-inexact cases. Mismatches need classification: LLVM IEEE status semantics do not by themselves establish AMD/x86 exception behavior. This is a diagnostic gate, not a passing validation claim. It is separate from the unit suite. The experimental engine is not wired to VMULSD execution.
+The comparison passes for **all 204,096 finite cases**, with zero result-bit or normalized-status mismatches. The experimental engine is not wired to VMULSD execution; nonfinite operands and unmasked multiplication exception delivery remain unsupported.
+
+The initial comparison found 9,780 raw status differences and no result-bit differences. LLVM APFloat reports precision alone for some overflowing results saturated by directed rounding; x86 also reports overflow. The comparator now uses independent 113-bit Quad arithmetic to prove that the exact product reaches the overflow threshold before adjusting that expectation. A boundary test checks saturated results below the threshold, which must not be adjusted. Raw differences and normalization counts remain visible in output. See Intel SDM volume 1, section 4.9.1.4 and table 4-10 (linked in the comparator source).
+
+Adding tiny results exposed 16 further status differences at the minimum-normal boundary. x86 determines tininess after precision rounding with an unbounded exponent, whereas the LLVM result can round to minimum normal without reporting underflow. A second independent Quad calculation and boundary test implement that distinction without calling production arithmetic. The output preserves all 9,796 raw status differences and reports the overflow and tininess adjustments separately.
 
 The generator uses pinned rustc_apfloat (LLVM APFloat port), not the implementation under test, to calculate expected binary64 values and IEEE status. The comparison maps those statuses and separately expects a denormal-operand flag. No NaN-priority, DAZ/FTZ, unmasked exception or hardware x86 equivalence is established by this finite corpus.
+
+## Truncating integer conversion
+
+```sh
+cargo run --release --locked --manifest-path tools/fp-oracle/Cargo.toml --bin compare-truncate
+```
+
+This separate model comparison passes 400,000 cases against LLVM's signed32 conversion, normalizing invalid results to the x86 integer-indefinite value. It covers all guest rounding-control settings (the operation must ignore them), DAZ on/off, signed boundaries, special values and an existing unrelated sticky flag. It does not prove native instruction lowering or unmasked exception delivery.

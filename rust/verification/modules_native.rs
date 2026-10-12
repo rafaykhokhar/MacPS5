@@ -2170,7 +2170,10 @@ fn automatic_compilation() {
     );
     let directory = PathBuf::from(
         std::env::var_os("NATIVE_PS5_AOT_DIRECTORY").expect("native compilation output"),
-    );
+    ).join(format!("compiler-lifecycle-{}", std::process::id()));
+    // Inspect only this fixture's generated files; other native verifiers may
+    // retain input ELF fixtures in the shared AOT parent directory.
+    std::fs::create_dir_all(&directory).unwrap();
     let file = imported_service_fixture();
     let mut native = NativeExecutor::new(0x900000, 16384, 100, 100).unwrap();
     // SAFETY: the verification runner supplies the same freshly built archive
