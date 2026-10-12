@@ -41,6 +41,7 @@ mod sort_search_native;
 mod fgets_native;
 mod getcwd_native;
 mod strdup_native;
+mod mkdir_native;
 mod system_service_native;
 mod threadattr_native;
 mod thread_services_native;
@@ -98,6 +99,7 @@ fn main() -> Result<(), String> {
     fgets_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("fgets"))?;
     getcwd_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("getcwd"))?;
     strdup_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strdup"))?;
+    mkdir_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("mkdir"))?;
     semaphore_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     stdio_file_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     system_service_native::verify(Path::new(&archive), Path::new(&directory))?;
@@ -132,7 +134,13 @@ fn main() -> Result<(), String> {
     guest_time_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     sleep_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     tiler_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
-    tiler_gpu_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+    // The presenter closes before returning. Preserve its failure while checking
+    // independent startup behavior; do not turn a presentation failure into PASS.
+    let presentation_result =
+        tiler_gpu_native::verify(&file, Path::new(&archive), Path::new(&directory));
+    if let Err(error) = &presentation_result {
+        eprintln!("PRESENTATION FAILED (retained until final result): {error}");
+    }
     user_service_native::verify(Path::new(&archive), Path::new(&directory))?;
     pad_native::verify(Path::new(&archive), Path::new(&directory))?;
     puts_native::verify(Path::new(&archive), Path::new(&directory))?;
@@ -468,6 +476,7 @@ fn main() -> Result<(), String> {
         ("bsearch", Service::Bsearch),
         ("fgets", Service::Fgets),
         ("getcwd", Service::Getcwd),
+        ("mkdir", Service::Mkdir),
     ]
     .into_iter()
     .enumerate()
@@ -1398,6 +1407,7 @@ fn main() -> Result<(), String> {
                 (952, 0x730000),
                 (960, 0x7300c0),
                 (968, 0x730010),
+                (976, 0x730760),
             ] {
                 if locale_segment.bytes[locale_offset + delta..locale_offset + delta + 8]
                     != expected.to_le_bytes()
@@ -1424,13 +1434,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 124 libc exports: (124+1)*24=3000 symbol bytes (rounded3008)
-                // and 1+124*12=1489 NID bytes (rounded1504). Getcwd
-                // export adds32+16bytes to18800; retain the exact32KiB cap.
-                || native.bytes_allocated() != 18848
+                // 125 libc exports: (125+1)*24=3024 symbol bytes
+                // and 1+125*12=1501 NID bytes (rounded1504). Mkdir
+                // adds16bytes to18848; retain the exact32KiB cap.
+                || native.bytes_allocated() != 18864
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'mkdir'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'pthread_cond_init'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1440,7 +1450,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; getcwd import bound; unresolved mkdir causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; mkdir import bound; unresolved pthread_cond_init causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1502,9 +1512,10 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved mkdir triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved pthread_cond_init triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
+    presentation_result?;
     Ok(())
 }
 

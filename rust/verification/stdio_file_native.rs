@@ -369,8 +369,9 @@ pub fn verify(file: &[u8], archive: &Path, directory: &Path) -> Result<(), Strin
         )?,
         0
     );
-    // /app0 is not a registered creation directory in this fixture.
-    assert_eq!(errno, 2u32.to_le_bytes());
+    // File registration materializes /app0 as a readonly directory.
+    // Missing reads remain ENOENT; creation is rejected with EROFS.
+    assert_eq!(errno, 30u32.to_le_bytes());
     macro_rules! call {
         ($args:expr) => {
             invoke(

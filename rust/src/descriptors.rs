@@ -322,6 +322,7 @@ impl Descriptors {
         path: &[u8],
     ) -> std::result::Result<FileToken, u32> {
         self.validate_file_namespace(files).map_err(|_| 9u32)?;
+        files.check_open(path, true, false)?;
         let backing = files.backing(path)?;
         self.install_file(backing, OpenOptions::read_only())
     }
@@ -338,6 +339,9 @@ impl Descriptors {
         if self.stdin.is_some() {
             return Err("Guest stdin is already configured".into());
         }
+        files
+            .check_open(path, true, false)
+            .map_err(|error| format!("Cannot configure guest stdin: errno {error}"))?;
         let backing = files
             .backing(path)
             .map_err(|error| format!("Cannot configure guest stdin: errno {error}"))?;
@@ -366,20 +370,47 @@ impl Descriptors {
         path: &[u8],
         options: OpenOptions,
     ) -> Result<std::result::Result<FileToken, u32>> {
+        self.open_file_options_at(files, path, options, None)
+    }
+    pub fn open_file_options_at(
+        &mut self,
+        files: &mut crate::kernel::Files,
+        path: &[u8],
+        options: OpenOptions,
+        cwd: Option<&[u8]>,
+    ) -> Result<std::result::Result<FileToken, u32>> {
         self.validate_file_namespace(files)?;
+        if !path.is_empty() && path[0] != b'/' && cwd.is_none() {
+            return Err("Guest working directory is not configured for relative open".into());
+        }
+        if (!options.read && !options.write) || (options.truncate && !options.write) {
+            return Ok(Err(22));
+        }
+        // Capacity/identity checks precede namespace or content mutation.
+        if !self.endpoints.iter().any(Option::is_none) || self.next_file == u64::MAX {
+            return Ok(Err(24));
+        }
+        let resolved = match files.resolve(path, cwd) {
+            Ok(path) => path,
+            Err(errno) => return Ok(Err(errno)),
+        };
+        let path = resolved.as_slice();
+        if files.is_directory(path).unwrap_or(false) {
+            if options.create && options.exclusive {
+                return Ok(Err(17));
+            }
+            if options.write {
+                return Ok(Err(21));
+            }
+            return Err("Read-only directory descriptors are unsupported".into());
+        }
         Ok((|| {
-            if (!options.read && !options.write) || (options.truncate && !options.write) {
-                return Err(22);
-            }
-            // Capacity/identity checks precede namespace or content mutation.
-            if !self.endpoints.iter().any(Option::is_none) || self.next_file == u64::MAX {
-                return Err(24);
-            }
             let backing = match files.backing(path) {
                 Ok(file) => {
                     if options.create && options.exclusive {
                         return Err(17);
                     }
+                    files.check_open(path, options.read, options.write)?;
                     file
                 }
                 Err(2) if options.create => files.create(path)?,
@@ -388,6 +419,7 @@ impl Descriptors {
             self.install_file(backing, options)
         })())
     }
+
     fn install_file(
         &mut self,
         backing: Rc<crate::kernel::FileBacking>,

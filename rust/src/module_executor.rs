@@ -6,11 +6,11 @@
 //! does not pin host-owned images or detect host replacement of their backing.
 #![allow(unsafe_code)]
 use crate::{
+    Result,
     guest_memory::{DataRegion, Memory},
     legacy_cpu::Cpu,
     loader::Image,
     modules::{Arguments, Executor},
-    Result,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -355,16 +355,20 @@ mod equeue_return_tests {
             second.stack.as_ptr() as usize,
         ];
         let mut wrong = Image::load(&memory_fixture(), 0x200000, 65536).unwrap();
-        assert!(native
-            .resume_with_data(&mut wrong, &mut [], first, 0, &mut [])
-            .err()
-            .unwrap()
-            .contains("different mappings"));
-        assert!(native
-            .resume_with_data(&mut wrong, &mut [], second, 0, &mut [])
-            .err()
-            .unwrap()
-            .contains("fault pinned"));
+        assert!(
+            native
+                .resume_with_data(&mut wrong, &mut [], first, 0, &mut [])
+                .err()
+                .unwrap()
+                .contains("different mappings")
+        );
+        assert!(
+            native
+                .resume_with_data(&mut wrong, &mut [], second, 0, &mut [])
+                .err()
+                .unwrap()
+                .contains("fault pinned")
+        );
         assert_eq!(native.semaphores.pending_count(), 2);
         let held = native.fault_stack.borrow();
         assert_eq!(held.len(), 2);
@@ -529,14 +533,10 @@ mod equeue_return_tests {
             assert_eq!(memory.read(0x2000, 512).unwrap(), before);
         }
         memory.store(0x2080, 0x2000, 8).unwrap();
-        assert!(validate_equeue_return(
-            &memory,
-            (0x2000, 1, 0x2040),
-            (0x2080, 0x2000),
-            false,
-            true
-        )
-        .is_err());
+        assert!(
+            validate_equeue_return(&memory, (0x2000, 1, 0x2040), (0x2080, 0x2000), false, true)
+                .is_err()
+        );
         assert_eq!(queues.pending_count(handle).unwrap(), 1);
         memory.store(0x2080, 0x4000, 8).unwrap();
         // Adjacent outputs are allowed, and a genuine registered return permits
@@ -689,6 +689,7 @@ struct TranslationSource {
 pub enum Service {
     Getenv,
     Getcwd,
+    Mkdir,
     Setenv,
     Wcslen,
     Wcstombs,
@@ -865,6 +866,7 @@ impl Service {
             | Self::Sigemptyset
             | Self::Sigaddset
             | Self::Getcwd
+            | Self::Mkdir
             | Self::Setenv
             | Self::Wcslen
             | Self::Wcstombs
@@ -4496,7 +4498,9 @@ impl NativeExecutor {
                                 u64::MAX
                             }
                             crate::guest_system::Query::Unsupported => {
-                                return Err(format!("Unsupported sysconf selector {selector} or missing explicit guest system profile"));
+                                return Err(format!(
+                                    "Unsupported sysconf selector {selector} or missing explicit guest system profile"
+                                ));
                             }
                         }
                     } else if matches!(service, Service::Stat) {
@@ -4760,6 +4764,27 @@ impl NativeExecutor {
                             cpu.registers[6],
                             cpu.registers[2],
                         )? as u32 as u64
+                    } else if matches!(service, Service::Mkdir) {
+                        let kernel = self.kernel.as_mut().ok_or("Missing mkdir kernel context")?;
+                        // Snapshot and resolve the pathname before publishing errno.
+                        // Namespace preparation/commit errors do not create a node.
+                        let outcome = match kernel.plan_mkdir(
+                            &memory,
+                            cpu.registers[7],
+                            cpu.registers[6] as u16,
+                        )? {
+                            Ok(plan) => kernel.commit_mkdir(plan),
+                            Err(errno) => Err(errno),
+                        };
+                        match outcome {
+                            Ok(()) => 0,
+                            Err(errno) => {
+                                let address = kernel.errno_address();
+                                validate_net_output(&memory, address, 4, sp, ret)?;
+                                memory.store(address, errno as u64, 4)?;
+                                u32::MAX as u64
+                            }
+                        }
                     } else if matches!(service, Service::Getcwd) {
                         crate::guest_getcwd::call(
                             &mut memory,
@@ -5400,13 +5425,15 @@ mod service_registration_tests {
         assert!(native.configure_stdin(b"/input").is_err());
         native.kernel = Some(crate::kernel::Kernel::new(65536, 0x800000).unwrap());
         assert!(native.configure_stdin(b"/missing").is_err());
-        assert!(native
-            .kernel
-            .as_ref()
-            .unwrap()
-            .descriptors
-            .file_token(0)
-            .is_err());
+        assert!(
+            native
+                .kernel
+                .as_ref()
+                .unwrap()
+                .descriptors
+                .file_token(0)
+                .is_err()
+        );
         native
             .kernel
             .as_mut()
@@ -5423,22 +5450,26 @@ mod service_registration_tests {
             u64::from_le_bytes(native.stdin_pointer),
             crate::stdio_file::STDIN_FILE_ADDR
         );
-        assert!(native
-            .kernel
-            .as_ref()
-            .unwrap()
-            .descriptors
-            .file_token(0)
-            .is_ok());
+        assert!(
+            native
+                .kernel
+                .as_ref()
+                .unwrap()
+                .descriptors
+                .file_token(0)
+                .is_ok()
+        );
         assert!(native.configure_stdin(b"/input").is_err());
         let mut image = Image::load(&crate::modules::fixture(), 0x100000, 65536).unwrap();
         let mut unconfigured = NativeExecutor::new(0x900000, 4096, 100, 100).unwrap();
         unconfigured.kernel = native.kernel.take();
         let _ = unconfigured.run(&mut image, u64::MAX - 1, Arguments::default(), &mut []);
-        assert!(unconfigured
-            .configure_stdin(b"/input")
-            .unwrap_err()
-            .contains("frozen"));
+        assert!(
+            unconfigured
+                .configure_stdin(b"/input")
+                .unwrap_err()
+                .contains("frozen")
+        );
         assert!(unconfigured.stdin_pointer_address().is_err());
     }
     #[test]
@@ -5452,9 +5483,11 @@ mod service_registration_tests {
         // Even a rejected entry attempt freezes configuration: no host retry can
         // mutate reported hardware after any execution path has been entered.
         let _ = native.run(&mut image, 0xffff_ffff, Arguments::default(), &mut []);
-        assert!(native
-            .configure_system_profile(GuestSystemProfile::new(8 << 30, 1, 1).unwrap())
-            .is_err());
+        assert!(
+            native
+                .configure_system_profile(GuestSystemProfile::new(8 << 30, 1, 1).unwrap())
+                .is_err()
+        );
         assert_eq!(native.system_profile(), Some(&original));
         let mut unconfigured = NativeExecutor::new(0x900000, 4096, 100, 100).unwrap();
         let _ = unconfigured.run(&mut image, 0xffff_ffff, Arguments::default(), &mut []);
@@ -5465,9 +5498,11 @@ mod service_registration_tests {
     fn loader_export_publication_is_atomic_and_resolves_name_and_nid() {
         let mut modules = crate::modules::Modules::new(65536);
         let mut native = NativeExecutor::new(0x900000, 4096, 100, 100).unwrap();
-        assert!(native
-            .register_loader_module(&mut modules, "../bad", 0x700000)
-            .is_err());
+        assert!(
+            native
+                .register_loader_module(&mut modules, "../bad", 0x700000)
+                .is_err()
+        );
         assert!(native.services.is_empty());
         native
             .register_loader_module(&mut modules, "libkernel.prx", 0x700000)
@@ -5480,16 +5515,20 @@ mod service_registration_tests {
             let identity = crate::imports::identify(name, &BTreeMap::new(), &[]).unwrap();
             assert_eq!(modules.resolve(&identity), Some(0x700000));
         }
-        assert!(native
-            .register_loader_module(&mut modules, "libkernel.prx", 0x710000)
-            .is_err());
+        assert!(
+            native
+                .register_loader_module(&mut modules, "libkernel.prx", 0x710000)
+                .is_err()
+        );
         assert_eq!(native.services.len(), 3);
         let stop =
             crate::imports::identify("sceKernelStopUnloadModule", &BTreeMap::new(), &[]).unwrap();
         assert_eq!(modules.resolve(&stop), Some(0x700010));
-        assert!(native
-            .register_loader_module(&mut modules, "other.prx", 0x700000)
-            .is_err());
+        assert!(
+            native
+                .register_loader_module(&mut modules, "other.prx", 0x700000)
+                .is_err()
+        );
     }
     #[test]
     fn loader_request_validates_all_inputs_before_side_effects() {
@@ -5533,18 +5572,24 @@ mod service_registration_tests {
         let mut native = NativeExecutor::new(0x900000, 4096, 100, 100).unwrap();
         let plain = |name: &str| crate::imports::identify(name, &BTreeMap::new(), &[]).unwrap();
         native.register_service(0x700020, Service::Strlen).unwrap();
-        assert!(native
-            .register_string_module(&mut modules, "libstrings.prx", 0x700000)
-            .is_err());
+        assert!(
+            native
+                .register_string_module(&mut modules, "libstrings.prx", 0x700000)
+                .is_err()
+        );
         assert_eq!(native.services.len(), 1);
         assert_eq!(modules.resolve(&plain("strcpy")), None);
-        assert!(native
-            .register_string_module(&mut modules, "libstrings.prx", u64::MAX - 16)
-            .is_err());
+        assert!(
+            native
+                .register_string_module(&mut modules, "libstrings.prx", u64::MAX - 16)
+                .is_err()
+        );
         assert_eq!(native.services.len(), 1);
-        assert!(native
-            .register_string_module(&mut modules, "../bad", 0x710000)
-            .is_err());
+        assert!(
+            native
+                .register_string_module(&mut modules, "../bad", 0x710000)
+                .is_err()
+        );
         assert_eq!(native.services.len(), 1);
         let handle = native
             .register_string_module(&mut modules, "libstrings.prx", 0x710000)
@@ -5562,9 +5607,11 @@ mod service_registration_tests {
                 Some(0x710000 + i as u64 * 16)
             );
         }
-        assert!(native
-            .register_string_module(&mut modules, "libstrings.prx", 0x720000)
-            .is_err());
+        assert!(
+            native
+                .register_string_module(&mut modules, "libstrings.prx", 0x720000)
+                .is_err()
+        );
         assert_eq!(native.services.len(), 6);
     }
 }
@@ -5634,16 +5681,20 @@ mod exit_request_tests {
                     );
                     assert_eq!(executor.exit_request(), Some(expected));
                     assert_eq!(executor.exit_remaining_fuel(), Some(2));
-                    assert!(executor
-                        .run(&mut image, 0x100100, Arguments::default(), &mut [])
-                        .err()
-                        .unwrap()
-                        .contains("exit requested"));
-                    assert!(executor
-                        .resume(&mut image, &mut [], stale, 0)
-                        .err()
-                        .unwrap()
-                        .contains("exit requested"));
+                    assert!(
+                        executor
+                            .run(&mut image, 0x100100, Arguments::default(), &mut [])
+                            .err()
+                            .unwrap()
+                            .contains("exit requested")
+                    );
+                    assert!(
+                        executor
+                            .resume(&mut image, &mut [], stale, 0)
+                            .err()
+                            .unwrap()
+                            .contains("exit requested")
+                    );
                 }
             }
         }
@@ -5654,18 +5705,20 @@ mod exit_request_tests {
         let pending = suspended(&image, true, 1, 0);
         let mut executor = NativeExecutor::new(0x900000, 4096, 10, 10).unwrap();
         executor.register_service(0x700000, Service::Exit).unwrap();
-        assert!(executor
-            .execute_flow(
-                &mut image,
-                0,
-                Arguments::default(),
-                &mut [],
-                Some(pending),
-                &mut []
-            )
-            .err()
-            .unwrap()
-            .contains("fuel"));
+        assert!(
+            executor
+                .execute_flow(
+                    &mut image,
+                    0,
+                    Arguments::default(),
+                    &mut [],
+                    Some(pending),
+                    &mut []
+                )
+                .err()
+                .unwrap()
+                .contains("fuel")
+        );
         assert_eq!(executor.exit_request(), None);
     }
 }

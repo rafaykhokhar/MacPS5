@@ -4,7 +4,7 @@ use crate::{Result, descriptors::Descriptors, guest_memory::Memory};
 #[path = "guest_files.rs"]
 mod guest_files;
 pub(crate) use guest_files::{FileBacking, Quota};
-pub use guest_files::{Files, STAT_SIZE, StatRequest, StatTrace};
+pub use guest_files::{Files, MkdirPlan, NamespaceProfile, STAT_SIZE, StatRequest, StatTrace};
 
 struct Region {
     address: u64,
@@ -29,8 +29,41 @@ impl Kernel {
     /// still performs its normal pathname/error handling and tracing afterward.
     pub(crate) fn stat_will_write(&self, memory: &Memory<'_>, path: u64) -> bool {
         guest_files::read_path(memory, path)
+            .and_then(|path| self.files.resolve(&path, self.working_directory.as_deref()))
             .and_then(|path| self.files.stat_record(&path))
             .is_ok()
+    }
+    pub fn open_file_path(
+        &mut self,
+        path: &[u8],
+        options: crate::descriptors::OpenOptions,
+    ) -> Result<std::result::Result<crate::descriptors::FileToken, u32>> {
+        self.descriptors.open_file_options_at(
+            &mut self.files,
+            path,
+            options,
+            self.working_directory.as_deref(),
+        )
+    }
+    pub fn plan_mkdir(
+        &self,
+        memory: &Memory<'_>,
+        path_address: u64,
+        mode: u16,
+    ) -> Result<std::result::Result<MkdirPlan, u32>> {
+        let path = match guest_files::read_path(memory, path_address) {
+            Ok(path) => path,
+            Err(errno) => return Ok(Err(errno)),
+        };
+        if !path.is_empty() && path[0] != b'/' && self.working_directory.is_none() {
+            return Err("Guest working directory is not configured for relative mkdir".into());
+        }
+        Ok(self
+            .files
+            .plan_mkdir(&path, self.working_directory.as_deref(), mode))
+    }
+    pub fn commit_mkdir(&mut self, plan: MkdirPlan) -> std::result::Result<(), u32> {
+        self.files.commit_mkdir(plan)
     }
     pub fn errno_address(&self) -> u64 {
         self.errno_address
@@ -73,11 +106,12 @@ impl Kernel {
         self.sandbox_component = Some(terminated);
         Ok(())
     }
-    /// Explicit virtual cwd; this does not query the host or create directory entries.
+    /// Explicit virtual cwd; this never queries the host.
     pub fn working_directory_bytes(&self) -> Option<&[u8]> {
         self.working_directory.as_deref()
     }
     /// Register a canonical absolute guest path, retained with its NUL terminator.
+    /// Missing directories are materialized readonly; existing policy is preserved.
     pub fn register_working_directory(&mut self, path: &[u8]) -> Result<()> {
         if path.is_empty()
             || path.len() > 1023
@@ -93,6 +127,7 @@ impl Kernel {
         }
         let mut terminated = path.to_vec();
         terminated.push(0);
+        self.files.ensure_working_directory(path)?;
         self.working_directory = Some(terminated);
         Ok(())
     }
@@ -283,11 +318,24 @@ impl Kernel {
                         Err(error) => Err(error),
                         Ok(path) => {
                             let options = open_options.expect("Open options decoded");
+                            if !path.is_empty()
+                                && path[0] != b'/'
+                                && self.working_directory.is_none()
+                            {
+                                return Err(
+                                    "Guest working directory is not configured for relative open"
+                                        .into(),
+                                );
+                            }
+                            let resolved =
+                                self.files.resolve(&path, self.working_directory.as_deref());
                             // Explicit virtual writable directories currently use
                             // mode0666 with no umask; other creation modes are not
                             // silently rewritten. Existing file mode is untouched.
                             if options.create
-                                && self.files.backing(&path).is_err()
+                                && resolved
+                                    .as_ref()
+                                    .is_ok_and(|path| matches!(self.files.backing(path), Err(2)))
                                 && args[2] as u32 != 0o666
                             {
                                 return Err(
@@ -296,7 +344,12 @@ impl Kernel {
                                 );
                             }
                             self.descriptors
-                                .open_file_options(&mut self.files, &path, options)?
+                                .open_file_options_at(
+                                    &mut self.files,
+                                    &path,
+                                    options,
+                                    self.working_directory.as_deref(),
+                                )?
                                 .map(|token| u64::from(token.descriptor()))
                         }
                     }
@@ -316,7 +369,17 @@ impl Kernel {
                 self.descriptors
                     .seek(args[0] as u32 as u64, args[1] as i64, args[2] as u32 as i32)
             }
-            188 => self.files.stat(user, args[0], args[1]),
+            188 => {
+                if let Ok(path) = guest_files::read_path(user, args[0]) {
+                    if !path.is_empty() && path[0] != b'/' && self.working_directory.is_none() {
+                        return Err(
+                            "Guest working directory is not configured for relative stat".into(),
+                        );
+                    }
+                }
+                self.files
+                    .stat_at(user, args[0], args[1], self.working_directory.as_deref())
+            }
             // FreeBSD kern_fstat obtains descriptor metadata before sys_fstat copyout.
             189 => self
                 .descriptors
@@ -735,6 +798,44 @@ mod tests {
         assert!(kernel.register_working_directory(b"/second").is_err());
     }
     #[test]
+    fn cwd_registration_has_directory_identity_and_preserves_policy() {
+        let mut kernel = Kernel::new(0, 0x1000).unwrap();
+        kernel.register_working_directory(b"/app0/data").unwrap();
+        let record = kernel.files.stat_record(b"/app0/data").unwrap();
+        assert_eq!(
+            u16::from_le_bytes(record[8..10].try_into().unwrap()),
+            0o040555
+        );
+        assert!(matches!(
+            kernel.files.plan_mkdir(b"/app0/data/new", None, 0o755),
+            Err(30)
+        ));
+
+        let mut kernel = Kernel::new(0, 0x1000).unwrap();
+        kernel
+            .files
+            .register_directory(b"/save", 0o700, false)
+            .unwrap();
+        let before = kernel.files.stat_record(b"/save").unwrap();
+        kernel.register_working_directory(b"/save").unwrap();
+        assert_eq!(kernel.files.stat_record(b"/save").unwrap(), before);
+        assert!(
+            kernel
+                .files
+                .plan_mkdir(b"child", kernel.working_directory_bytes(), 0o700)
+                .is_ok()
+        );
+
+        let mut kernel = Kernel::new(0, 0x1000).unwrap();
+        kernel.files.register(b"/file", Vec::new()).unwrap();
+        let before = kernel.files.stat_record(b"/").unwrap();
+        assert!(kernel.register_working_directory(b"/file/child").is_err());
+        assert!(kernel.working_directory_bytes().is_none());
+        assert_eq!(kernel.files.stat_record(b"/").unwrap(), before);
+        assert!(kernel.register_working_directory(b"/file").is_err());
+        kernel.register_working_directory(b"/valid").unwrap();
+    }
+    #[test]
     fn sandbox_path_validates_both_outputs_before_atomic_commit() {
         let mut kernel = Kernel::new(0, 0x1000).unwrap();
         let mut errno = [0u8; 4];
@@ -1111,5 +1212,84 @@ mod tests {
         assert_eq!(user.load(0x1000, 4).unwrap(), 9);
         assert!(kernel.syscall(&mut user, 21, [0; 6]).is_err());
         assert_eq!(user.load(0x1000, 4).unwrap(), 9);
+    }
+}
+
+#[cfg(test)]
+mod directory_bridge_tests {
+    use super::*;
+    use crate::descriptors::OpenOptions;
+    #[test]
+    fn mkdir_open_stat_share_cwd_nodes_and_file_identity() {
+        let mut kernel = Kernel::new(0, 0x1000).unwrap();
+        kernel.files.allow_create_directory(b"/save").unwrap();
+        assert!(
+            kernel
+                .open_file_path(b"new/file", OpenOptions::read_only())
+                .is_err()
+        );
+        kernel.register_working_directory(b"/save").unwrap();
+        let mut errno = [0; 4];
+        let mut path = [0u8; 64];
+        let mut output = [0u8; STAT_SIZE];
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut errno, true, false).unwrap();
+        memory.add(0x2000, &mut path, true, false).unwrap();
+        memory.add(0x3000, &mut output, true, false).unwrap();
+        memory.write(0x2000, b"new\0").unwrap();
+        let plan = kernel.plan_mkdir(&memory, 0x2000, 0o755).unwrap().unwrap();
+        kernel.commit_mkdir(plan).unwrap();
+        assert!(matches!(
+            kernel.plan_mkdir(&memory, 0x2000, 0o755).unwrap(),
+            Err(17)
+        ));
+        let options = OpenOptions {
+            write: true,
+            create: true,
+            ..OpenOptions::read_only()
+        };
+        let first = kernel
+            .open_file_path(b"new/file", options)
+            .unwrap()
+            .unwrap();
+        let second = kernel
+            .open_file_path(b"./new/../new/file", OpenOptions::read_only())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            kernel.descriptors.stat_file(&first).unwrap(),
+            kernel.descriptors.stat_file(&second).unwrap()
+        );
+        memory.write(0x2000, b"new/file\0").unwrap();
+        assert!(kernel.stat_will_write(&memory, 0x2000));
+        assert_eq!(
+            kernel
+                .syscall(&mut memory, 188, [0x2000, 0x3000, 0, 0, 0, 0])
+                .unwrap(),
+            (0, false)
+        );
+        assert_eq!(
+            memory.read(0x3000, STAT_SIZE).unwrap(),
+            kernel.descriptors.stat_file(&first).unwrap()
+        );
+        assert!(matches!(
+            kernel
+                .open_file_path(b"new/file/../other", options)
+                .unwrap(),
+            Err(20)
+        ));
+        assert!(matches!(
+            kernel.open_file_path(b"missing/../other", options).unwrap(),
+            Err(2)
+        ));
+        assert!(matches!(
+            kernel
+                .open_file_path(b"new/file/", OpenOptions::read_only())
+                .unwrap(),
+            Err(20)
+        ));
+        assert_eq!(kernel.files.content_bytes(), 0);
+        assert_eq!(kernel.descriptors.close_file(&first), 0);
+        assert_eq!(kernel.descriptors.close_file(&second), 0);
     }
 }

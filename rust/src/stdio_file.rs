@@ -690,14 +690,10 @@ impl Store {
                 exclusive: mode.exclusive,
                 cloexec: mode.cloexec,
             };
-            let token =
-                match kernel
-                    .descriptors
-                    .open_file_options(&mut kernel.files, &path, options)?
-                {
-                    Ok(token) => token,
-                    Err(e) => return fail(memory, e, 0),
-                };
+            let token = match kernel.open_file_path(&path, options)? {
+                Ok(token) => token,
+                Err(e) => return fail(memory, e, 0),
+            };
             if mode.append {
                 kernel
                     .descriptors
