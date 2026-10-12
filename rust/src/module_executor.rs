@@ -748,6 +748,42 @@ pub enum Execution {
         continuation: Box<Continuation>,
     },
 }
+impl Execution {
+    /// Lower a suspended context's lifetime instruction allowance. Never grants
+    /// extra fuel and never changes CPU registers or execution position.
+    pub fn cap_instruction_fuel(&mut self, limit: u64) {
+        let continuation = match self {
+            Self::QuantumYield(wait) => wait.continuation.as_mut(),
+            Self::MutexWait(wait) => wait.continuation.as_mut(),
+            Self::Dlsym { continuation, .. }
+            | Self::SysmoduleLoadInternal { continuation, .. }
+            | Self::StopUnloadModule { continuation, .. }
+            | Self::LoadStartModule { continuation, .. } => Some(&mut **continuation),
+            _ => None,
+        };
+        if let Some(state) = continuation {
+            state.cpu.fuel = state.cpu.fuel.min(limit);
+        }
+    }
+    /// Borrow the owned stack of suspended execution while another worker runs.
+    /// The scheduler must map every live stack to preserve shared stack arguments.
+    pub fn stack_region(&mut self) -> Result<Option<DataRegion<'_>>> {
+        match self {
+            Self::QuantumYield(wait) => wait.stack_region().map(Some),
+            Self::MutexWait(wait) => Ok(Some(
+                wait.continuation
+                    .as_mut()
+                    .ok_or("Mutex wait already consumed")?
+                    .stack_region(),
+            )),
+            Self::Dlsym { continuation, .. }
+            | Self::SysmoduleLoadInternal { continuation, .. }
+            | Self::StopUnloadModule { continuation, .. }
+            | Self::LoadStartModule { continuation, .. } => Ok(Some(continuation.stack_region())),
+            Self::WorkerReturned(_) | Self::Returned(_) | Self::ExitRequested(_) => Ok(None),
+        }
+    }
+}
 enum Flow {
     Finished(Execution),
     TranslationMiss {
@@ -757,6 +793,7 @@ enum Flow {
     },
 }
 pub struct NativeExecutor {
+    consumed_instruction_fuel: u128,
     worker_quantum: Option<u64>,
     mutex_wait_owner: Rc<()>,
     pub thread_attributes: crate::guest_thread_attr::GuestThreadAttributes,
@@ -803,6 +840,13 @@ pub struct NativeExecutor {
     stack_size: usize,
 }
 impl NativeExecutor {
+    pub(crate) fn execution_identity(&self) -> Rc<()> {
+        self.mutex_wait_owner.clone()
+    }
+    /// Monotonic count of translated instructions and charged service dispatches.
+    pub fn consumed_instruction_fuel(&self) -> u128 {
+        self.consumed_instruction_fuel
+    }
     /// Bound future worker slices; lifetime instruction/transition budgets remain
     /// independent. Module entries retain their existing synchronous behavior.
     pub fn set_worker_quantum(&mut self, quantum: Option<u64>) -> Result<()> {
@@ -1242,6 +1286,7 @@ impl NativeExecutor {
         let mut tls = crate::guest_tls::GuestTls::default();
         tls.register_thread(MAIN_GUEST_THREAD)?;
         Ok(Self {
+            consumed_instruction_fuel: 0,
             worker_quantum: None,
             mutex_wait_owner: Rc::new(()),
             thread_attributes: crate::guest_thread_attr::GuestThreadAttributes::default(),
@@ -1946,6 +1991,7 @@ impl NativeExecutor {
                             },
                         };
                         cpu.fuel -= 1;
+                        self.consumed_instruction_fuel += 1;
                         drop(memory);
                         self.exit_context = Some(Box::new(Continuation {
                             quantum: slice.0,
@@ -1995,6 +2041,7 @@ impl NativeExecutor {
                     }
                     cpu.registers[4] = sp;
                     cpu.fuel -= 1;
+                    self.consumed_instruction_fuel += 1;
                     if matches!(
                         service,
                         Service::Dlsym
@@ -2869,6 +2916,7 @@ impl NativeExecutor {
             let spent = dispatch_fuel
                 .checked_sub(cpu.fuel)
                 .ok_or("Translation increased instruction fuel")?;
+            self.consumed_instruction_fuel += u128::from(spent);
             cpu.fuel = total_fuel - spent;
             if slice.0.is_some() {
                 slice.1 -= spent;

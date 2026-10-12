@@ -19,6 +19,7 @@ mod pad_native;
 mod puts_native;
 mod quantum_native;
 mod realloc_native;
+mod scheduler_native;
 mod sprx_symbol_native;
 mod stat_native;
 mod stdio_native;
@@ -28,6 +29,7 @@ mod tls_native;
 mod truncate_native;
 mod user_service_native;
 mod vmovsd_native;
+mod vmulsd_native;
 mod worker_native;
 fn main() -> Result<(), String> {
     let file = std::fs::read(
@@ -49,6 +51,8 @@ fn main() -> Result<(), String> {
     worker_native::verify(Path::new(&archive), Path::new(&directory))?;
     quantum_native::verify(Path::new(&archive), Path::new(&directory))?;
     truncate_native::verify(Path::new(&archive), Path::new(&directory))?;
+    scheduler_native::verify(Path::new(&archive), Path::new(&directory))?;
+    vmulsd_native::verify(Path::new(&archive), Path::new(&directory))?;
     user_service_native::verify(Path::new(&archive), Path::new(&directory))?;
     pad_native::verify(Path::new(&archive), Path::new(&directory))?;
     puts_native::verify(Path::new(&archive), Path::new(&directory))?;

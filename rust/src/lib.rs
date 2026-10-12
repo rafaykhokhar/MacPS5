@@ -67,3 +67,5 @@ pub mod equeue;
 pub mod metal_present;
 
 pub mod scalar_fp;
+
+pub mod scheduler;

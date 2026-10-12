@@ -22,7 +22,7 @@ Unlike AnyPS5's Linux/Windows relinking approach, MacPS5 needs CPU translation a
 
 The pinned homebrew startup resolves ten named dependency providers and the implemented mutex/thread-attribute imports. It stops at the missing `pthread_create` import and requests normal exit with status -1 before game main. Thread scheduling and process cleanup remain incomplete.
 
-Focused ARM64 instruction and runtime checks, plus isolated Metal rendering/presentation checks, pass on the development machine. These do not establish game rendering, native-port performance, or full instruction/system compatibility. Experimental floating-point multiplication is not yet enabled in the translator. Full-width worker arguments and returns pass native checks, including suspension and lazy translation; this does not implement thread scheduling.
+Focused ARM64 instruction and runtime checks, plus isolated Metal rendering/presentation checks, pass on the development machine. These do not establish game rendering, native-port performance, or full instruction/system compatibility. Scalar multiplication passes native checks; fused multiply-add and broader CPU coverage remain unfinished. Full-width worker arguments and returns pass native checks, including suspension and lazy translation; this does not implement thread scheduling.
 
 Unsupported operations and invalid guest memory stop explicitly rather than silently reporting success.
 
