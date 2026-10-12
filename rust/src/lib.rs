@@ -80,3 +80,4 @@ pub mod integer_parse;
 pub mod float_parse;
 pub mod c_locale;
 pub mod float_service;
+pub mod scan;

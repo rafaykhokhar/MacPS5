@@ -356,6 +356,7 @@ pub enum Service {
     Strtoull,
     Atof,
     Strtod,
+    Vsscanf,
     Malloc,
     Realloc,
     Calloc,
@@ -509,6 +510,7 @@ impl Service {
             | Self::Strtoull
             | Self::Atof
             | Self::Strtod
+            | Self::Vsscanf
             | Self::ThreadSigmask
             | Self::ThreadSetCancelType
             | Self::ThreadGetschedparam
@@ -3151,6 +3153,31 @@ impl NativeExecutor {
                         } else {
                             parsed.bits
                         }
+                    } else if matches!(service, Service::Vsscanf) {
+                        let plan = crate::scan::guest_plan(&memory, cpu.registers[7], cpu.registers[6], cpu.registers[2])?;
+                        for write in &plan.writes {
+                            validate_net_output(&memory, write.address, write.bytes.len(), sp, ret)?;
+                            memory.validate_write(write.address, write.bytes.len())?;
+                        }
+                        let errno = if plan.errno.is_some() {
+                            let address = self.kernel.as_ref().ok_or("Missing scanf errno context")?.errno_address();
+                            let end = address.checked_add(4).ok_or("Scanf errno address overflow")?;
+                            for (start, length) in plan.protected_ranges.iter().copied().chain(plan.writes.iter().map(|write| (write.address, write.bytes.len()))) {
+                                let other_end = start.checked_add(length as u64).ok_or("Scanf protected range overflow")?;
+                                if address < other_end && start < end {
+                                    return Err("Scanf errno aliases input, arguments or output".into());
+                                }
+                            }
+                            validate_net_output(&memory, address, 4, sp, ret)?;
+                            memory.validate_write(address, 4)?;
+                            Some(address)
+                        } else { None };
+                        // Ordinary matching failure retains successful assignments
+                        // in this plan. Guard failures commit nothing; sequential
+                        // output aliases retain the plan's original write order.
+                        for write in &plan.writes { memory.write(write.address, &write.bytes)?; }
+                        if let Some(address) = errno { memory.store(address, plan.errno.expect("Validated errno") as u64, 4)?; }
+                        plan.result as u32 as u64
                     } else if matches!(service, Service::Atof | Service::Strtod) {
                         let rounding = crate::float_service::rounding(&cpu)?;
                         let source = cpu.registers[7];
