@@ -1,0 +1,9 @@
+[package]
+name = "finite-fp-oracle"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rustc_apfloat = "=0.2.3"
+native-ps5 = { path = "../../rust" }

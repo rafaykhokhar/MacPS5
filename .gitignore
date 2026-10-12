@@ -1,0 +1,17 @@
+.DS_Store
+**/target/
+/build/
+/work/
+*.o
+*.a
+*.dylib
+*.dSYM/
+__pycache__/
+*.pyc
+.env
+.env.*
+*.pem
+*.key
+*.elf
+*.pkg
+*.iso

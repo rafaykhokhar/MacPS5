@@ -1,0 +1,3014 @@
+//! Rust-owned translated-module executor with dependency mappings and bounded services.
+#![allow(unsafe_code)]
+use crate::{
+    Result,
+    guest_memory::{DataRegion, Memory},
+    legacy_cpu::Cpu,
+    loader::Image,
+    modules::{Arguments, Executor},
+};
+use std::collections::BTreeMap;
+use std::rc::Rc;
+const ERROR_TEXT: u64 = 0x7fff00000000;
+// Disjoint from the 128-byte ERROR_TEXT buffer. Owned per executor; future
+// multi-thread guest execution will need per-guest-thread network errno slots.
+const NET_ERRNO: u64 = 0x7fff00000100;
+const LOCALE_NAME: u64 = 0x7fff00000200;
+pub const MAIN_GUEST_THREAD: u64 = 1;
+fn validate_net_output(
+    memory: &Memory<'_>,
+    output: u64,
+    length: usize,
+    sp: u64,
+    ret: u64,
+) -> Result<()> {
+    let end = output
+        .checked_add(length as u64)
+        .ok_or("Network output overflow")?;
+    let frame_end = sp.checked_add(8).ok_or("Network return frame overflow")?;
+    if memory.load(sp, 8)? != ret || (output < frame_end && sp < end) {
+        return Err("Network output overlaps or changes its live return frame".into());
+    }
+    Ok(())
+}
+fn validate_video_attribute_return(
+    memory: &Memory<'_>,
+    output: u64,
+    sp: u64,
+    ret: u64,
+) -> Result<()> {
+    if memory.load(sp, 8)? != ret {
+        return Err("Video attribute return frame changed before write".into());
+    }
+    let end = output
+        .checked_add(80)
+        .ok_or("Video attribute range overflow")?;
+    let frame_end = sp.checked_add(8).ok_or("Video return frame overflow")?;
+    if output < frame_end && sp < end {
+        return Err("Video attribute overlaps its live return frame".into());
+    }
+    Ok(())
+}
+fn video_stack_arguments(memory: &Memory<'_>, sp: u64) -> Result<(u64, u64)> {
+    Ok((
+        memory.load(sp.checked_add(8).ok_or("Video argument stack overflow")?, 8)?,
+        memory.load(
+            sp.checked_add(16).ok_or("Video argument stack overflow")?,
+            8,
+        )?,
+    ))
+}
+/// Check the live return frame before a queue can publish output or consume an
+/// event. The generic post-service check is too late for failure atomicity.
+fn validate_equeue_return(
+    memory: &Memory<'_>,
+    outputs: (u64, i32, u64),
+    frame: (u64, u64),
+    terminal: bool,
+    registered_return: bool,
+) -> Result<()> {
+    let (events, maximum, count) = outputs;
+    let (sp, ret) = frame;
+    if memory.load(sp, 8)? != ret {
+        return Err("Event wait return frame changed before delivery".into());
+    }
+    if (terminal && ret != u64::MAX)
+        || (!terminal && (!registered_return || !memory.executable(ret)))
+    {
+        return Err("Invalid event wait return target before delivery".into());
+    }
+    if !(1..=crate::equeue::MAX_EVENTS as i32).contains(&maximum) {
+        return Err("Invalid event queue capacity".into());
+    }
+    let frame_end = sp
+        .checked_add(8)
+        .ok_or("Event wait return frame overflow")?;
+    for (start, length) in [
+        (events, maximum as u64 * crate::equeue::EVENT_SIZE as u64),
+        (count, 4),
+    ] {
+        let end = start
+            .checked_add(length)
+            .ok_or("Event output range overflow")?;
+        if start < frame_end && sp < end {
+            return Err("Event wait outputs overlap its live return frame".into());
+        }
+    }
+    Ok(())
+}
+pub const MEMORY_FIXTURE_CODE: &[u8] = &[
+    0x55, 0x48, 0x89, 0xe5, 0x48, 0x89, 0x37, 0x48, 0x8b, 0x0f, 0x31, 0xc0, 0x5d, 0xc3,
+];
+
+#[cfg(test)]
+mod equeue_return_tests {
+    use super::*;
+    #[test]
+    fn network_outputs_cannot_overwrite_or_wrap_return_frame() {
+        let mut bytes = [0xa5; 128];
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut bytes, true, false).unwrap();
+        memory.store(0x1040, 0x4000, 8).unwrap();
+        let before = memory.read(0x1000, 128).unwrap().to_vec();
+        for (output, length) in [(0x1040, 4), (0x103d, 4), (0x1047, 32), (u64::MAX - 1, 4)] {
+            assert!(validate_net_output(&memory, output, length, 0x1040, 0x4000).is_err());
+        }
+        assert!(validate_net_output(&memory, 0x1000, 4, 0x1040, 0x4001).is_err());
+        validate_net_output(&memory, 0x103c, 4, 0x1040, 0x4000).unwrap();
+        validate_net_output(&memory, 0x1048, 32, 0x1040, 0x4000).unwrap();
+        assert_eq!(memory.read(0x1000, 128).unwrap(), before);
+        const {
+            assert!(NET_ERRNO >= ERROR_TEXT + 128);
+        }
+    }
+    #[test]
+    fn video_stack_arguments_and_attribute_frame_are_guarded() {
+        let mut bytes = [0xa5; 256];
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut bytes, true, false).unwrap();
+        memory.store(0x1080, 0x4000, 8).unwrap();
+        memory.store(0x1088, 7, 8).unwrap();
+        memory.store(0x1090, 8, 8).unwrap();
+        assert_eq!(video_stack_arguments(&memory, 0x1080).unwrap(), (7, 8));
+        assert!(video_stack_arguments(&memory, 0x10f0).is_err());
+        assert!(video_stack_arguments(&memory, u64::MAX - 8).is_err());
+        let before = memory.read(0x1000, 256).unwrap().to_vec();
+        for output in [0x1031, 0x1080, 0x1087, u64::MAX - 40] {
+            assert!(validate_video_attribute_return(&memory, output, 0x1080, 0x4000).is_err());
+        }
+        assert!(validate_video_attribute_return(&memory, 0x1000, 0x1080, 0x4001).is_err());
+        validate_video_attribute_return(&memory, 0x1030, 0x1080, 0x4000).unwrap();
+        validate_video_attribute_return(&memory, 0x1088, 0x1080, 0x4000).unwrap();
+        assert_eq!(memory.read(0x1000, 256).unwrap(), before);
+    }
+    #[test]
+    fn invalid_return_or_overlapping_outputs_preserve_real_queued_event() {
+        let mut backing = [0xa5; 512];
+        let mut executable = [0xc3];
+        let mut memory = Memory::default();
+        memory.add(0x2000, &mut backing, true, false).unwrap();
+        memory.add(0x4000, &mut executable, false, true).unwrap();
+        memory.write(0x2110, b"flip\0").unwrap();
+        memory.store(0x2080, 0x4000, 8).unwrap();
+        let mut queues = crate::equeue::Equeues::default();
+        queues.create(&mut memory, 0x2100, 0x2110).unwrap();
+        let handle = memory.load(0x2100, 8).unwrap();
+        let event = crate::equeue::Event {
+            ident: 7,
+            filter: -1,
+            flags: 0,
+            fflags: 0,
+            data: 9,
+            udata: 0,
+        };
+        queues.enqueue(handle, event).unwrap();
+        let before = memory.read(0x2000, 512).unwrap().to_vec();
+        for (events, count, ret, registered) in [
+            (0x2080, 0x2040, 0x4000, true),  // event overwrites return
+            (0x2061, 0x2040, 0x4000, true),  // one-byte event overlap
+            (0x2000, 0x207d, 0x4000, true),  // one-byte count overlap
+            (0x2000, 0x2084, 0x4000, true),  // count inside return
+            (0x2000, 0x2040, 0x4001, true),  // changed return word
+            (0x2000, 0x2040, 0x4000, false), // executable but unregistered
+        ] {
+            let outcome = validate_equeue_return(
+                &memory,
+                (events, 1, count),
+                (0x2080, ret),
+                false,
+                registered,
+            )
+            .and_then(|()| queues.wait(&mut memory, handle, events, 1, count, 0));
+            assert!(outcome.is_err());
+            assert_eq!(queues.pending_count(handle).unwrap(), 1);
+            assert_eq!(memory.read(0x2000, 512).unwrap(), before);
+        }
+        memory.store(0x2080, 0x2000, 8).unwrap();
+        assert!(
+            validate_equeue_return(&memory, (0x2000, 1, 0x2040), (0x2080, 0x2000), false, true)
+                .is_err()
+        );
+        assert_eq!(queues.pending_count(handle).unwrap(), 1);
+        memory.store(0x2080, 0x4000, 8).unwrap();
+        // Adjacent outputs are allowed, and a genuine registered return permits
+        // exactly one delivery after every precommit check succeeds.
+        validate_equeue_return(&memory, (0x2060, 1, 0x2088), (0x2080, 0x4000), false, true)
+            .unwrap();
+        assert_eq!(
+            queues
+                .wait(&mut memory, handle, 0x2060, 1, 0x2088, 0)
+                .unwrap(),
+            crate::equeue::WaitOutcome::Ready(0)
+        );
+        assert_eq!(memory.load(0x2080, 8).unwrap(), 0x4000);
+        assert_eq!(memory.read(0x2060, 32).unwrap(), event.encode());
+        assert_eq!(queues.pending_count(handle).unwrap(), 0);
+        memory.store(0x2080, u64::MAX, 8).unwrap();
+        validate_equeue_return(
+            &memory,
+            (0x2000, 1, 0x2040),
+            (0x2080, u64::MAX),
+            true,
+            false,
+        )
+        .unwrap();
+    }
+}
+pub const LOOP_FIXTURE_BLOCKS: &[(u64, &[u8], &str)] = &[
+    (
+        0x100,
+        &[0x48, 0x89, 0xf1, 0x31, 0xc0, 0x48, 0x85, 0xc9, 0x74, 0x16],
+        "rust_module_loop_entry",
+    ),
+    (
+        0x10a,
+        &[0x83, 0xc0, 0x01, 0x48, 0x83, 0xe9, 0x01, 0x75, 0xf7],
+        "rust_module_loop_body",
+    ),
+    (
+        0x113,
+        &[0x48, 0x89, 0x07, 0x31, 0xc0, 0xc3],
+        "rust_module_loop_exit",
+    ),
+    (
+        0x120,
+        &[0x48, 0x89, 0x07, 0x31, 0xc0, 0xc3],
+        "rust_module_loop_zero",
+    ),
+];
+pub const SHIFT_FIXTURE_CODE: &[u8] = &[
+    0x48, 0x89, 0xf0, // mov rax,rsi
+    0x48, 0xc1, 0xe0, 0x07, // shl rax,7
+    0x48, 0xc1, 0xc8, 0x05, // ror rax,5
+    0x48, 0x89, 0x07, // mov [rdi],rax
+    0x31, 0xc0, 0xc3,
+];
+pub const VECTOR_FIXTURE_CODE: &[u8] = &[
+    0xc5, 0xfc, 0x10, 0x06, // vmovups ymm0,[rsi]
+    0xc5, 0xfc, 0x57, 0x46, 0x20, // vxorps ymm0,ymm0,[rsi+32]
+    0xc5, 0xfc, 0x11, 0x07, // vmovups [rdi],ymm0
+    0x31, 0xc0, 0xc3,
+];
+pub const SERVICE_CALL_CODE: &[u8] = &[
+    0xba, 3, 0, 0, 0, // mov edx,3
+    0x48, 0xb8, 0, 0, 0x70, 0, 0, 0, 0, 0, // mov rax,0x700000
+    0xff, 0xd0, // call rax
+];
+pub const SERVICE_RETURN_CODE: &[u8] = &[0x48, 0x89, 0x47, 0x40, 0x31, 0xc0, 0xc3];
+pub const IMPORT_CALL_CODE: &[u8] = &[0xba, 3, 0, 0, 0, 0xff, 0x15, 0x75, 0x04, 0, 0];
+/// A real undefined strcpy symbol and RELA-patched call slot, not a fixed thunk.
+pub fn imported_service_fixture() -> Vec<u8> {
+    let mut file = memory_fixture();
+    file.resize(0x900, 0);
+    fn put(file: &mut [u8], p: usize, value: u64) {
+        file[p..p + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    file[56..58].copy_from_slice(&3u16.to_le_bytes());
+    for (p, value) in [(96, 0x500), (104, 0x500), (152, 0x400), (160, 0x400)] {
+        put(&mut file, p, value);
+    }
+    for (i, value) in [0x400000002, 0x300, 0x300, 0, 160, 160, 8]
+        .into_iter()
+        .enumerate()
+    {
+        put(&mut file, 176 + i * 8, value);
+    }
+    let strings = b"\0strcpy\0libstrings.prx\0";
+    file[0x450..0x450 + strings.len()].copy_from_slice(strings);
+    for (i, (tag, value)) in [
+        (6, 0x400),
+        (11, 24),
+        (5, 0x450),
+        (10, strings.len() as u64),
+        (7, 0x480),
+        (8, 24),
+        (9, 24),
+        (1, 8),
+        (4, 0x4c0),
+        (0, 0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        put(&mut file, 0x300 + i * 16, tag);
+        put(&mut file, 0x308 + i * 16, value);
+    }
+    file[0x418..0x41c].copy_from_slice(&1u32.to_le_bytes());
+    file[0x41c] = 0x12;
+    for (i, value) in [1u32, 2, 1, 0, 0].into_iter().enumerate() {
+        file[0x4c0 + i * 4..0x4c4 + i * 4].copy_from_slice(&value.to_le_bytes());
+    }
+    put(&mut file, 0x480, 0x580);
+    put(&mut file, 0x488, (1 << 32) | 7);
+    file[0x100..0x10b].copy_from_slice(IMPORT_CALL_CODE);
+    file[0x10b..0x112].copy_from_slice(SERVICE_RETURN_CODE);
+    file[0x520..0x527].copy_from_slice(b"linked\0");
+    file
+}
+pub fn memory_fixture() -> Vec<u8> {
+    let mut file = crate::modules::fixture();
+    file.resize(0x600, 0);
+    file[56..58].copy_from_slice(&2u16.to_le_bytes());
+    for (i, value) in [0x600000001u64, 0x500, 0x500, 0, 0x100, 0x100, 1]
+        .into_iter()
+        .enumerate()
+    {
+        file[120 + i * 8..128 + i * 8].copy_from_slice(&value.to_le_bytes());
+    }
+    file[0x100..0x100 + MEMORY_FIXTURE_CODE.len()].copy_from_slice(MEMORY_FIXTURE_CODE);
+    file
+}
+struct Block {
+    start: u64,
+    bytes: Rc<[u8]>,
+    function: unsafe extern "C" fn(*mut Cpu),
+    _library: Option<Rc<crate::module_compiler::Library>>,
+}
+/// Explicit and opt-in automatic rebuilds share a finite attempt allowance.
+pub const MAX_TRANSLATION_REBUILDS: usize = 16;
+const MAX_TRANSLATION_SOURCE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_TRANSLATION_SOURCES: usize = 256;
+struct TranslationSource {
+    file: Rc<[u8]>,
+    roots: std::collections::BTreeSet<u64>,
+    instruction_limit: usize,
+    rebuilds: usize,
+    archive: std::path::PathBuf,
+    directory: std::path::PathBuf,
+}
+#[derive(Clone, Copy)]
+pub enum Service {
+    Getenv,
+    Malloc,
+    Realloc,
+    Calloc,
+    Free,
+    Strerror,
+    InternalStrerror,
+    Getargc,
+    Getargv,
+    SystemHideSplashScreen,
+    SystemLaunchWebBrowser,
+    UserInitialize,
+    UserGetForeground,
+    UserGetLoginList,
+    UserGetName,
+    PadInitialize,
+    PadOpen,
+    PadClose,
+    PadReadState,
+    PadSetLightBar,
+    PadSetVibration,
+    PadSetVibrationMode,
+    AudioInitialize,
+    AudioOpen,
+    AudioOutput,
+    AudioClose,
+    DirectAllocate,
+    DirectMap,
+    DirectRelease,
+    EqueueCreate,
+    EqueueDelete,
+    EqueueWait,
+    VideoOpen,
+    VideoClose,
+    VideoAddFlipEvent,
+    VideoDeleteFlipEvent,
+    VideoSetFlipRate,
+    VideoSetBufferAttribute,
+    VideoRegisterBuffers,
+    VideoSubmitFlip,
+    KeyboardInitialize,
+    KeyboardOpen,
+    KeyboardReadState,
+    KeyboardClose,
+    ImeInitialize,
+    ImeGetStatus,
+    ImeGetResult,
+    NetErrnoLoc,
+    NetPoolCreate,
+    NetPoolDestroy,
+    NetResolverCreate,
+    NetResolverDestroy,
+    NetResolverStartAton,
+    NetResolverStartNtoa,
+    ImeTerminate,
+    Sprintf,
+    Snprintf,
+    Vsnprintf,
+    Errno,
+    Getpid,
+    Syscall,
+    Dlsym,
+    LoadStartModule,
+    StopUnloadModule,
+    SysmoduleLoadInternal,
+    Memcpy,
+    Strdup,
+    Memset,
+    Setlocale,
+    Puts,
+    Fprintf,
+    Fflush,
+    ThreadAttrInit,
+    ThreadAttrDestroy,
+    ThreadAttrSetDetachState,
+    ThreadAttrSetStackSize,
+    MutexAttrInit,
+    MutexAttrSetType,
+    MutexAttrDestroy,
+    MutexInit,
+    MutexDestroy,
+    MutexLock,
+    MutexTryLock,
+    MutexUnlock,
+    TlsKeyCreate,
+    TlsKeyDelete,
+    TlsGetSpecific,
+    TlsSetSpecific,
+    Exit,
+    ImmediateExit,
+    Strcpy,
+    Strcat,
+    Strcmp,
+    Strncmp,
+    Strlen,
+}
+impl Service {
+    fn operation(self) -> u64 {
+        match self {
+            Self::Getenv
+            | Self::Memcpy
+            | Self::Strdup
+            | Self::Memset
+            | Self::Setlocale
+            | Self::Puts
+            | Self::Fprintf
+            | Self::Fflush
+            | Self::ThreadAttrInit
+            | Self::ThreadAttrDestroy
+            | Self::ThreadAttrSetDetachState
+            | Self::ThreadAttrSetStackSize
+            | Self::MutexAttrInit
+            | Self::MutexAttrSetType
+            | Self::MutexAttrDestroy
+            | Self::MutexInit
+            | Self::MutexDestroy
+            | Self::MutexLock
+            | Self::MutexTryLock
+            | Self::MutexUnlock
+            | Self::TlsKeyCreate
+            | Self::TlsKeyDelete
+            | Self::TlsGetSpecific
+            | Self::TlsSetSpecific
+            | Self::Exit
+            | Self::ImmediateExit
+            | Self::Malloc
+            | Self::Realloc
+            | Self::Calloc
+            | Self::Free
+            | Self::Strerror
+            | Self::InternalStrerror
+            | Self::Getargc
+            | Self::Getargv
+            | Self::SystemHideSplashScreen
+            | Self::SystemLaunchWebBrowser
+            | Self::UserInitialize
+            | Self::UserGetForeground
+            | Self::UserGetLoginList
+            | Self::UserGetName
+            | Self::PadInitialize
+            | Self::PadOpen
+            | Self::PadClose
+            | Self::PadReadState
+            | Self::PadSetLightBar
+            | Self::PadSetVibration
+            | Self::PadSetVibrationMode
+            | Self::AudioInitialize
+            | Self::AudioOpen
+            | Self::AudioOutput
+            | Self::AudioClose
+            | Self::DirectAllocate
+            | Self::DirectMap
+            | Self::DirectRelease
+            | Self::EqueueCreate
+            | Self::EqueueDelete
+            | Self::EqueueWait
+            | Self::VideoOpen
+            | Self::VideoClose
+            | Self::VideoAddFlipEvent
+            | Self::VideoDeleteFlipEvent
+            | Self::VideoSetFlipRate
+            | Self::VideoSetBufferAttribute
+            | Self::VideoRegisterBuffers
+            | Self::VideoSubmitFlip
+            | Self::KeyboardInitialize
+            | Self::KeyboardOpen
+            | Self::KeyboardReadState
+            | Self::KeyboardClose
+            | Self::ImeInitialize
+            | Self::ImeGetStatus
+            | Self::ImeGetResult
+            | Self::NetErrnoLoc
+            | Self::NetPoolCreate
+            | Self::NetPoolDestroy
+            | Self::NetResolverCreate
+            | Self::NetResolverDestroy
+            | Self::NetResolverStartAton
+            | Self::NetResolverStartNtoa
+            | Self::ImeTerminate
+            | Self::Sprintf
+            | Self::Snprintf
+            | Self::Vsnprintf
+            | Self::Errno
+            | Self::Getpid
+            | Self::Syscall
+            | Self::Dlsym
+            | Self::LoadStartModule
+            | Self::StopUnloadModule => {
+                unreachable!("loader services yield to the runtime")
+            }
+            Self::SysmoduleLoadInternal => unreachable!("sysmodule service yields to the runtime"),
+            Self::Strcpy => 0,
+            Self::Strcat => 1,
+            Self::Strcmp => 2,
+            Self::Strncmp => 3,
+            Self::Strlen => 4,
+        }
+    }
+}
+/// Owned state at a host-service boundary; contains no borrowed guest mappings.
+#[derive(Clone, Copy)]
+enum ReturnConvention {
+    ModuleStatus,
+    WorkerPointer,
+}
+impl ReturnConvention {
+    fn completed(self, value: u64) -> Execution {
+        match self {
+            Self::ModuleStatus => Execution::Returned(value as u32 as i32),
+            Self::WorkerPointer => Execution::WorkerReturned(value),
+        }
+    }
+}
+pub struct Continuation {
+    return_convention: ReturnConvention,
+    guest_thread: u64,
+    cpu: Cpu,
+    stack: Vec<u8>,
+    stack_address: u64,
+    remaining: u64,
+    caller_bias: u64,
+}
+impl Continuation {
+    pub fn guest_thread_id(&self) -> u64 {
+        self.guest_thread
+    }
+    pub fn stack_region(&mut self) -> DataRegion<'_> {
+        DataRegion {
+            address: self.stack_address,
+            bytes: &mut self.stack,
+            writable: true,
+        }
+    }
+    /// Temporarily map suspended storage for host service argument/result access.
+    /// The callback cannot retain mapped references beyond this call. The runtime
+    /// must keep the caller/dependency images alive until the continuation ends.
+    pub fn with_memory<T>(
+        &mut self,
+        image: &mut Image,
+        dependencies: &mut [&mut Image],
+        operation: impl FnOnce(&mut Memory<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.with_memory_data(image, dependencies, &mut [], operation)
+    }
+    pub fn with_memory_data<T>(
+        &mut self,
+        image: &mut Image,
+        dependencies: &mut [&mut Image],
+        data: &mut [DataRegion<'_>],
+        operation: impl FnOnce(&mut Memory<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.with_memory_context(image, dependencies, data, None, operation)
+    }
+    fn with_memory_context<T>(
+        &mut self,
+        image: &mut Image,
+        dependencies: &mut [&mut Image],
+        data: &mut [DataRegion<'_>],
+        allocations: Option<&mut crate::guest_memory::OwnedMappings>,
+        operation: impl FnOnce(&mut Memory<'_>) -> Result<T>,
+    ) -> Result<T> {
+        if image.bias != self.caller_bias {
+            return Err("Continuation belongs to different caller".into());
+        }
+        let mut memory = Memory::default();
+        for mapped in std::iter::once(image).chain(dependencies.iter_mut().map(|i| &mut **i)) {
+            for segment in &mut mapped.segments {
+                memory.add(
+                    segment.address,
+                    &mut segment.bytes,
+                    segment.flags & 2 != 0,
+                    segment.flags & 1 != 0,
+                )?;
+            }
+        }
+        memory.add(self.stack_address, &mut self.stack, true, false)?;
+        for region in data {
+            memory.add(region.address, region.bytes, region.writable, false)?;
+        }
+        if let Some(owner) = allocations {
+            memory.attach_owned(owner)?;
+        }
+        operation(&mut memory)
+    }
+}
+/// Validated input for the supported zero-flags, null-options loader subset.
+/// Addresses stay guest addresses; the runtime must map caller storage while
+/// executing the new module's start routine and writing its optional result.
+pub struct LoadRequest {
+    pub path: String,
+    pub arguments: Arguments,
+    pub result_address: u64,
+}
+impl LoadRequest {
+    pub fn read(memory: &Memory<'_>, arguments: [u64; 6]) -> Result<Self> {
+        let [path, size, pointer, flags, options, result_address] = arguments;
+        if path == 0 {
+            return Err("Null module path".into());
+        }
+        if flags != 0 || options != 0 {
+            return Err("Module load flags/options are unsupported".into());
+        }
+        let mut bytes = Vec::new();
+        for offset in 0..=1024u64 {
+            let byte =
+                memory.load(path.checked_add(offset).ok_or("Module path overflow")?, 1)? as u8;
+            if byte == 0 {
+                let path = String::from_utf8(bytes).map_err(|_| "Invalid module path encoding")?;
+                if !crate::module_files::valid_path(&path) {
+                    return Err("Invalid guest module path".into());
+                }
+                if size != 0 {
+                    memory.read(
+                        pointer,
+                        usize::try_from(size).map_err(|_| "Module argument size overflow")?,
+                    )?;
+                }
+                if result_address != 0 {
+                    memory.validate_write(result_address, 4)?;
+                }
+                return Ok(Self {
+                    path,
+                    arguments: Arguments { size, pointer },
+                    result_address,
+                });
+            }
+            bytes.push(byte);
+        }
+        Err("Module path exceeds 1024 bytes".into())
+    }
+}
+/// A termination request, not proof of libc cleanup or host resource teardown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitKind {
+    /// exit(): atexit callbacks and stdio finalization remain pending.
+    Normal,
+    /// _exit(): bypass libc callbacks; host resource teardown remains pending.
+    Immediate,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExitRequest {
+    pub status: i32,
+    pub kind: ExitKind,
+}
+/// An unacquired lock request. Dropping it cancels the request; it never unlocks
+/// an owned mutex. Its continuation cannot be passed to generic service resume.
+pub struct MutexWait {
+    owner: Rc<()>,
+    continuation: Option<Continuation>,
+    ticket: crate::guest_mutex::LockTicket,
+    ret: u64,
+    terminal: bool,
+}
+impl MutexWait {
+    pub fn guest_thread_id(&self) -> u64 {
+        self.ticket.thread_id()
+    }
+    pub fn slot_address(&self) -> u64 {
+        self.ticket.slot_address()
+    }
+    pub fn is_consumed(&self) -> bool {
+        self.continuation.is_none()
+    }
+}
+pub enum Execution {
+    /// Full-width pointer return from an explicitly invoked worker entry.
+    WorkerReturned(u64),
+    MutexWait(Box<MutexWait>),
+    ExitRequested(ExitRequest),
+    SysmoduleLoadInternal {
+        arguments: [u64; 6],
+        continuation: Box<Continuation>,
+    },
+    Dlsym {
+        arguments: [u64; 6],
+        continuation: Box<Continuation>,
+    },
+    Returned(i32),
+    StopUnloadModule {
+        arguments: [u64; 6],
+        continuation: Box<Continuation>,
+    },
+    LoadStartModule {
+        /// SysV arguments: path, size, args, flags, options, result pointer.
+        arguments: [u64; 6],
+        continuation: Box<Continuation>,
+    },
+}
+enum Flow {
+    Finished(Execution),
+    TranslationMiss {
+        bias: u64,
+        target: u64,
+        continuation: Box<Continuation>,
+    },
+}
+pub struct NativeExecutor {
+    mutex_wait_owner: Rc<()>,
+    pub thread_attributes: crate::guest_thread_attr::GuestThreadAttributes,
+    pub mutex: crate::guest_mutex::GuestMutex,
+    pub tls: crate::guest_tls::GuestTls,
+    selected_guest_thread: u64,
+    exit_request: Option<ExitRequest>,
+    // Kept owned for future cleanup and diagnostics; never an ordinary resumable call.
+    exit_context: Option<Box<Continuation>>,
+    pub user_service: crate::user_service::UserService,
+    pub pad: crate::pad::Pad,
+    pub keyboard: crate::keyboard::Keyboard,
+    pub ime_dialog: crate::ime_dialog::ImeDialog,
+    /// Host DNS is disabled initially. Configure before creating live resources.
+    pub network: crate::net_resolver::Resolver<crate::net_dns::DnsBackend>,
+    network_errno: [u8; 4],
+    pub locale: crate::guest_locale::GuestLocale,
+    pub stdout: crate::captured_stdout::CapturedStdout,
+    pub stdio: crate::guest_stdio::GuestStdio,
+    stderr_file: [u8; 312],
+    stderr_pointer: [u8; 8],
+    locale_name: [u8; 2],
+    pub audio: crate::audio_out::AudioOut<crate::audio_queue::AudioQueueBackend>,
+    pub direct_memory: crate::direct_memory::DirectMemory,
+    pub equeues: crate::equeue::Equeues,
+    pub video_out: crate::video_out::VideoOut<crate::video_out::MetalBackend>,
+    pub system_service: crate::system_service::SystemService,
+    /// Explicit guest argc/argv; no host command-line data is inherited.
+    pub process_arguments: Option<(u32, u64)>,
+    /// Guest NULL-terminated environment table; zero explicitly means empty.
+    pub environment: u64,
+    error_text: [u8; 128],
+    allocations: crate::guest_memory::OwnedMappings,
+    pub kernel: Option<crate::kernel::Kernel>,
+    blocks: BTreeMap<u64, Block>,
+    image_blocks: BTreeMap<(u64, u64), Block>,
+    translation_sources: BTreeMap<u64, TranslationSource>,
+    translation_source_bytes: usize,
+    automatic_translation: bool,
+    services: BTreeMap<u64, Service>,
+    pub fuel: u64,
+    pub transitions: u64,
+    stack_address: u64,
+    stack_size: usize,
+}
+impl NativeExecutor {
+    /// Identity used by new guest entries. This is never a host thread ID.
+    pub fn guest_thread_id(&self) -> u64 {
+        self.selected_guest_thread
+    }
+    /// Select an explicitly registered guest context for a new entry. This
+    /// creates no worker or scheduler. Resumes retain their captured identity.
+    pub fn select_guest_thread(&mut self, thread: u64) -> Result<()> {
+        self.require_running()?;
+        if !self.tls.contains_thread(thread) {
+            return Err("Guest TLS thread identity is not registered".into());
+        }
+        self.selected_guest_thread = thread;
+        Ok(())
+    }
+    /// Once requested, ordinary guest execution cannot resume. This does not
+    /// mean callbacks, buffered output, or native resource disposal completed.
+    pub fn exit_request(&self) -> Option<ExitRequest> {
+        self.exit_request
+    }
+    pub fn exit_remaining_fuel(&self) -> Option<u64> {
+        self.exit_context.as_ref().map(|context| context.cpu.fuel)
+    }
+    pub(crate) fn require_running(&self) -> Result<()> {
+        if let Some(request) = self.exit_request {
+            return Err(format!(
+                "Guest exit requested ({:?}, status {}); cleanup remains pending",
+                request.kind, request.status
+            ));
+        }
+        Ok(())
+    }
+    /// Inspect or update a suspended call with this process's owned allocations.
+    /// Storage is returned to its owner even when the callback fails.
+    pub fn with_suspended_memory<T>(
+        &mut self,
+        continuation: &mut Continuation,
+        image: &mut Image,
+        dependencies: &mut [&mut Image],
+        data: &mut [DataRegion<'_>],
+        operation: impl FnOnce(&mut Memory<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.with_suspended_runtime(continuation, image, dependencies, data, |memory, _| {
+            operation(memory)
+        })
+    }
+    fn with_suspended_runtime<T>(
+        &mut self,
+        continuation: &mut Continuation,
+        image: &mut Image,
+        dependencies: &mut [&mut Image],
+        data: &mut [DataRegion<'_>],
+        operation: impl FnOnce(&mut Memory<'_>, &mut crate::guest_mutex::GuestMutex) -> Result<T>,
+    ) -> Result<T> {
+        let reserved: Vec<_> = self.services.keys().copied().collect();
+        let mut mapped_data = data
+            .iter_mut()
+            .map(|region| DataRegion {
+                address: region.address,
+                bytes: &mut *region.bytes,
+                writable: region.writable,
+            })
+            .collect::<Vec<_>>();
+        if self
+            .services
+            .values()
+            .any(|service| matches!(service, Service::Strerror | Service::InternalStrerror))
+        {
+            mapped_data.push(DataRegion {
+                address: ERROR_TEXT,
+                bytes: &mut self.error_text,
+                writable: false,
+            });
+        }
+        if self
+            .services
+            .values()
+            .any(|service| matches!(service, Service::NetErrnoLoc))
+        {
+            mapped_data.push(DataRegion {
+                address: NET_ERRNO,
+                bytes: &mut self.network_errno,
+                writable: true,
+            });
+        }
+        if self
+            .services
+            .values()
+            .any(|service| matches!(service, Service::Setlocale))
+        {
+            mapped_data.push(DataRegion {
+                address: LOCALE_NAME,
+                bytes: &mut self.locale_name,
+                writable: false,
+            });
+        }
+        if self
+            .services
+            .values()
+            .any(|service| matches!(service, Service::Fprintf | Service::Fflush))
+        {
+            mapped_data.push(DataRegion {
+                address: crate::guest_stdio::FILE_ADDR,
+                bytes: &mut self.stderr_file,
+                writable: true,
+            });
+            mapped_data.push(DataRegion {
+                address: crate::guest_stdio::STDERR_PTR_ADDR,
+                bytes: &mut self.stderr_pointer,
+                writable: false,
+            });
+        }
+        continuation.with_memory_context(
+            image,
+            dependencies,
+            &mut mapped_data,
+            Some(&mut self.allocations),
+            |memory| {
+                for address in reserved {
+                    memory.reserve_service(address);
+                }
+                operation(memory, &mut self.mutex)
+            },
+        )
+    }
+    pub fn bytes_allocated(&self) -> usize {
+        self.allocations.bytes_allocated()
+    }
+    /// Atomically publish the implemented loader thunk under its kernel name/NID.
+    /// Exports load/start, stop/unload and dlsym, not a complete libkernel.
+    pub fn register_loader_module(
+        &mut self,
+        modules: &mut crate::modules::Modules,
+        name: &str,
+        address: u64,
+    ) -> Result<u64> {
+        let dlsym = address
+            .checked_add(32)
+            .ok_or("Loader thunk address overflow")?;
+        if dlsym == u64::MAX || self.services.contains_key(&dlsym) {
+            return Err("Invalid or duplicate resolver thunk".into());
+        }
+        let stop = address
+            .checked_add(16)
+            .ok_or("Loader thunk address overflow")?;
+        if address == 0
+            || stop == u64::MAX
+            || self.services.contains_key(&address)
+            || self.services.contains_key(&stop)
+        {
+            return Err("Invalid or duplicate loader thunk".into());
+        }
+        let handle = modules.register_native(
+            name,
+            &[
+                ("sceKernelLoadStartModule", address),
+                ("sceKernelStopUnloadModule", stop),
+                ("sceKernelDlsym", dlsym),
+            ],
+        )?;
+        self.services.insert(address, Service::LoadStartModule);
+        self.services.insert(stop, Service::StopUnloadModule);
+        self.services.insert(dlsym, Service::Dlsym);
+        Ok(handle)
+    }
+    /// Discover and compile supplied ELF code using a matching trusted runtime
+    /// archive. Publication is all-or-nothing; existing image entries reject it.
+    /// # Safety
+    /// The archive must be this exact runtime build for this target. Its helpers
+    /// must obey the current Cpu/Memory ABI and contain no untrusted host code.
+    pub unsafe fn compile_image(
+        &mut self,
+        file: &[u8],
+        bias: u64,
+        roots: std::collections::BTreeSet<u64>,
+        limit: usize,
+        archive: &std::path::Path,
+        directory: &std::path::Path,
+    ) -> Result<crate::discover::Manifest> {
+        if self
+            .image_blocks
+            .keys()
+            .any(|&(existing, _)| existing == bias)
+        {
+            return Err("Image translations already registered".into());
+        }
+        if self.translation_sources.len() >= MAX_TRANSLATION_SOURCES
+            || file.len() > MAX_TRANSLATION_SOURCE_BYTES - self.translation_source_bytes
+        {
+            return Err("Immutable translation source budget exceeded".into());
+        }
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve_exact(file.len())
+            .map_err(|_| "Cannot allocate immutable translation source")?;
+        snapshot.extend_from_slice(file);
+        let compiled =
+            crate::module_compiler::compile(file, roots.clone(), limit, archive, directory)?;
+        let archive = archive.canonicalize().map_err(|e| e.to_string())?;
+        let directory = directory.canonicalize().map_err(|e| e.to_string())?;
+        for entry in &compiled.entries {
+            bias.checked_add(entry.pc)
+                .ok_or("Compiled image address overflow")?;
+        }
+        for entry in compiled.entries {
+            self.image_blocks.insert(
+                (bias, entry.pc),
+                Block {
+                    start: entry.start,
+                    bytes: entry.bytes,
+                    function: entry.function,
+                    _library: Some(compiled.library.clone()),
+                },
+            );
+        }
+        self.translation_source_bytes += snapshot.len();
+        self.translation_sources.insert(
+            bias,
+            TranslationSource {
+                file: snapshot.into(),
+                roots,
+                instruction_limit: limit,
+                rebuilds: 0,
+                archive,
+                directory,
+            },
+        );
+        Ok(compiled.manifest)
+    }
+    /// Opt in to observed-target compilation while this executor is quiescent.
+    /// # Safety
+    /// Every archive supplied to `compile_image` must remain the exact trusted
+    /// runtime build for the entire time this option is enabled. Compilation
+    /// directories must remain host-controlled. Guest data must not select them.
+    pub unsafe fn set_automatic_translation(&mut self, enabled: bool) {
+        self.automatic_translation = enabled;
+    }
+    pub fn translation_rebuilds(&self, bias: u64) -> Option<usize> {
+        self.translation_sources
+            .get(&bias)
+            .map(|source| source.rebuilds)
+    }
+    pub fn translation_roots(&self, bias: u64) -> Option<&std::collections::BTreeSet<u64>> {
+        self.translation_sources
+            .get(&bias)
+            .map(|source| &source.roots)
+    }
+    /// Recompile the immutable original ELF with one observed executable target
+    /// added to its root set. The same instruction limit applies to the complete
+    /// union. All old translations survive every rejected/failed replacement.
+    /// Call only while guest execution is quiescent; this does not resume a miss.
+    /// Writable/self-modified executable bytes are not reinterpreted as code.
+    /// # Safety
+    /// The archive must remain the matching trusted runtime described by
+    /// `compile_image`; no generated guest code may be executing during this call.
+    pub unsafe fn extend_image_translation(
+        &mut self,
+        image: &Image,
+        target: u64,
+        archive: &std::path::Path,
+        directory: &std::path::Path,
+    ) -> Result<crate::discover::Manifest> {
+        let source = self
+            .translation_sources
+            .get(&image.bias)
+            .ok_or("Image has no immutable compilation source")?;
+        if source.file.as_ref() != image.file.as_slice() {
+            return Err("Translation extension image identity differs".into());
+        }
+        let pc = target
+            .checked_sub(image.bias)
+            .ok_or("Translation target below image")?;
+        if self.image_blocks.contains_key(&(image.bias, pc)) {
+            return Err("Translation target is already registered".into());
+        }
+        if !image.segments.iter().any(|segment| {
+            segment.flags & 1 != 0
+                && target >= segment.address
+                && target - segment.address < segment.bytes.len() as u64
+        }) {
+            return Err("Translation target is not executable image memory".into());
+        }
+        if source.rebuilds >= MAX_TRANSLATION_REBUILDS {
+            return Err("Translation rebuild budget exhausted".into());
+        }
+        let file = source.file.clone();
+        let mut roots = source.roots.clone();
+        roots.insert(pc);
+        let limit = source.instruction_limit;
+        // Charge attempts, including unsupported/overlapping code or compiler
+        // failures, so repeated misses cannot cause unbounded host compilation.
+        self.translation_sources
+            .get_mut(&image.bias)
+            .unwrap()
+            .rebuilds += 1;
+        let compiled =
+            crate::module_compiler::compile(&file, roots.clone(), limit, archive, directory)?;
+        if !compiled.entries.iter().any(|entry| entry.pc == pc) {
+            let reason = compiled
+                .manifest
+                .untranslated
+                .iter()
+                .find(|failure| failure.pc == pc)
+                .map(|failure| failure.reason.as_str())
+                .unwrap_or("no supported translation");
+            return Err(format!("Observed target {pc:#x} is unsupported: {reason}"));
+        }
+        let mut replacement = BTreeMap::new();
+        for entry in compiled.entries {
+            image
+                .bias
+                .checked_add(entry.pc)
+                .ok_or("Compiled image address overflow")?;
+            let address = image
+                .bias
+                .checked_add(entry.start)
+                .ok_or("Compiled block address overflow")?;
+            let matches = image.segments.iter().any(|segment| {
+                if segment.flags & 1 == 0 || address < segment.address {
+                    return false;
+                }
+                let Ok(offset) = usize::try_from(address - segment.address) else {
+                    return false;
+                };
+                offset
+                    .checked_add(entry.bytes.len())
+                    .and_then(|end| segment.bytes.get(offset..end))
+                    == Some(entry.bytes.as_ref())
+            });
+            if !matches {
+                return Err("Live executable bytes differ from immutable ELF translation".into());
+            }
+            replacement.insert(
+                (image.bias, entry.pc),
+                Block {
+                    start: entry.start,
+                    bytes: entry.bytes,
+                    function: entry.function,
+                    _library: Some(compiled.library.clone()),
+                },
+            );
+        }
+        // No fallible work remains. Existing libraries stay pinned until the
+        // replacement has been compiled, loaded and validated in its entirety.
+        self.image_blocks.retain(|&(bias, _), _| bias != image.bias);
+        self.image_blocks.append(&mut replacement);
+        self.translation_sources.get_mut(&image.bias).unwrap().roots = roots;
+        Ok(compiled.manifest)
+    }
+    /// Call only after guest execution is quiescent; later calls fail until rebuilt.
+    pub fn remove_image_translations(&mut self, bias: u64) {
+        self.image_blocks.retain(|&(owner, _), _| owner != bias);
+        if let Some(source) = self.translation_sources.remove(&bias) {
+            self.translation_source_bytes -= source.file.len();
+        }
+    }
+    /// Publish working string thunks and matching name/NID exports together.
+    pub fn register_string_module(
+        &mut self,
+        modules: &mut crate::modules::Modules,
+        name: &str,
+        base: u64,
+    ) -> Result<u64> {
+        let mut services = self.services.clone();
+        let mut exports = Vec::new();
+        for (i, service) in [
+            Service::Strcpy,
+            Service::Strcat,
+            Service::Strcmp,
+            Service::Strncmp,
+            Service::Strlen,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let address = base
+                .checked_add(i as u64 * 16)
+                .ok_or("String thunk address overflow")?;
+            if address == 0 || address == u64::MAX || services.contains_key(&address) {
+                return Err("String thunk address conflict".into());
+            }
+            services.insert(address, service);
+            exports.push((crate::strings::NAMES[i], address));
+        }
+        let handle = modules.register_native(name, &exports)?;
+        self.services = services;
+        Ok(handle)
+    }
+    pub fn new(stack_address: u64, stack_size: usize, fuel: u64, transitions: u64) -> Result<Self> {
+        if !(4096..=16 * 1024 * 1024).contains(&stack_size)
+            || stack_size % 16 != 0
+            || stack_address % 16 != 0
+            || stack_address.checked_add(stack_size as u64).is_none()
+        {
+            return Err("Invalid module stack".into());
+        }
+        let mut tls = crate::guest_tls::GuestTls::default();
+        tls.register_thread(MAIN_GUEST_THREAD)?;
+        Ok(Self {
+            mutex_wait_owner: Rc::new(()),
+            thread_attributes: crate::guest_thread_attr::GuestThreadAttributes::default(),
+            mutex: crate::guest_mutex::GuestMutex::default(),
+            tls,
+            selected_guest_thread: MAIN_GUEST_THREAD,
+            exit_request: None,
+            exit_context: None,
+            user_service: crate::user_service::UserService::default(),
+            pad: crate::pad::Pad::default(),
+            audio: crate::audio_out::AudioOut::new(crate::audio_queue::AudioQueueBackend),
+            equeues: crate::equeue::Equeues::default(),
+            video_out: crate::video_out::VideoOut::new(crate::video_out::MetalBackend, None),
+            keyboard: crate::keyboard::Keyboard::default(),
+            ime_dialog: crate::ime_dialog::ImeDialog::default(),
+            network: crate::net_resolver::Resolver::new(crate::net_dns::DnsBackend::default()),
+            network_errno: [0; 4],
+            locale: crate::guest_locale::GuestLocale::default(),
+            stdout: crate::captured_stdout::CapturedStdout::default(),
+            stdio: crate::guest_stdio::GuestStdio::default(),
+            stderr_file: crate::guest_stdio::stderr_file_bytes(),
+            stderr_pointer: crate::guest_stdio::stderr_pointer_bytes(),
+            locale_name: crate::guest_locale::C_NAME,
+            direct_memory: crate::direct_memory::DirectMemory::default(),
+            system_service: crate::system_service::SystemService::default(),
+            environment: 0,
+            error_text: [0; 128],
+            process_arguments: None,
+            allocations: crate::guest_memory::OwnedMappings::default(),
+            kernel: None,
+            blocks: BTreeMap::new(),
+            image_blocks: BTreeMap::new(),
+            translation_sources: BTreeMap::new(),
+            translation_source_bytes: 0,
+            automatic_translation: false,
+            services: BTreeMap::new(),
+            fuel,
+            transitions,
+            stack_address,
+            stack_size,
+        })
+    }
+    /// Explicit guest thunk address. Thunks must not overlap any mapped guest bytes.
+    pub fn register_service(&mut self, address: u64, service: Service) -> Result<()> {
+        if address == 0 || address == u64::MAX || self.services.contains_key(&address) {
+            return Err("Invalid or duplicate module service".into());
+        }
+        self.services.insert(address, service);
+        Ok(())
+    }
+    /// # Safety
+    /// Function must be ARM64 code emitted for these guest bytes/offset using
+    /// translate_rust_memory. It must respect Cpu and the synchronous Memory ABI,
+    /// never retain pointers or unwind, and stop at a supported dispatcher boundary.
+    pub unsafe fn register(
+        &mut self,
+        offset: u64,
+        bytes: &[u8],
+        function: unsafe extern "C" fn(*mut Cpu),
+    ) -> Result<()> {
+        if bytes.is_empty() || self.blocks.contains_key(&offset) {
+            return Err("Invalid translated registration".into());
+        }
+        self.blocks.insert(
+            offset,
+            Block {
+                start: offset,
+                bytes: bytes.into(),
+                function,
+                _library: None,
+            },
+        );
+        Ok(())
+    }
+    /// # Safety
+    /// Same generated-code contract as register, scoped to one image load bias.
+    pub unsafe fn register_in_image(
+        &mut self,
+        bias: u64,
+        offset: u64,
+        bytes: &[u8],
+        function: unsafe extern "C" fn(*mut Cpu),
+    ) -> Result<()> {
+        if bytes.is_empty()
+            || bias.checked_add(offset).is_none()
+            || self.image_blocks.contains_key(&(bias, offset))
+            || self.translation_sources.contains_key(&bias)
+        {
+            return Err("Invalid image translation registration".into());
+        }
+        self.image_blocks.insert(
+            (bias, offset),
+            Block {
+                start: offset,
+                bytes: bytes.into(),
+                function,
+                _library: None,
+            },
+        );
+        Ok(())
+    }
+    fn execute(
+        &mut self,
+        image: &mut Image,
+        address: u64,
+        arguments: Arguments,
+        dependencies: &mut [&mut Image],
+    ) -> Result<i32> {
+        match self.run(image, address, arguments, dependencies)? {
+            Execution::MutexWait(_) => {
+                Err("Mutex wait requires resumable runtime orchestration".into())
+            }
+            Execution::WorkerReturned(_) => {
+                Err("Unexpected worker return in module status call".into())
+            }
+            Execution::Returned(value) => Ok(value),
+            Execution::ExitRequested(request) => Err(format!(
+                "Guest exit requested ({:?}, status {}); cleanup remains pending",
+                request.kind, request.status
+            )),
+            Execution::Dlsym { .. }
+            | Execution::SysmoduleLoadInternal { .. }
+            | Execution::LoadStartModule { .. }
+            | Execution::StopUnloadModule { .. } => {
+                Err("Module loader requires resumable runtime orchestration".into())
+            }
+        }
+    }
+    /// Run until return or a loader request. All image borrows end on return.
+    pub fn run(
+        &mut self,
+        image: &mut Image,
+        address: u64,
+        arguments: Arguments,
+        dependencies: &mut [&mut Image],
+    ) -> Result<Execution> {
+        self.run_with_data(image, address, arguments, dependencies, &mut [])
+    }
+    pub fn run_with_data(
+        &mut self,
+        image: &mut Image,
+        address: u64,
+        arguments: Arguments,
+        dependencies: &mut [&mut Image],
+        data: &mut [DataRegion<'_>],
+    ) -> Result<Execution> {
+        self.execute_flow(image, address, arguments, dependencies, None, data)
+    }
+    /// Invoke one worker entry with an opaque RDI argument and full-width RAX
+    /// result. This does not create a thread, reserve a scheduler stack, or join.
+    /// Caller must retain/map other live stacks and select a registered identity.
+    pub fn run_worker(
+        &mut self,
+        image: &mut Image,
+        address: u64,
+        argument: u64,
+        dependencies: &mut [&mut Image],
+    ) -> Result<Execution> {
+        self.run_worker_with_data(image, address, argument, dependencies, &mut [])
+    }
+    pub fn run_worker_with_data(
+        &mut self,
+        image: &mut Image,
+        address: u64,
+        argument: u64,
+        dependencies: &mut [&mut Image],
+        data: &mut [DataRegion<'_>],
+    ) -> Result<Execution> {
+        self.execute_flow_entry(
+            image,
+            (
+                address,
+                Arguments {
+                    size: argument,
+                    pointer: 0,
+                },
+                ReturnConvention::WorkerPointer,
+            ),
+            dependencies,
+            None,
+            data,
+        )
+    }
+    /// Resume after servicing a request, preserving stack, registers and budgets.
+    /// The runtime must retain the suspended images and supply their current mappings.
+    pub fn resume(
+        &mut self,
+        image: &mut Image,
+        dependencies: &mut [&mut Image],
+        continuation: Continuation,
+        result: u64,
+    ) -> Result<Execution> {
+        self.resume_with_data(image, dependencies, continuation, result, &mut [])
+    }
+    pub fn resume_with_data(
+        &mut self,
+        image: &mut Image,
+        dependencies: &mut [&mut Image],
+        mut continuation: Continuation,
+        result: u64,
+        data: &mut [DataRegion<'_>],
+    ) -> Result<Execution> {
+        self.require_running()?;
+        if continuation.caller_bias != image.bias
+            || continuation.stack_address < self.stack_address
+            || continuation.stack.len() != self.stack_size
+            || (continuation.stack_address - self.stack_address) % self.stack_size as u64 != 0
+        {
+            return Err("Continuation belongs to different mappings".into());
+        }
+        continuation.cpu.registers[0] = result;
+        if continuation.cpu.stop != 3 {
+            continuation.cpu.rip = continuation.cpu.next_rip;
+            continuation.cpu.stop = 0;
+        }
+        self.execute_flow(
+            image,
+            0,
+            Arguments::default(),
+            dependencies,
+            Some(continuation),
+            data,
+        )
+    }
+    /// Retry a lock without manufacturing a guest return value. Pending and
+    /// precommit failures retain the request. Once acquired, the request is
+    /// consumed even if subsequent guest execution faults.
+    pub fn resume_mutex_with_data(
+        &mut self,
+        image: &mut Image,
+        dependencies: &mut [&mut Image],
+        wait: &mut MutexWait,
+        data: &mut [DataRegion<'_>],
+    ) -> Result<Option<Execution>> {
+        self.require_running()?;
+        if !Rc::ptr_eq(&self.mutex_wait_owner, &wait.owner) {
+            return Err("Mutex wait belongs to another executor".into());
+        }
+        let continuation = wait
+            .continuation
+            .as_mut()
+            .ok_or("Mutex wait already consumed")?;
+        if continuation.caller_bias != image.bias
+            || continuation.stack_address < self.stack_address
+            || continuation.stack.len() != self.stack_size
+            || (continuation.stack_address - self.stack_address) % self.stack_size as u64 != 0
+            || continuation.guest_thread != wait.ticket.thread_id()
+            || !self.tls.contains_thread(continuation.guest_thread)
+        {
+            return Err("Mutex wait belongs to different mappings or thread".into());
+        }
+        if continuation.remaining == 0 {
+            return Err("Mutex retry budget exhausted".into());
+        }
+        let cpu = &continuation.cpu;
+        let sp = cpu.registers[4];
+        let popped = sp.checked_add(8).ok_or("Mutex return stack overflow")?;
+        let target = if wait.terminal {
+            None
+        } else {
+            let block = self
+                .image_blocks
+                .get(&(cpu.bias, cpu.next_rip))
+                .or_else(|| self.blocks.get(&cpu.next_rip))
+                .ok_or("Mutex return target no longer registered")?;
+            if cpu.bias.checked_add(cpu.next_rip) != Some(wait.ret) {
+                return Err("Mutex return target changed".into());
+            }
+            Some((
+                cpu.bias
+                    .checked_add(block.start)
+                    .ok_or("Mutex code address overflow")?,
+                block.bytes.clone(),
+            ))
+        };
+        let ret = wait.ret;
+        let terminal = wait.terminal;
+        let ticket = wait.ticket;
+        let outcome = self.with_suspended_runtime(
+            continuation,
+            image,
+            dependencies,
+            data,
+            |memory, mutex| {
+                if memory.load(sp, 8)? != ret {
+                    return Err("Mutex return frame changed".into());
+                }
+                if terminal && ret != u64::MAX {
+                    return Err("Mutex terminal return invalid".into());
+                }
+                if let Some((source, bytes)) = target {
+                    if !memory.executable(ret) || memory.read(source, bytes.len())? != &*bytes {
+                        return Err("Mutex return code changed before acquisition".into());
+                    }
+                }
+                mutex.resume_lock(memory, ticket)
+            },
+        )?;
+        continuation.remaining -= 1;
+        let value = match outcome {
+            crate::guest_mutex::LockOutcome::Pending(ticket) => {
+                wait.ticket = ticket;
+                return Ok(None);
+            }
+            crate::guest_mutex::LockOutcome::Acquired => 0,
+            crate::guest_mutex::LockOutcome::Status(status) => status,
+        };
+        let mut continuation = wait.continuation.take().unwrap();
+        continuation.cpu.registers[4] = popped;
+        continuation.cpu.registers[0] = value as u32 as u64;
+        if terminal {
+            return Ok(Some(
+                continuation
+                    .return_convention
+                    .completed(value as u32 as u64),
+            ));
+        }
+        continuation.cpu.rip = continuation.cpu.next_rip;
+        continuation.cpu.stop = 0;
+        self.execute_flow(
+            image,
+            0,
+            Arguments::default(),
+            dependencies,
+            Some(continuation),
+            data,
+        )
+        .map(Some)
+    }
+    pub fn resume_mutex(
+        &mut self,
+        image: &mut Image,
+        dependencies: &mut [&mut Image],
+        wait: &mut MutexWait,
+    ) -> Result<Option<Execution>> {
+        self.resume_mutex_with_data(image, dependencies, wait, &mut [])
+    }
+    pub fn with_mutex_wait_memory<T>(
+        &mut self,
+        wait: &mut MutexWait,
+        image: &mut Image,
+        dependencies: &mut [&mut Image],
+        data: &mut [DataRegion<'_>],
+        operation: impl FnOnce(&mut Memory<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.with_suspended_memory(
+            wait.continuation
+                .as_mut()
+                .ok_or("Mutex wait already consumed")?,
+            image,
+            dependencies,
+            data,
+            operation,
+        )
+    }
+    fn execute_flow(
+        &mut self,
+        image: &mut Image,
+        address: u64,
+        arguments: Arguments,
+        dependencies: &mut [&mut Image],
+        continuation: Option<Continuation>,
+        data: &mut [DataRegion<'_>],
+    ) -> Result<Execution> {
+        self.execute_flow_entry(
+            image,
+            (address, arguments, ReturnConvention::ModuleStatus),
+            dependencies,
+            continuation,
+            data,
+        )
+    }
+    fn execute_flow_entry(
+        &mut self,
+        image: &mut Image,
+        entry: (u64, Arguments, ReturnConvention),
+        dependencies: &mut [&mut Image],
+        mut continuation: Option<Continuation>,
+        data: &mut [DataRegion<'_>],
+    ) -> Result<Execution> {
+        self.require_running()?;
+        loop {
+            match self.execute_step(image, entry, dependencies, continuation, data)? {
+                Flow::Finished(execution) => return Ok(execution),
+                Flow::TranslationMiss {
+                    bias,
+                    target,
+                    continuation: saved,
+                } => {
+                    // execute_step dropped every borrowed mapping before yielding;
+                    // compilation cannot hold a stale guest/stack pointer or invoke
+                    // an old native block while its library is being replaced.
+                    let source = self
+                        .translation_sources
+                        .get(&bias)
+                        .ok_or("Translation miss lost its compilation owner")?;
+                    let archive = source.archive.clone();
+                    let directory = source.directory.clone();
+                    let owner = if image.bias == bias {
+                        &*image
+                    } else {
+                        dependencies
+                            .iter()
+                            .find(|dependency| dependency.bias == bias)
+                            .map(|dependency| &**dependency)
+                            .ok_or("Translation miss owner is not mapped")?
+                    };
+                    // SAFETY: opt-in's contract pins the matching trusted archive;
+                    // execution is suspended with no native block on the stack.
+                    unsafe { self.extend_image_translation(owner, target, &archive, &directory) }
+                        .map_err(|error| {
+                        format!("Translation miss at {target:#x} (bias {bias:#x}): {error}")
+                    })?;
+                    // Unlike a host-service resume, do not replace RAX, consume a
+                    // return frame or advance RIP. Retry the exact saved phase.
+                    continuation = Some(*saved);
+                }
+            }
+        }
+    }
+    fn execute_step(
+        &mut self,
+        image: &mut Image,
+        entry: (u64, Arguments, ReturnConvention),
+        dependencies: &mut [&mut Image],
+        continuation: Option<Continuation>,
+        data: &mut [DataRegion<'_>],
+    ) -> Result<Flow> {
+        let (address, arguments, initial_convention) = entry;
+        let caller_bias = image.bias;
+        let (saved_cpu, mut stack, remaining, stack_address, guest_thread, return_convention) =
+            match continuation {
+                Some(state) => (
+                    Some(state.cpu),
+                    state.stack,
+                    state.remaining,
+                    state.stack_address,
+                    state.guest_thread,
+                    state.return_convention,
+                ),
+                None => {
+                    let mut candidate = self.stack_address;
+                    let mut selected = None;
+                    for _ in 0..128 {
+                        let end = candidate
+                            .checked_add(self.stack_size as u64)
+                            .ok_or("Guest stack address overflow")?;
+                        let mut overlap = false;
+                        for region in data.iter() {
+                            let region_end = region
+                                .address
+                                .checked_add(region.bytes.len() as u64)
+                                .ok_or("Guest data mapping overflow")?;
+                            overlap |= candidate < region_end && region.address < end;
+                        }
+                        if !overlap {
+                            selected = Some(candidate);
+                            break;
+                        }
+                        candidate = end;
+                    }
+                    (
+                        None,
+                        vec![0; self.stack_size],
+                        self.transitions,
+                        selected.ok_or("Guest stack slots exhausted")?,
+                        self.selected_guest_thread,
+                        initial_convention,
+                    )
+                }
+            };
+        if !self.tls.contains_thread(guest_thread) {
+            return Err("Guest execution thread identity is not registered".into());
+        }
+        let top = stack_address + stack.len() as u64 - 8;
+        let mut ranges = Vec::new();
+        for mapped in std::iter::once(&*image).chain(dependencies.iter().map(|i| &**i)) {
+            for segment in &mapped.segments {
+                if segment.flags & 1 != 0 {
+                    ranges.push((
+                        segment.address,
+                        segment.address + segment.bytes.len() as u64,
+                        mapped.bias,
+                    ));
+                }
+            }
+        }
+        let owner = |address| {
+            ranges
+                .iter()
+                .find(|&&(begin, end, _)| address >= begin && address < end)
+                .map(|&(_, _, bias)| bias)
+                .ok_or("Target outside executable module mappings")
+        };
+        let block_at = |bias, offset| {
+            self.image_blocks
+                .get(&(bias, offset))
+                .or_else(|| self.blocks.get(&offset))
+        };
+        let mut memory = Memory::default();
+        for mapped in std::iter::once(&mut *image).chain(dependencies.iter_mut().map(|i| &mut **i))
+        {
+            for segment in &mut mapped.segments {
+                memory.add(
+                    segment.address,
+                    &mut segment.bytes,
+                    segment.flags & 2 != 0,
+                    segment.flags & 1 != 0,
+                )?;
+            }
+        }
+        memory.add(stack_address, &mut stack, true, false)?;
+        for region in data {
+            memory.add(region.address, region.bytes, region.writable, false)?;
+        }
+        memory.attach_owned(&mut self.allocations)?;
+        if self
+            .services
+            .values()
+            .any(|s| matches!(s, Service::Strerror | Service::InternalStrerror))
+        {
+            memory.add_service_data(ERROR_TEXT, &mut self.error_text)?;
+        }
+        if self
+            .services
+            .values()
+            .any(|service| matches!(service, Service::NetErrnoLoc))
+        {
+            memory.add(NET_ERRNO, &mut self.network_errno, true, false)?;
+        }
+        if self
+            .services
+            .values()
+            .any(|service| matches!(service, Service::Setlocale))
+        {
+            memory.add_service_data(LOCALE_NAME, &mut self.locale_name)?;
+        }
+        if self
+            .services
+            .values()
+            .any(|service| matches!(service, Service::Fprintf | Service::Fflush))
+        {
+            memory.add(
+                crate::guest_stdio::FILE_ADDR,
+                &mut self.stderr_file,
+                true,
+                false,
+            )?;
+            memory.add_service_data(
+                crate::guest_stdio::STDERR_PTR_ADDR,
+                &mut self.stderr_pointer,
+            )?;
+        }
+        for &address in self.services.keys() {
+            memory.reserve_service(address);
+        }
+        if self
+            .services
+            .keys()
+            .any(|&address| memory.read(address, 1).is_ok())
+        {
+            return Err("Service thunk overlaps mapped guest bytes".into());
+        }
+        let mut cpu = if let Some(cpu) = saved_cpu {
+            cpu
+        } else {
+            memory.store(top, u64::MAX, 8)?;
+            let mut cpu = Cpu {
+                bias: owner(address)?,
+                rip: address
+                    .checked_sub(owner(address)?)
+                    .ok_or("Entry below image")?,
+                fuel: self.fuel,
+                ..Cpu::default()
+            };
+            cpu.registers[4] = top;
+            cpu.registers[7] = arguments.size;
+            cpu.registers[6] = arguments.pointer;
+            cpu
+        };
+        for transition in 0..remaining {
+            // Invoke only before effects associated with the pending dispatch.
+            // Every retry consumes transition budget, but no guest instruction
+            // or service is replayed and instruction fuel is unchanged.
+            macro_rules! translation_miss {
+                ($bias:expr, $offset:expr) => {{
+                    let missing_bias = $bias;
+                    let missing_target = missing_bias
+                        .checked_add($offset)
+                        .ok_or("Translation target overflow")?;
+                    if self.automatic_translation
+                        && cpu.fuel != 0
+                        && self.translation_sources.contains_key(&missing_bias)
+                        && memory.executable(missing_target)
+                    {
+                        drop(memory);
+                        return Ok(Flow::TranslationMiss {
+                            bias: missing_bias,
+                            target: missing_target,
+                            continuation: Box::new(Continuation {
+                                return_convention,
+                                guest_thread,
+                                cpu,
+                                stack,
+                                stack_address,
+                                remaining: remaining - transition - 1,
+                                caller_bias,
+                            }),
+                        });
+                    }
+                }};
+            }
+            if cpu.fault != 0 {
+                return Err(format!(
+                    "Module guest fault {} at {:#x}",
+                    cpu.fault, cpu.rip
+                ));
+            }
+            if cpu.stop == 3 {
+                let target = memory.load(cpu.registers[4], 8)?;
+                if target == u64::MAX && cpu.registers[4] == top {
+                    return Ok(Flow::Finished(
+                        return_convention.completed(cpu.registers[0]),
+                    ));
+                }
+                if !memory.executable(target) {
+                    return Err("Invalid guest return target".into());
+                }
+                let return_bias = owner(target)?;
+                let return_offset = target
+                    .checked_sub(return_bias)
+                    .ok_or("Return below image")?;
+                if block_at(return_bias, return_offset).is_none() {
+                    translation_miss!(return_bias, return_offset);
+                }
+                cpu.bias = owner(target)?;
+                cpu.rip = target.checked_sub(cpu.bias).ok_or("Return below image")?;
+                cpu.registers[4] = cpu.registers[4]
+                    .checked_add(8)
+                    .ok_or("Return stack overflow")?;
+            } else if cpu.stop == 1 || cpu.stop == 5 {
+                let tail = cpu.stop == 5;
+                if cpu.fuel == 0 {
+                    return Err("Module fuel exhausted before call".into());
+                }
+                if let Some(service) = self.services.get(&cpu.target) {
+                    // A noreturn service has no valid continuation to translate
+                    // or pop. Real callers commonly put UD2 immediately after it.
+                    if matches!(service, Service::Exit | Service::ImmediateExit) {
+                        let request = ExitRequest {
+                            status: cpu.registers[7] as u32 as i32,
+                            kind: if matches!(service, Service::Exit) {
+                                ExitKind::Normal
+                            } else {
+                                ExitKind::Immediate
+                            },
+                        };
+                        cpu.fuel -= 1;
+                        drop(memory);
+                        self.exit_context = Some(Box::new(Continuation {
+                            return_convention,
+                            guest_thread,
+                            cpu,
+                            stack,
+                            stack_address,
+                            remaining: remaining - transition - 1,
+                            caller_bias,
+                        }));
+                        self.exit_request = Some(request);
+                        return Ok(Flow::Finished(Execution::ExitRequested(request)));
+                    }
+                    let ret = if tail {
+                        memory.load(cpu.registers[4], 8)?
+                    } else {
+                        cpu.bias
+                            .checked_add(cpu.next_rip)
+                            .ok_or("Service return overflow")?
+                    };
+                    let terminal = tail && ret == u64::MAX && cpu.registers[4] == top;
+                    if !terminal {
+                        let return_bias = owner(ret)?;
+                        let return_offset = ret
+                            .checked_sub(return_bias)
+                            .ok_or("Service return below image")?;
+                        if block_at(return_bias, return_offset).is_none() {
+                            translation_miss!(return_bias, return_offset);
+                        }
+                        if !memory.executable(ret) || block_at(return_bias, return_offset).is_none()
+                        {
+                            return Err("Unregistered service return".into());
+                        }
+                        cpu.bias = return_bias;
+                        cpu.next_rip = return_offset;
+                    }
+                    let sp = if tail {
+                        cpu.registers[4]
+                    } else {
+                        cpu.registers[4]
+                            .checked_sub(8)
+                            .ok_or("Service stack underflow")?
+                    };
+                    if !tail {
+                        memory.store(sp, ret, 8)?;
+                    }
+                    cpu.registers[4] = sp;
+                    cpu.fuel -= 1;
+                    if matches!(
+                        service,
+                        Service::Dlsym
+                            | Service::LoadStartModule
+                            | Service::StopUnloadModule
+                            | Service::SysmoduleLoadInternal
+                    ) {
+                        // Complete the thunk return before yielding. No raw Memory
+                        // pointer or borrow escapes; nested module initialization
+                        // may use a fresh independent executor stack.
+                        if terminal {
+                            cpu.stop = 3;
+                        } else {
+                            cpu.registers[4] = sp + 8;
+                        }
+                        let arguments = [7, 6, 2, 1, 8, 9].map(|i| cpu.registers[i]);
+                        drop(memory);
+                        let continuation = Box::new(Continuation {
+                            return_convention,
+                            guest_thread,
+                            cpu,
+                            stack,
+                            stack_address,
+                            remaining: remaining - transition - 1,
+                            caller_bias,
+                        });
+                        return Ok(Flow::Finished(
+                            if matches!(service, Service::SysmoduleLoadInternal) {
+                                Execution::SysmoduleLoadInternal {
+                                    arguments,
+                                    continuation,
+                                }
+                            } else if matches!(service, Service::Dlsym) {
+                                Execution::Dlsym {
+                                    arguments,
+                                    continuation,
+                                }
+                            } else if matches!(service, Service::StopUnloadModule) {
+                                Execution::StopUnloadModule {
+                                    arguments,
+                                    continuation,
+                                }
+                            } else {
+                                Execution::LoadStartModule {
+                                    arguments,
+                                    continuation,
+                                }
+                            },
+                        ));
+                    }
+                    let value = if matches!(service, Service::Getpid | Service::Syscall) {
+                        let direct = matches!(service, Service::Getpid);
+                        let number = if direct { 20 } else { cpu.registers[0] };
+                        if number != 20 && self.kernel.is_none() {
+                            return Err(format!(
+                                "Unsupported Rust kernel syscall {number} at {:#x}",
+                                cpu.rip
+                            ));
+                        }
+                        if direct {
+                            cpu.registers[10] = cpu.registers[1];
+                        }
+                        cpu.registers[11] = cpu.flags;
+                        cpu.registers[1] = cpu
+                            .target
+                            .checked_add(if direct { 12 } else { 2 })
+                            .ok_or("Syscall continuation overflow")?;
+                        let (value, error) = if number == 20 {
+                            (u64::from(std::process::id()), false)
+                        } else {
+                            self.kernel.as_mut().unwrap().syscall(
+                                &mut memory,
+                                number,
+                                [
+                                    cpu.registers[7],
+                                    cpu.registers[6],
+                                    cpu.registers[2],
+                                    cpu.registers[10],
+                                    cpu.registers[8],
+                                    cpu.registers[9],
+                                ],
+                            )?
+                        };
+                        cpu.flags = (cpu.flags & !1) | u64::from(error);
+                        value
+                    } else if matches!(
+                        service,
+                        Service::ThreadAttrInit
+                            | Service::ThreadAttrDestroy
+                            | Service::ThreadAttrSetDetachState
+                            | Service::ThreadAttrSetStackSize
+                    ) {
+                        if memory.load(sp, 8)? != ret {
+                            return Err(
+                                "Thread attribute return frame changed before commit".into()
+                            );
+                        }
+                        let slot = cpu.registers[7];
+                        if matches!(
+                            service,
+                            Service::ThreadAttrInit | Service::ThreadAttrDestroy
+                        ) {
+                            validate_net_output(&memory, slot, 8, sp, ret)?;
+                        }
+                        (match service {
+                            Service::ThreadAttrInit => {
+                                self.thread_attributes.init(&mut memory, slot)?
+                            }
+                            Service::ThreadAttrDestroy => {
+                                self.thread_attributes.destroy(&mut memory, slot)?
+                            }
+                            Service::ThreadAttrSetDetachState => self
+                                .thread_attributes
+                                .set_detach_state(&memory, slot, cpu.registers[6] as u32 as i32)?,
+                            Service::ThreadAttrSetStackSize => self
+                                .thread_attributes
+                                .set_stack_size(&memory, slot, cpu.registers[6])?,
+                            _ => unreachable!(),
+                        }) as u32 as u64
+                    } else if matches!(
+                        service,
+                        Service::MutexAttrInit
+                            | Service::MutexAttrSetType
+                            | Service::MutexAttrDestroy
+                            | Service::MutexInit
+                            | Service::MutexDestroy
+                            | Service::MutexLock
+                            | Service::MutexTryLock
+                            | Service::MutexUnlock
+                    ) {
+                        if memory.load(sp, 8)? != ret {
+                            return Err("Mutex return frame changed before commit".into());
+                        }
+                        let slot = cpu.registers[7];
+                        if matches!(
+                            service,
+                            Service::MutexAttrInit
+                                | Service::MutexAttrDestroy
+                                | Service::MutexInit
+                                | Service::MutexDestroy
+                        ) {
+                            validate_net_output(&memory, slot, 8, sp, ret)?;
+                        }
+                        let status = match service {
+                            Service::MutexAttrInit => self.mutex.attr_init(&mut memory, slot)?,
+                            Service::MutexAttrSetType => self.mutex.attr_settype(
+                                &memory,
+                                slot,
+                                cpu.registers[6] as u32 as i32,
+                            )?,
+                            Service::MutexAttrDestroy => {
+                                self.mutex.attr_destroy(&mut memory, slot)?
+                            }
+                            Service::MutexInit => {
+                                self.mutex.init(&mut memory, slot, cpu.registers[6])?
+                            }
+                            Service::MutexDestroy => self.mutex.destroy(&mut memory, slot)?,
+                            Service::MutexTryLock => {
+                                self.mutex.try_lock(&memory, slot, guest_thread)?
+                            }
+                            Service::MutexUnlock => {
+                                self.mutex.unlock(&memory, slot, guest_thread)?
+                            }
+                            Service::MutexLock => {
+                                match self.mutex.lock(&memory, slot, guest_thread)? {
+                                    crate::guest_mutex::LockOutcome::Acquired => 0,
+                                    crate::guest_mutex::LockOutcome::Status(status) => status,
+                                    crate::guest_mutex::LockOutcome::Pending(ticket) => {
+                                        drop(memory);
+                                        return Ok(Flow::Finished(Execution::MutexWait(Box::new(
+                                            MutexWait {
+                                                owner: self.mutex_wait_owner.clone(),
+                                                continuation: Some(Continuation {
+                                                    return_convention,
+                                                    guest_thread,
+                                                    cpu,
+                                                    stack,
+                                                    stack_address,
+                                                    remaining: remaining - transition - 1,
+                                                    caller_bias,
+                                                }),
+                                                ticket,
+                                                ret,
+                                                terminal,
+                                            },
+                                        ))));
+                                    }
+                                }
+                            }
+                            _ => unreachable!(),
+                        };
+                        status as u32 as u64
+                    } else if matches!(
+                        service,
+                        Service::TlsKeyCreate
+                            | Service::TlsKeyDelete
+                            | Service::TlsGetSpecific
+                            | Service::TlsSetSpecific
+                    ) {
+                        if memory.load(sp, 8)? != ret {
+                            return Err("TLS return frame changed before state commit".into());
+                        }
+                        match service {
+                            Service::TlsKeyCreate => {
+                                validate_net_output(&memory, cpu.registers[7], 4, sp, ret)?;
+                                self.tls.key_create(
+                                    &mut memory,
+                                    cpu.registers[7],
+                                    cpu.registers[6],
+                                )? as u32 as u64
+                            }
+                            Service::TlsKeyDelete => {
+                                self.tls.key_delete(cpu.registers[7] as u32 as i32) as u32 as u64
+                            }
+                            Service::TlsGetSpecific => self
+                                .tls
+                                .getspecific(guest_thread, cpu.registers[7] as u32 as i32)?,
+                            Service::TlsSetSpecific => self.tls.setspecific(
+                                guest_thread,
+                                cpu.registers[7] as u32 as i32,
+                                cpu.registers[6],
+                            )? as u32 as u64,
+                            _ => unreachable!(),
+                        }
+                    } else if matches!(service, Service::Fprintf | Service::Fflush) {
+                        // Validate the live return frame before a sink commit;
+                        // return-PC translation was already checked above.
+                        if memory.load(sp, 8)? != ret {
+                            return Err("Stdio return frame changed before output".into());
+                        }
+                        if matches!(service, Service::Fflush) {
+                            self.stdio.fflush(&memory, cpu.registers[7])? as u32 as u64
+                        } else {
+                            validate_net_output(
+                                &memory,
+                                crate::guest_stdio::FILE_ADDR + 172,
+                                4,
+                                sp,
+                                ret,
+                            )?;
+                            let registers = [
+                                cpu.registers[2],
+                                cpu.registers[1],
+                                cpu.registers[8],
+                                cpu.registers[9],
+                            ];
+                            let mut index = 0usize;
+                            let mut next = |memory: &Memory<'_>| -> std::result::Result<u64, crate::strings::Fault> {
+                                let current = index;
+                                index = index.checked_add(1).ok_or(crate::strings::Fault::Limit)?;
+                                if let Some(&value) = registers.get(current) {
+                                    return Ok(value);
+                                }
+                                let offset = u64::try_from(current - registers.len()).map_err(|_| crate::strings::Fault::Read)?
+                                    .checked_mul(8).and_then(|offset| offset.checked_add(8)).ok_or(crate::strings::Fault::Read)?;
+                                let address = sp.checked_add(offset).ok_or(crate::strings::Fault::Read)?;
+                                memory.load(address, 8).map_err(|_| crate::strings::Fault::Read)
+                            };
+                            self.stdio.fprintf(
+                                &mut memory,
+                                cpu.registers[7],
+                                cpu.registers[6],
+                                &mut next,
+                            )? as u32 as u64
+                        }
+                    } else if matches!(service, Service::Puts) {
+                        // The registered return target was validated before
+                        // dispatch. Validate the live frame before sink commit.
+                        if memory.load(sp, 8)? != ret {
+                            return Err("Puts return frame changed before output".into());
+                        }
+                        self.stdout.puts(&memory, cpu.registers[7])? as u32 as u64
+                    } else if matches!(service, Service::Setlocale) {
+                        if self.locale.setlocale(
+                            &memory,
+                            cpu.registers[7] as i32,
+                            cpu.registers[6],
+                        )? {
+                            LOCALE_NAME
+                        } else {
+                            0
+                        }
+                    } else if matches!(service, Service::Memcpy) {
+                        memory.memcpy(cpu.registers[7], cpu.registers[6], cpu.registers[2])?
+                    } else if matches!(service, Service::Memset) {
+                        if cpu.registers[2] != 0 {
+                            validate_net_output(
+                                &memory,
+                                cpu.registers[7],
+                                usize::try_from(cpu.registers[2])
+                                    .map_err(|_| "Memset size overflow")?,
+                                sp,
+                                ret,
+                            )?;
+                        }
+                        crate::libc_memory::memset(
+                            &mut memory,
+                            cpu.registers[7],
+                            cpu.registers[6],
+                            cpu.registers[2],
+                        )?
+                    } else if matches!(service, Service::Strdup) {
+                        let errno = self
+                            .kernel
+                            .as_ref()
+                            .ok_or("Missing strdup errno context")?
+                            .errno_address();
+                        memory.validate_write(errno, 4)?;
+                        match crate::libc_memory::strdup(&mut memory, cpu.registers[7])? {
+                            Ok(address) => address,
+                            Err(error) => {
+                                memory.store(errno, error.into(), 4)?;
+                                0
+                            }
+                        }
+                    } else if matches!(
+                        service,
+                        Service::Sprintf | Service::Snprintf | Service::Vsnprintf
+                    ) {
+                        let mode = match service {
+                            Service::Sprintf => 0,
+                            Service::Snprintf => 1,
+                            _ => 2,
+                        };
+                        let errno = self
+                            .kernel
+                            .as_ref()
+                            .ok_or("Missing formatting errno context")?
+                            .errno_address();
+                        memory.validate_write(errno, 4)?;
+                        match crate::format::formatted(
+                            &mut memory,
+                            crate::format::Arguments {
+                                registers: [
+                                    cpu.registers[7],
+                                    cpu.registers[6],
+                                    cpu.registers[2],
+                                    cpu.registers[1],
+                                    cpu.registers[8],
+                                    cpu.registers[9],
+                                ],
+                                stack: sp,
+                            },
+                            mode,
+                        ) {
+                            Ok(value) => value,
+                            Err(fault) => {
+                                let error = match fault {
+                                    crate::strings::Fault::Allocation => 12,
+                                    crate::strings::Fault::Limit => 22,
+                                    _ => 14,
+                                };
+                                memory.store(errno, error, 4)?;
+                                u32::MAX.into()
+                            }
+                        }
+                    } else if matches!(service, Service::Getenv) {
+                        crate::environment::getenv(&memory, self.environment, cpu.registers[7])
+                            .map_err(|fault| format!("Guest getenv fault {fault:?}"))?
+                    } else if matches!(service, Service::Realloc) {
+                        let errno = self
+                            .kernel
+                            .as_ref()
+                            .ok_or("Missing realloc errno context")?
+                            .errno_address();
+                        memory.validate_write(errno, 4)?;
+                        validate_net_output(&memory, errno, 4, sp, ret)?;
+                        if cpu.registers[7] != 0 {
+                            // Realloc releases the old object on success. It
+                            // must not revoke its own live guest return frame.
+                            let length = memory.heap_allocation_size(cpu.registers[7])?;
+                            validate_net_output(&memory, cpu.registers[7], length, sp, ret)?;
+                        }
+                        match crate::libc_memory::realloc(
+                            &mut memory,
+                            cpu.registers[7],
+                            cpu.registers[6],
+                        )? {
+                            Ok(address) => address,
+                            Err(error) => {
+                                memory.store(errno, error.into(), 4)?;
+                                0
+                            }
+                        }
+                    } else if matches!(service, Service::Malloc | Service::Calloc | Service::Free) {
+                        if matches!(service, Service::Free) {
+                            memory.free(cpu.registers[7])?;
+                            0
+                        } else {
+                            let errno = self
+                                .kernel
+                                .as_ref()
+                                .ok_or("Missing heap errno context")?
+                                .errno_address();
+                            memory.validate_write(errno, 4)?;
+                            let result = if matches!(service, Service::Calloc) {
+                                memory.calloc(cpu.registers[7], cpu.registers[6])
+                            } else {
+                                memory.malloc(cpu.registers[7])
+                            };
+                            match result {
+                                Ok(address) => address,
+                                Err(error) => {
+                                    memory.store(errno, error.into(), 4)?;
+                                    0
+                                }
+                            }
+                        }
+                    } else if matches!(service, Service::NetErrnoLoc) {
+                        NET_ERRNO
+                    } else if matches!(service, Service::NetPoolCreate) {
+                        self.network.pool_create(
+                            &memory,
+                            cpu.registers[7],
+                            cpu.registers[6] as i32,
+                            cpu.registers[2] as i32,
+                        )? as u32 as u64
+                    } else if matches!(service, Service::NetPoolDestroy) {
+                        self.network.pool_destroy(cpu.registers[7] as i32)? as u32 as u64
+                    } else if matches!(service, Service::NetResolverCreate) {
+                        self.network.resolver_create(
+                            &memory,
+                            cpu.registers[7],
+                            cpu.registers[6] as i32,
+                            cpu.registers[2] as i32,
+                        )? as u32 as u64
+                    } else if matches!(service, Service::NetResolverDestroy) {
+                        self.network.resolver_destroy(cpu.registers[7] as i32)? as u32 as u64
+                    } else if matches!(service, Service::NetResolverStartNtoa) {
+                        // The common dispatch already validated the executable
+                        // registered return target, or the terminal sentinel.
+                        validate_net_output(&memory, cpu.registers[2], 4, sp, ret)?;
+                        self.network.start_ntoa(
+                            &mut memory,
+                            cpu.registers[7] as i32,
+                            cpu.registers[6],
+                            cpu.registers[2],
+                            cpu.registers[1] as i32,
+                            cpu.registers[8] as i32,
+                            cpu.registers[9] as i32,
+                        )? as u32 as u64
+                    } else if matches!(service, Service::NetResolverStartAton) {
+                        let flags = memory.load(
+                            sp.checked_add(8).ok_or("Network argument stack overflow")?,
+                            8,
+                        )? as i32;
+                        let capacity = cpu.registers[1] as i32;
+                        if !(1..=1025).contains(&capacity) {
+                            return Err("Invalid reverse resolver capacity".into());
+                        }
+                        validate_net_output(&memory, cpu.registers[2], capacity as usize, sp, ret)?;
+                        self.network.start_aton(
+                            &mut memory,
+                            cpu.registers[7] as i32,
+                            cpu.registers[6],
+                            cpu.registers[2],
+                            capacity,
+                            cpu.registers[8] as i32,
+                            cpu.registers[9] as i32,
+                            flags,
+                        )? as u32 as u64
+                    } else if matches!(service, Service::ImeInitialize) {
+                        self.ime_dialog
+                            .initialize(&memory, cpu.registers[7], cpu.registers[6])?
+                            as u32 as u64
+                    } else if matches!(service, Service::ImeGetStatus) {
+                        self.ime_dialog.get_status()? as u32 as u64
+                    } else if matches!(service, Service::ImeGetResult) {
+                        let end = sp.checked_add(8).ok_or("IME return frame overflow")?;
+                        if memory.load(sp, 8)? != ret {
+                            return Err("IME return frame changed before result delivery".into());
+                        }
+                        for (address, length) in
+                            self.ime_dialog.result_output_ranges(cpu.registers[7])?
+                        {
+                            let output_end = address
+                                .checked_add(length as u64)
+                                .ok_or("IME output overflow")?;
+                            if address < end && sp < output_end {
+                                return Err("IME output overlaps its live return frame".into());
+                            }
+                        }
+                        self.ime_dialog.get_result(&mut memory, cpu.registers[7])? as u32 as u64
+                    } else if matches!(service, Service::ImeTerminate) {
+                        self.ime_dialog.terminate()? as u32 as u64
+                    } else if matches!(service, Service::KeyboardInitialize) {
+                        self.keyboard.initialize()? as u32 as u64
+                    } else if matches!(service, Service::KeyboardOpen) {
+                        self.keyboard.open(
+                            cpu.registers[7] as i32,
+                            cpu.registers[6] as i32,
+                            cpu.registers[2] as i32,
+                            cpu.registers[1],
+                        )? as u32 as u64
+                    } else if matches!(service, Service::KeyboardReadState) {
+                        let output = cpu.registers[6];
+                        let output_end =
+                            output.checked_add(96).ok_or("Keyboard output overflow")?;
+                        let frame_end =
+                            sp.checked_add(8).ok_or("Keyboard return frame overflow")?;
+                        if memory.load(sp, 8)? != ret || (output < frame_end && sp < output_end) {
+                            return Err(
+                                "Keyboard output overlaps or changes its live return frame".into(),
+                            );
+                        }
+                        self.keyboard.read_state(
+                            &mut memory,
+                            cpu.registers[7] as i32,
+                            cpu.registers[6],
+                        )? as u32 as u64
+                    } else if matches!(service, Service::KeyboardClose) {
+                        self.keyboard.close(cpu.registers[7] as i32)? as u32 as u64
+                    } else if matches!(service, Service::VideoOpen) {
+                        self.video_out.open(
+                            cpu.registers[7] as i32,
+                            cpu.registers[6] as i32,
+                            cpu.registers[2] as i32,
+                            cpu.registers[1],
+                        )? as u32 as u64
+                    } else if matches!(service, Service::VideoClose) {
+                        self.video_out
+                            .close(&mut self.direct_memory, cpu.registers[7] as i32)?;
+                        // The SDK declares close/set-attribute void. Completing
+                        // their HLE thunk with RAX=0 is our explicit convention.
+                        0
+                    } else if matches!(service, Service::VideoAddFlipEvent) {
+                        self.video_out.add_flip_event(
+                            &self.equeues,
+                            cpu.registers[7],
+                            cpu.registers[6] as i32,
+                            cpu.registers[2],
+                        )? as u32 as u64
+                    } else if matches!(service, Service::VideoDeleteFlipEvent) {
+                        self.video_out
+                            .delete_flip_event(cpu.registers[7], cpu.registers[6] as i32)?
+                            as u32 as u64
+                    } else if matches!(service, Service::VideoSetFlipRate) {
+                        self.video_out
+                            .set_flip_rate(cpu.registers[7] as i32, cpu.registers[6] as i32)?
+                            as u32 as u64
+                    } else if matches!(service, Service::VideoSetBufferAttribute) {
+                        let (seventh, eighth) = video_stack_arguments(&memory, sp)?;
+                        // Registered executable return targets (or the terminal
+                        // sentinel) were checked before entering service dispatch.
+                        validate_video_attribute_return(&memory, cpu.registers[7], sp, ret)?;
+                        self.video_out.set_buffer_attribute(
+                            &mut memory,
+                            cpu.registers[7],
+                            cpu.registers[6],
+                            cpu.registers[2] as u32,
+                            cpu.registers[1] as u32,
+                            cpu.registers[8] as u32,
+                            cpu.registers[9],
+                            seventh as u32,
+                            eighth,
+                        )?;
+                        0
+                    } else if matches!(service, Service::VideoRegisterBuffers) {
+                        let (seventh, eighth) = video_stack_arguments(&memory, sp)?;
+                        self.video_out.register_buffers(
+                            &memory,
+                            &mut self.direct_memory,
+                            cpu.registers[7] as i32,
+                            cpu.registers[6] as i32,
+                            cpu.registers[2] as i32,
+                            cpu.registers[1],
+                            cpu.registers[8] as i32,
+                            cpu.registers[9],
+                            seventh as i32,
+                            eighth,
+                        )? as u32 as u64
+                    } else if matches!(service, Service::VideoSubmitFlip) {
+                        self.video_out.submit_flip(
+                            &memory,
+                            &mut self.equeues,
+                            cpu.registers[7] as i32,
+                            cpu.registers[6] as i32,
+                            cpu.registers[2] as u32,
+                            cpu.registers[1] as i64,
+                        )? as u32 as u64
+                    } else if matches!(service, Service::EqueueCreate) {
+                        self.equeues
+                            .create(&mut memory, cpu.registers[7], cpu.registers[6])?
+                            as u32 as u64
+                    } else if matches!(service, Service::EqueueDelete) {
+                        self.equeues.delete(cpu.registers[7])? as u32 as u64
+                    } else if matches!(service, Service::EqueueWait) {
+                        let registered_return = terminal
+                            || owner(ret).is_ok_and(|bias| {
+                                ret.checked_sub(bias)
+                                    .is_some_and(|offset| block_at(bias, offset).is_some())
+                            });
+                        validate_equeue_return(
+                            &memory,
+                            (cpu.registers[6], cpu.registers[2] as i32, cpu.registers[1]),
+                            (sp, ret),
+                            terminal,
+                            registered_return,
+                        )?;
+                        match self.equeues.wait(
+                            &mut memory,
+                            cpu.registers[7],
+                            cpu.registers[6],
+                            cpu.registers[2] as i32,
+                            cpu.registers[1],
+                            cpu.registers[8],
+                        )? {
+                            crate::equeue::WaitOutcome::Ready(value) => value as u32 as u64,
+                            // Existing resume APIs complete a yielded service with
+                            // a caller-supplied result. An event wait needs its own
+                            // continuation/revalidation before it can use those
+                            // semantics; never turn Pending into successful zero.
+                            crate::equeue::WaitOutcome::Pending => {
+                                return Err(
+                                    "sceKernelWaitEqueue: empty queue requires event suspension"
+                                        .into(),
+                                );
+                            }
+                        }
+                    } else if matches!(service, Service::DirectAllocate) {
+                        self.direct_memory.allocate(
+                            &mut memory,
+                            cpu.registers[7],
+                            cpu.registers[6],
+                            cpu.registers[2] as i32,
+                            cpu.registers[1],
+                        )? as u32 as u64
+                    } else if matches!(service, Service::DirectMap) {
+                        self.direct_memory.map(
+                            &mut memory,
+                            cpu.registers[7],
+                            cpu.registers[6],
+                            cpu.registers[2] as i32,
+                            cpu.registers[1] as i32,
+                            cpu.registers[8],
+                            cpu.registers[9],
+                        )? as u32 as u64
+                    } else if matches!(service, Service::DirectRelease) {
+                        self.direct_memory.release(
+                            &mut memory,
+                            cpu.registers[7],
+                            cpu.registers[6],
+                        )? as u32 as u64
+                    } else if matches!(service, Service::AudioInitialize) {
+                        self.audio.initialize()? as u32 as u64
+                    } else if matches!(service, Service::AudioOpen) {
+                        self.audio.open(
+                            cpu.registers[7] as i32,
+                            cpu.registers[6] as i32,
+                            cpu.registers[2] as i32,
+                            cpu.registers[1] as u32,
+                            cpu.registers[8] as u32,
+                            cpu.registers[9] as u32,
+                        )? as u32 as u64
+                    } else if matches!(service, Service::AudioOutput) {
+                        self.audio
+                            .output(&memory, cpu.registers[7] as i32, cpu.registers[6])?
+                            as u32 as u64
+                    } else if matches!(service, Service::AudioClose) {
+                        self.audio.close(cpu.registers[7] as i32)? as u32 as u64
+                    } else if matches!(service, Service::PadInitialize) {
+                        self.pad.initialize()? as u32 as u64
+                    } else if matches!(service, Service::PadOpen) {
+                        self.pad.open(
+                            cpu.registers[7] as i32,
+                            cpu.registers[6] as i32,
+                            cpu.registers[2] as i32,
+                            cpu.registers[1],
+                        )? as u32 as u64
+                    } else if matches!(service, Service::PadClose) {
+                        self.pad.close(cpu.registers[7] as i32)? as u32 as u64
+                    } else if matches!(service, Service::PadReadState) {
+                        self.pad.read_state(
+                            &mut memory,
+                            cpu.registers[7] as i32,
+                            cpu.registers[6],
+                        )? as u32 as u64
+                    } else if matches!(service, Service::PadSetLightBar) {
+                        self.pad
+                            .set_light_bar(cpu.registers[7] as i32, cpu.registers[6])?
+                            as u32 as u64
+                    } else if matches!(service, Service::PadSetVibration) {
+                        self.pad
+                            .set_vibration(cpu.registers[7] as i32, cpu.registers[6])?
+                            as u32 as u64
+                    } else if matches!(service, Service::PadSetVibrationMode) {
+                        self.pad
+                            .set_vibration_mode(cpu.registers[7] as i32, cpu.registers[6] as i32)?
+                            as u32 as u64
+                    } else if matches!(service, Service::UserInitialize) {
+                        self.user_service.initialize(cpu.registers[7])? as u32 as u64
+                    } else if matches!(service, Service::UserGetForeground) {
+                        self.user_service
+                            .get_foreground_user(&mut memory, cpu.registers[7])?
+                            as u32 as u64
+                    } else if matches!(service, Service::UserGetLoginList) {
+                        self.user_service
+                            .get_login_user_id_list(&mut memory, cpu.registers[7])?
+                            as u32 as u64
+                    } else if matches!(service, Service::UserGetName) {
+                        self.user_service.get_user_name(
+                            &mut memory,
+                            cpu.registers[7] as i32,
+                            cpu.registers[6],
+                            cpu.registers[2],
+                        )? as u32 as u64
+                    } else if matches!(service, Service::SystemHideSplashScreen) {
+                        self.system_service.hide_splash_screen() as u32 as u64
+                    } else if matches!(service, Service::SystemLaunchWebBrowser) {
+                        self.system_service
+                            .launch_web_browser(cpu.registers[7], cpu.registers[6])?
+                            as u32 as u64
+                    } else if matches!(service, Service::Getargc | Service::Getargv) {
+                        let (count, address) = self
+                            .process_arguments
+                            .ok_or("Guest process arguments are not configured")?;
+                        if count > 4096 || address == 0 || address & 7 != 0 {
+                            return Err("Invalid guest process argument table".into());
+                        }
+                        let table = memory.read(address, (count as usize + 1) * 8)?;
+                        if table[count as usize * 8..] != [0; 8]
+                            || table[..count as usize * 8]
+                                .chunks_exact(8)
+                                .any(|p| p == [0; 8])
+                        {
+                            return Err("Malformed guest process argument table".into());
+                        }
+                        if matches!(service, Service::Getargc) {
+                            u64::from(count)
+                        } else {
+                            address
+                        }
+                    } else if matches!(service, Service::Strerror | Service::InternalStrerror) {
+                        if matches!(service, Service::InternalStrerror) && cpu.registers[6] != 0 {
+                            return Err("Non-null _Strerror buffer is unsupported".into());
+                        }
+                        let (mut text, known) =
+                            crate::error_text::describe(cpu.registers[7] as i32);
+                        if !known && matches!(service, Service::Strerror) {
+                            let errno = self
+                                .kernel
+                                .as_ref()
+                                .ok_or("Missing strerror errno context")?
+                                .errno_address();
+                            memory.store(errno, 22, 4)?;
+                        }
+                        text.push('\0');
+                        memory.update_service_data(ERROR_TEXT, text.as_bytes())?;
+                        ERROR_TEXT
+                    } else if matches!(service, Service::Errno) {
+                        let address = self
+                            .kernel
+                            .as_ref()
+                            .ok_or("Missing errno context")?
+                            .errno_address();
+                        memory.validate_write(address, 4)?;
+                        address
+                    } else {
+                        crate::strings::call(
+                            &mut memory,
+                            service.operation(),
+                            cpu.registers[7],
+                            cpu.registers[6],
+                            cpu.registers[2],
+                        )
+                        .map_err(|fault| format!("Module string service fault {fault:?}"))?
+                    };
+                    if memory.load(sp, 8)? != ret {
+                        return Err("Service corrupted guest return address".into());
+                    }
+                    cpu.registers[4] = sp.checked_add(8).ok_or("Service stack overflow")?;
+                    cpu.registers[0] = value;
+                    if terminal {
+                        return Ok(Flow::Finished(return_convention.completed(value)));
+                    }
+                    cpu.rip = cpu.next_rip;
+                    cpu.stop = 0;
+                    continue;
+                }
+                let target_bias = owner(cpu.target)?;
+                let target = cpu
+                    .target
+                    .checked_sub(target_bias)
+                    .ok_or("Call below image")?;
+                if block_at(target_bias, target).is_none() {
+                    translation_miss!(target_bias, target);
+                }
+                if tail {
+                    if block_at(target_bias, target).is_none() || !memory.executable(cpu.target) {
+                        return Err(format!(
+                            "Unregistered module tail jump to {:#x}",
+                            cpu.target
+                        ));
+                    }
+                    cpu.rip = target;
+                    cpu.bias = target_bias;
+                } else {
+                    let ret = cpu
+                        .bias
+                        .checked_add(cpu.next_rip)
+                        .ok_or("Call return overflow")?;
+                    if block_at(target_bias, target).is_none()
+                        || !memory.executable(cpu.target)
+                        || !memory.executable(ret)
+                    {
+                        return Err("Unregistered module call".into());
+                    }
+                    let sp = cpu.registers[4]
+                        .checked_sub(8)
+                        .ok_or("Call stack underflow")?;
+                    memory.store(sp, ret, 8)?;
+                    cpu.registers[4] = sp;
+                    cpu.rip = target;
+                    cpu.bias = target_bias;
+                }
+            } else if cpu.stop == 2 {
+                let target = cpu
+                    .bias
+                    .checked_add(cpu.rip)
+                    .ok_or("Branch address overflow")?;
+                let target_bias = owner(target)?;
+                let target_offset = target
+                    .checked_sub(target_bias)
+                    .ok_or("Branch below image")?;
+                if block_at(target_bias, target_offset).is_none() {
+                    translation_miss!(target_bias, target_offset);
+                }
+                cpu.bias = owner(target)?;
+                cpu.rip = target.checked_sub(cpu.bias).ok_or("Branch below image")?;
+            }
+            if cpu.fuel == 0 || cpu.stop == 4 {
+                return Err("Module fuel exhausted".into());
+            }
+            if block_at(cpu.bias, cpu.rip).is_none() {
+                // The pre-dispatch checks above cover all control transfers;
+                // this path is an initial entry or a normal service continuation.
+                translation_miss!(cpu.bias, cpu.rip);
+            }
+            let block = block_at(cpu.bias, cpu.rip).ok_or_else(|| {
+                format!(
+                    "Missing module translation at {:#x} (bias {:#x})",
+                    cpu.rip, cpu.bias
+                )
+            })?;
+            let pc = cpu.bias.checked_add(cpu.rip).ok_or("Module PC overflow")?;
+            let source = cpu
+                .bias
+                .checked_add(block.start)
+                .ok_or("Block source address overflow")?;
+            if !memory.executable(pc) || memory.read(source, block.bytes.len())? != &*block.bytes {
+                return Err("Module code does not match translation".into());
+            }
+            cpu.stop = 0;
+            cpu.target = 0;
+            // Refresh the raw borrow after Rust-side dispatch accesses, and use
+            // it only for this synchronous translated block.
+            cpu.memory = (&mut memory as *mut Memory<'_>) as u64;
+            // SAFETY: registration contract plus byte verification; CPU and all
+            // borrowed mappings remain live and exclusive for this call.
+            unsafe {
+                (block.function)(&mut cpu);
+            }
+            cpu.memory = 0;
+            if cpu.stop == 0 && cpu.fault == 0 {
+                return Err("Translation did not stop at a boundary".into());
+            }
+        }
+        Err("Module transition budget exhausted".into())
+    }
+}
+impl Executor for NativeExecutor {
+    fn exit_request(&self) -> Option<ExitRequest> {
+        self.exit_request
+    }
+    fn call_with_dependencies(
+        &mut self,
+        image: &mut Image,
+        address: u64,
+        arguments: Arguments,
+        dependencies: &mut [&mut Image],
+    ) -> Result<i32> {
+        self.execute(image, address, arguments, dependencies)
+    }
+    fn initialize_with_dependencies(
+        &mut self,
+        image: &mut Image,
+        address: u64,
+        dependencies: &mut [&mut Image],
+    ) -> Result<()> {
+        self.execute(image, address, Arguments::default(), dependencies)
+            .map(|_| ())
+    }
+    fn call(&mut self, image: &mut Image, address: u64, arguments: Arguments) -> Result<i32> {
+        self.execute(image, address, arguments, &mut [])
+    }
+    fn initialize(&mut self, image: &mut Image, address: u64) -> Result<()> {
+        self.execute(image, address, Arguments::default(), &mut [])
+            .map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod service_registration_tests {
+    use super::*;
+    #[test]
+    fn loader_export_publication_is_atomic_and_resolves_name_and_nid() {
+        let mut modules = crate::modules::Modules::new(65536);
+        let mut native = NativeExecutor::new(0x900000, 4096, 100, 100).unwrap();
+        assert!(
+            native
+                .register_loader_module(&mut modules, "../bad", 0x700000)
+                .is_err()
+        );
+        assert!(native.services.is_empty());
+        native
+            .register_loader_module(&mut modules, "libkernel.prx", 0x700000)
+            .unwrap();
+        let nid = crate::strings::nid("sceKernelLoadStartModule");
+        for name in [
+            "sceKernelLoadStartModule",
+            std::str::from_utf8(&nid[..11]).unwrap(),
+        ] {
+            let identity = crate::imports::identify(name, &BTreeMap::new(), &[]).unwrap();
+            assert_eq!(modules.resolve(&identity), Some(0x700000));
+        }
+        assert!(
+            native
+                .register_loader_module(&mut modules, "libkernel.prx", 0x710000)
+                .is_err()
+        );
+        assert_eq!(native.services.len(), 3);
+        let stop =
+            crate::imports::identify("sceKernelStopUnloadModule", &BTreeMap::new(), &[]).unwrap();
+        assert_eq!(modules.resolve(&stop), Some(0x700010));
+        assert!(
+            native
+                .register_loader_module(&mut modules, "other.prx", 0x700000)
+                .is_err()
+        );
+    }
+    #[test]
+    fn loader_request_validates_all_inputs_before_side_effects() {
+        let mut data = vec![0u8; 2048];
+        let path = b"/app0/test.prx\0";
+        data[..path.len()].copy_from_slice(path);
+        let mut code = [0u8; 16];
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut data, true, false).unwrap();
+        memory.add(0x3000, &mut code, false, true).unwrap();
+        let valid = [0x1000, 3, 0x1100, 0, 0, 0x1200];
+        let request = LoadRequest::read(&memory, valid).unwrap();
+        assert_eq!(request.path, "/app0/test.prx");
+        assert_eq!(request.arguments.size, 3);
+        assert_eq!(request.result_address, 0x1200);
+        for (index, value) in [
+            (0, 0),
+            (0, u64::MAX),
+            (1, u64::MAX),
+            (2, 0x17ff),
+            (3, 1),
+            (4, 1),
+            (5, 0x3000),
+            (5, 0x17ff),
+        ] {
+            let mut invalid = valid;
+            invalid[index] = value;
+            assert!(LoadRequest::read(&memory, invalid).is_err());
+        }
+        assert_eq!(memory.load(0x1200, 4).unwrap(), 0);
+        memory.write(0x1000, b"/app0/../bad\0").unwrap();
+        assert!(LoadRequest::read(&memory, valid).is_err());
+        memory.write(0x1000, &vec![b'a'; 1025]).unwrap();
+        assert!(LoadRequest::read(&memory, valid).is_err());
+        memory.write(0x1000, b"/\xff\0").unwrap();
+        assert!(LoadRequest::read(&memory, valid).is_err());
+    }
+    #[test]
+    fn service_publication_is_atomic_across_executor_and_registry() {
+        let mut modules = crate::modules::Modules::new(65536);
+        let mut native = NativeExecutor::new(0x900000, 4096, 100, 100).unwrap();
+        let plain = |name: &str| crate::imports::identify(name, &BTreeMap::new(), &[]).unwrap();
+        native.register_service(0x700020, Service::Strlen).unwrap();
+        assert!(
+            native
+                .register_string_module(&mut modules, "libstrings.prx", 0x700000)
+                .is_err()
+        );
+        assert_eq!(native.services.len(), 1);
+        assert_eq!(modules.resolve(&plain("strcpy")), None);
+        assert!(
+            native
+                .register_string_module(&mut modules, "libstrings.prx", u64::MAX - 16)
+                .is_err()
+        );
+        assert_eq!(native.services.len(), 1);
+        assert!(
+            native
+                .register_string_module(&mut modules, "../bad", 0x710000)
+                .is_err()
+        );
+        assert_eq!(native.services.len(), 1);
+        let handle = native
+            .register_string_module(&mut modules, "libstrings.prx", 0x710000)
+            .unwrap();
+        assert_eq!(modules.phase(handle), Some(crate::modules::Phase::Started));
+        assert_eq!(native.services.len(), 6);
+        for (i, name) in crate::strings::NAMES[..5].iter().enumerate() {
+            assert_eq!(
+                modules.resolve(&plain(name)),
+                Some(0x710000 + i as u64 * 16)
+            );
+            let nid = crate::strings::nid(name);
+            assert_eq!(
+                modules.resolve(&plain(std::str::from_utf8(&nid[..11]).unwrap())),
+                Some(0x710000 + i as u64 * 16)
+            );
+        }
+        assert!(
+            native
+                .register_string_module(&mut modules, "libstrings.prx", 0x720000)
+                .is_err()
+        );
+        assert_eq!(native.services.len(), 6);
+    }
+}
+
+#[cfg(test)]
+mod exit_request_tests {
+    use super::*;
+    fn suspended(image: &Image, tail: bool, status: u64, fuel: u64) -> Continuation {
+        let mut cpu = Cpu {
+            bias: image.bias,
+            rip: 0x100,
+            next_rip: 0x106,
+            stop: if tail { 5 } else { 1 },
+            target: 0x700000,
+            fuel,
+            ..Cpu::default()
+        };
+        cpu.registers[7] = status;
+        // Tail exit must not dereference a return address, even if RSP is unmapped.
+        cpu.registers[4] = if tail { 0 } else { 0x900ff8 };
+        Continuation {
+            return_convention: ReturnConvention::ModuleStatus,
+            guest_thread: MAIN_GUEST_THREAD,
+            cpu,
+            stack: vec![0; 4096],
+            stack_address: 0x900000,
+            remaining: 10,
+            caller_bias: image.bias,
+        }
+    }
+    #[test]
+    fn noreturn_dispatch_skips_ud2_and_tail_return_stack_and_latches_status() {
+        for (service, kind) in [
+            (Service::Exit, ExitKind::Normal),
+            (Service::ImmediateExit, ExitKind::Immediate),
+        ] {
+            for tail in [false, true] {
+                for status in [0, 1, 0xabcd_1234_ffff_ffff] {
+                    let mut file = crate::modules::fixture();
+                    file[0x106..0x108].copy_from_slice(&[0x0f, 0x0b]);
+                    let mut image = Image::load(&file, 0x100000, 65536).unwrap();
+                    let pending = suspended(&image, tail, status, 3);
+                    let stale = suspended(&image, false, 0, 3);
+                    let mut executor = NativeExecutor::new(0x900000, 4096, 10, 10).unwrap();
+                    executor.register_service(0x700000, service).unwrap();
+                    // Begin at the dispatcher boundary: no generated function or
+                    // return-PC translation exists, and UD2 cannot be executed.
+                    let result = executor
+                        .execute_flow(
+                            &mut image,
+                            0,
+                            Arguments::default(),
+                            &mut [],
+                            Some(pending),
+                            &mut [],
+                        )
+                        .unwrap();
+                    let expected = ExitRequest {
+                        status: status as u32 as i32,
+                        kind,
+                    };
+                    assert!(
+                        matches!(result,Execution::ExitRequested(request) if request==expected)
+                    );
+                    assert_eq!(executor.exit_request(), Some(expected));
+                    assert_eq!(executor.exit_remaining_fuel(), Some(2));
+                    assert!(
+                        executor
+                            .run(&mut image, 0x100100, Arguments::default(), &mut [])
+                            .err()
+                            .unwrap()
+                            .contains("exit requested")
+                    );
+                    assert!(
+                        executor
+                            .resume(&mut image, &mut [], stale, 0)
+                            .err()
+                            .unwrap()
+                            .contains("exit requested")
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn exhausted_budget_does_not_invent_exit_request() {
+        let mut image = Image::load(&crate::modules::fixture(), 0x100000, 65536).unwrap();
+        let pending = suspended(&image, true, 1, 0);
+        let mut executor = NativeExecutor::new(0x900000, 4096, 10, 10).unwrap();
+        executor.register_service(0x700000, Service::Exit).unwrap();
+        assert!(
+            executor
+                .execute_flow(
+                    &mut image,
+                    0,
+                    Arguments::default(),
+                    &mut [],
+                    Some(pending),
+                    &mut []
+                )
+                .err()
+                .unwrap()
+                .contains("fuel")
+        );
+        assert_eq!(executor.exit_request(), None);
+    }
+}
