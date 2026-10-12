@@ -1312,7 +1312,7 @@ impl NativeExecutor {
         if self
             .services
             .values()
-            .any(|service| matches!(service, Service::Fprintf | Service::Fflush))
+            .any(|service| matches!(service, Service::Fprintf | Service::Fflush | Service::File(_)))
         {
             mapped_data.push(DataRegion {
                 address: crate::guest_stdio::FILE_ADDR,
@@ -2236,7 +2236,7 @@ impl NativeExecutor {
         if self
             .services
             .values()
-            .any(|service| matches!(service, Service::Fprintf | Service::Fflush))
+            .any(|service| matches!(service, Service::Fprintf | Service::Fflush | Service::File(_)))
         {
             memory.add(
                 crate::guest_stdio::FILE_ADDR,
@@ -2922,7 +2922,15 @@ impl NativeExecutor {
                             return Err("Stdio return frame changed before output".into());
                         }
                         if matches!(service, Service::Fflush) {
-                            self.stdio.fflush(&memory, cpu.registers[7])? as u32 as u64
+                            let stream = cpu.registers[7];
+                            if stream == crate::guest_stdio::FILE_ADDR || (stream == 0 && self.stdio.configured()) {
+                                self.stdio.fflush(&memory,stream)?;
+                            }
+                            if stream != crate::guest_stdio::FILE_ADDR {
+                                if let Some(kernel) = &self.kernel { self.file_streams.flush(&kernel.descriptors,&memory,stream)?; }
+                                else if stream != 0 { return Err("Missing FILE kernel context".into()); }
+                            }
+                            0
                         } else {
                             validate_net_output(
                                 &memory,
@@ -3244,12 +3252,16 @@ impl NativeExecutor {
                         let (value, _) = kernel.syscall(&mut memory, 189, [descriptor,cpu.registers[6],0,0,0,0])?;
                         value as u32 as u64
                     } else if let Service::File(operation) = service {
-                        self.file_streams.call(
+                        if matches!(operation,crate::stdio_file::Operation::Write) && cpu.registers[1] == crate::guest_stdio::FILE_ADDR {
+                            self.stdio.fwrite(&mut memory,cpu.registers[7],cpu.registers[6],cpu.registers[2],
+                                self.kernel.as_ref().ok_or("Missing fwrite errno context")?.errno_address(),
+                                |memory,address,length| validate_net_output(memory,address,length,sp,ret))?
+                        } else { self.file_streams.call(
                             self.kernel.as_mut().ok_or("Missing FILE kernel context")?,
                             &mut memory, *operation,
                             [cpu.registers[7],cpu.registers[6],cpu.registers[2],cpu.registers[1]],
                             |memory,address,length| validate_net_output(memory,address,length,sp,ret),
-                        )?
+                        )? }
                     } else if matches!(service, Service::Gettimeofday) {
 
                         let plan = self.guest_time.plan(cpu.registers[7], cpu.registers[6])?;

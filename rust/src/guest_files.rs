@@ -1,11 +1,16 @@
-//! Explicit read-only guest files. No host filesystem lookup or path forwarding.
+//! Explicit memory-backed guest files with opt-in writable paths and shared quota.
+//! No host filesystem lookup, path forwarding or persistent save storage.
 //! ABI: ps5-payload-dev/sdk include/freebsd/sys/stat.h (FreeBSD 11.4 amd64),
 //! corroborated by AnyPS5/core/libs/SceTypes.hpp::FileStat. Serialize fields
 //! explicitly: host struct stat has a different layout on Apple Silicon.
 //! https://raw.githubusercontent.com/ps5-payload-dev/sdk/master/include/freebsd/sys/stat.h
 //! https://raw.githubusercontent.com/ps5-payload-dev/sdk/master/include/freebsd/sys/_types.h
 use crate::{Result, guest_memory::Memory};
-use std::{collections::BTreeMap, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+};
 
 pub const STAT_SIZE: usize = 120;
 const PATH_MAX: usize = 1024;
@@ -13,9 +18,76 @@ const MAX_FILES: usize = 256;
 const MAX_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TRACE_RECORDS: usize = 256;
 const MAX_TRACE_BYTES: usize = 65536;
-struct File {
-    bytes: Rc<[u8]>,
+pub(crate) struct Quota {
+    pub used: Cell<usize>,
+    pub revision: Cell<u64>,
+}
+impl Default for Quota {
+    fn default() -> Self {
+        Self {
+            used: Cell::new(0),
+            revision: Cell::new(0),
+        }
+    }
+}
+impl Quota {
+    pub fn remaining(&self) -> usize {
+        MAX_CONTENT_BYTES - self.used.get()
+    }
+    pub fn change(&self, old: usize, new: usize) -> std::result::Result<(), u32> {
+        let used = self
+            .used
+            .get()
+            .checked_sub(old)
+            .and_then(|v| v.checked_add(new))
+            .filter(|v| *v <= MAX_CONTENT_BYTES)
+            .ok_or(28u32)?;
+        let revision = self.revision.get().checked_add(1).ok_or(28u32)?;
+        self.used.set(used);
+        self.revision.set(revision);
+        Ok(())
+    }
+}
+pub(crate) struct FileState {
+    pub bytes: Box<[u8]>,
+    pub revision: u64,
+}
+pub(crate) struct FileBacking {
+    pub state: RefCell<FileState>,
+    pub quota: Rc<Quota>,
+    pub writable: bool,
     inode: u32,
+}
+impl FileBacking {
+    pub fn stat(&self) -> [u8; STAT_SIZE] {
+        let length = self.state.borrow().bytes.len();
+        let mut record = [0; STAT_SIZE];
+        record[0..4].copy_from_slice(&1u32.to_le_bytes());
+        record[4..8].copy_from_slice(&self.inode.to_le_bytes());
+        record[8..10].copy_from_slice(
+            &(if self.writable {
+                0o100666u16
+            } else {
+                0o100444u16
+            })
+            .to_le_bytes(),
+        );
+        record[10..12].copy_from_slice(&1u16.to_le_bytes());
+        record[72..80].copy_from_slice(&(length as i64).to_le_bytes());
+        record[80..88].copy_from_slice(&(length.div_ceil(512) as i64).to_le_bytes());
+        record[88..92].copy_from_slice(&512u32.to_le_bytes());
+        record
+    }
+}
+impl Drop for FileBacking {
+    fn drop(&mut self) {
+        self.quota
+            .used
+            .set(self.quota.used.get() - self.state.get_mut().bytes.len());
+        self.quota
+            .revision
+            .set(self.quota.revision.get().saturating_add(1));
+    }
 }
 #[derive(Debug, PartialEq, Eq)]
 pub struct StatRequest {
@@ -29,8 +101,9 @@ pub struct StatTrace {
 }
 #[derive(Default)]
 pub struct Files {
-    files: BTreeMap<Vec<u8>, File>,
-    content_bytes: usize,
+    files: BTreeMap<Vec<u8>, Rc<FileBacking>>,
+    quota: Rc<Quota>,
+    create_directories: BTreeSet<Vec<u8>>,
     tracing: bool,
     trace: StatTrace,
     trace_bytes: usize,
@@ -39,32 +112,66 @@ impl Files {
     /// Register actual owned contents under an exact canonical absolute guest
     /// path. Regular files only; no cwd, symlinks, directories or host metadata.
     pub fn register(&mut self, path: &[u8], bytes: Vec<u8>) -> Result<()> {
+        self.register_mode(path, bytes, false)
+    }
+    pub fn register_writable(&mut self, path: &[u8], bytes: Vec<u8>) -> Result<()> {
+        self.register_mode(path, bytes, true)
+    }
+    fn register_mode(&mut self, path: &[u8], bytes: Vec<u8>, writable: bool) -> Result<()> {
         if !canonical(path) || self.files.contains_key(path) || self.files.len() >= MAX_FILES {
             return Err("Invalid, duplicate or excessive guest file registration".into());
         }
-        let total = self
-            .content_bytes
-            .checked_add(bytes.len())
-            .ok_or("Guest file budget overflow")?;
-        if total > MAX_CONTENT_BYTES {
-            return Err("Guest file content budget exceeded".into());
-        }
+        self.quota
+            .change(0, bytes.len())
+            .map_err(|_| "Guest file content budget exceeded")?;
         let inode = self.files.len() as u32 + 1;
         self.files.insert(
             path.to_vec(),
-            File {
-                bytes: bytes.into(),
+            Rc::new(FileBacking {
+                state: RefCell::new(FileState {
+                    bytes: bytes.into_boxed_slice(),
+                    revision: 0,
+                }),
+                quota: self.quota.clone(),
+                writable,
                 inode,
-            },
+            }),
         );
-        self.content_bytes = total;
         Ok(())
     }
-    /// Shared immutable backing; opening a descriptor never copies file contents.
-    /// Kept behind this API so a later explicit mounted-file backend can supply
-    /// bounded read-at chunks without changing stream/descriptor cursor ownership.
-    pub(crate) fn contents(&self, path: &[u8]) -> std::result::Result<Rc<[u8]>, u32> {
-        self.files.get(path).map(|f| f.bytes.clone()).ok_or(2)
+    /// Explicit writable virtual directory; creation never reaches a host path.
+    pub fn allow_create_directory(&mut self, path: &[u8]) -> Result<()> {
+        if (path != b"/" && !canonical(path)) || self.create_directories.len() >= MAX_FILES {
+            return Err("Invalid or excessive writable guest directory".into());
+        }
+        self.create_directories.insert(path.to_vec());
+        Ok(())
+    }
+    pub(crate) fn backing(&self, path: &[u8]) -> std::result::Result<Rc<FileBacking>, u32> {
+        self.files.get(path).cloned().ok_or(2)
+    }
+    pub(crate) fn quota(&self) -> Rc<Quota> {
+        self.quota.clone()
+    }
+    pub(crate) fn create(&mut self, path: &[u8]) -> std::result::Result<Rc<FileBacking>, u32> {
+        if !canonical(path) {
+            return Err(2);
+        }
+        let slash = path.iter().rposition(|b| *b == b'/').unwrap();
+        let parent = if slash == 0 {
+            &path[..1]
+        } else {
+            &path[..slash]
+        };
+        if !self.create_directories.contains(parent) {
+            return Err(2);
+        }
+        if self.files.len() >= MAX_FILES {
+            return Err(28);
+        }
+        self.register_mode(path, Vec::new(), true)
+            .map_err(|_| 28u32)?;
+        self.backing(path)
     }
     /// Tracing is off by default. Disabling retains already captured requests
     /// until drained; exhaustion drops trace records without changing syscall results.
@@ -76,7 +183,7 @@ impl Files {
         std::mem::take(&mut self.trace)
     }
     pub fn content_bytes(&self) -> usize {
-        self.content_bytes
+        self.quota.used.get()
     }
     pub fn stat(
         &mut self,
@@ -102,18 +209,7 @@ impl Files {
         result
     }
     pub(crate) fn stat_record(&self, path: &[u8]) -> std::result::Result<[u8; STAT_SIZE], u32> {
-        let file = self.files.get(path).ok_or(2u32)?;
-        let mut record = [0u8; STAT_SIZE];
-        // A deterministic virtual regular-file identity, with read permissions,
-        // one link, zero owner/timestamps, and 512-byte allocation units.
-        record[0..4].copy_from_slice(&1u32.to_le_bytes());
-        record[4..8].copy_from_slice(&file.inode.to_le_bytes());
-        record[8..10].copy_from_slice(&0o100444u16.to_le_bytes());
-        record[10..12].copy_from_slice(&1u16.to_le_bytes());
-        record[72..80].copy_from_slice(&(file.bytes.len() as i64).to_le_bytes());
-        record[80..88].copy_from_slice(&(file.bytes.len().div_ceil(512) as i64).to_le_bytes());
-        record[88..92].copy_from_slice(&512u32.to_le_bytes());
-        Ok(record)
+        Ok(self.backing(path)?.stat())
     }
     fn stat_path(
         &self,
@@ -278,9 +374,9 @@ mod tests {
         files.register(b"/file", vec![1]).unwrap();
         assert!(files.register(b"/file", vec![2]).is_err());
         assert_eq!(files.content_bytes(), 1);
-        files.content_bytes = MAX_CONTENT_BYTES;
+        files.quota.used.set(MAX_CONTENT_BYTES);
         assert!(files.register(b"/over", vec![1]).is_err());
-        files.content_bytes = 1;
+        files.quota.used.set(1);
         let mut path = *b"/missing\0";
         let mut long = vec![b'x'; PATH_MAX];
         for i in (0..PATH_MAX).step_by(100) {

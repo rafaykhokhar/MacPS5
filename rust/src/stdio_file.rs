@@ -1,8 +1,9 @@
-//! Owned read-only FILE state over the shared kernel descriptor cursor.
+//! Owned unbuffered FILE state over shared kernel descriptor cursors/backing.
 //! Policy: FreeBSD releng/11.4 libc/stdio/{fread,fseek,ftell,flags}.c.
 //! Layout: SDK10b539de8f2b6773a9a78caa7576a97dbd99b29a/freebsd/stdio.h.
 //! No host FILE pointers, host paths, duplicated cursors or invented close.
-use crate::descriptors::{Descriptors, FileReadPlan, FileToken};
+use crate::descriptors::{Descriptors, FileReadPlan, FileToken, FileWritePlan, OpenOptions};
+use crate::stdio_write::{Direction, Mode};
 use std::rc::Rc;
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
@@ -10,6 +11,14 @@ pub enum Error {
     Unsupported(&'static str),
 }
 type Result<T> = std::result::Result<T, Error>;
+pub struct WritePlan {
+    pub elements: u64,
+    pub errno: Option<u32>,
+    write: Option<FileWritePlan>,
+    preparation: crate::stdio_write::WritePreparation,
+    revision: u64,
+    owner: Rc<()>,
+}
 pub struct ReadPlan {
     pub elements: u64,
     pub errno: Option<u32>,
@@ -17,6 +26,7 @@ pub struct ReadPlan {
     eof: bool,
     error: bool,
     orientation: bool,
+    direction: Direction,
     revision: u64,
     owner: Rc<()>,
 }
@@ -27,6 +37,8 @@ impl ReadPlan {
 }
 pub struct Stream {
     token: FileToken,
+    mode: Mode,
+    direction: Direction,
     eof: bool,
     error: bool,
     orientation: bool,
@@ -36,11 +48,16 @@ pub struct Stream {
 }
 impl Stream {
     pub fn new(token: FileToken) -> Result<Self> {
+        Self::with_mode(token, Mode::parse(b"r").expect("constant mode"))
+    }
+    pub fn with_mode(token: FileToken, mode: Mode) -> Result<Self> {
         if token.descriptor() > i16::MAX as u32 {
             return Err(Error::Errno(24));
         }
         Ok(Self {
             token,
+            mode,
+            direction: mode.initial_direction(),
             eof: false,
             error: false,
             orientation: false,
@@ -56,6 +73,69 @@ impl Stream {
             Ok(())
         }
     }
+    pub fn write_preparation(
+        &self,
+        size: u64,
+        count: u64,
+    ) -> Result<crate::stdio_write::WritePreparation> {
+        self.live()?;
+        Ok(crate::stdio_write::prepare(
+            self.mode,
+            self.direction,
+            size,
+            count,
+        ))
+    }
+    pub fn write_plan(
+        &self,
+        descriptors: &Descriptors,
+        size: u64,
+        count: u64,
+        bytes: &[u8],
+    ) -> Result<WritePlan> {
+        let preparation = self.write_preparation(size, count)?;
+        let mut plan = WritePlan {
+            elements: 0,
+            errno: preparation.errno,
+            write: None,
+            preparation,
+            revision: self.revision,
+            owner: self.owner.clone(),
+        };
+        if preparation.total == 0 {
+            return Ok(plan);
+        }
+        match descriptors.preview_write_count(&self.token, bytes, preparation.total) {
+            Ok(write) => {
+                plan.elements = write.bytes_written() as u64 / size;
+                plan.errno = write.terminal_error();
+                plan.write = Some(write);
+            }
+            Err(errno) => plan.errno = Some(errno),
+        }
+        Ok(plan)
+    }
+    pub fn commit_write(&mut self, descriptors: &mut Descriptors, plan: WritePlan) -> Result<()> {
+        self.live()?;
+        if !Rc::ptr_eq(&self.owner, &plan.owner) || self.revision != plan.revision {
+            return Err(Error::Unsupported("Foreign or stale FILE write plan"));
+        }
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(Error::Unsupported("FILE revision exhausted"))?;
+        if let Some(write) = plan.write {
+            descriptors.commit_write(write).map_err(Error::Errno)?;
+        }
+        self.revision = revision;
+        self.error |= plan.errno.is_some();
+        self.orientation |= plan.preparation.orient;
+        if plan.preparation.clear_eof {
+            self.eof = false;
+        }
+        self.direction = plan.preparation.direction;
+        Ok(())
+    }
     /// Snapshot only. Caller guards output bytes and FILE metadata before commit.
     pub fn read_plan(&self, descriptors: &Descriptors, size: u64, count: u64) -> Result<ReadPlan> {
         self.live()?;
@@ -66,6 +146,7 @@ impl Stream {
             eof: self.eof,
             error: self.error,
             orientation: self.orientation,
+            direction: self.direction,
             revision: self.revision,
             owner: self.owner.clone(),
         };
@@ -81,6 +162,12 @@ impl Stream {
         if self.eof {
             return Ok(plan);
         }
+        if !self.mode.read {
+            plan.error = true;
+            plan.errno = Some(9);
+            return Ok(plan);
+        }
+        plan.direction = Direction::Read;
         let read = match descriptors.preview_read(&self.token, total) {
             Ok(read) => read,
             Err(errno) => {
@@ -111,6 +198,7 @@ impl Stream {
         self.eof = plan.eof;
         self.error = plan.error;
         self.orientation = plan.orientation;
+        self.direction = plan.direction;
         Ok(())
     }
     pub fn seek(&mut self, descriptors: &mut Descriptors, offset: i64, whence: i32) -> Result<()> {
@@ -174,10 +262,25 @@ impl Stream {
             .ok_or(Error::Unsupported("FILE address overflow"))?;
         let mut bytes = [0; 312];
         bytes[..8].copy_from_slice(&buffer.to_le_bytes());
-        bytes[16..18].copy_from_slice(
-            &(6u16 | if self.eof { 0x20 } else { 0 } | if self.error { 0x40 } else { 0 })
-                .to_le_bytes(),
-        );
+        let access = match self.direction {
+            Direction::Neither => 0,
+            Direction::Read => 4,
+            Direction::Write => 8,
+        };
+        let flags = 2u16
+            | access
+            | if self.mode.read && self.mode.write {
+                16
+            } else {
+                0
+            }
+            | if self.eof { 0x20 } else { 0 }
+            | if self.error { 0x40 } else { 0 };
+        bytes[16..18].copy_from_slice(&flags.to_le_bytes());
+        // __S2OAP: descriptor writes already enforce append atomically.
+        if self.mode.append {
+            bytes[304..308].copy_from_slice(&1i32.to_le_bytes());
+        }
         bytes[18..20].copy_from_slice(&(self.token.descriptor() as i16).to_le_bytes());
         bytes[24..32].copy_from_slice(&buffer.to_le_bytes());
         bytes[32..36].copy_from_slice(&1i32.to_le_bytes());
@@ -185,16 +288,6 @@ impl Stream {
             bytes[172..176].copy_from_slice(&(-1i32).to_le_bytes());
         }
         Ok(bytes)
-    }
-}
-pub fn readonly_mode(mode: &[u8]) -> Result<()> {
-    match mode {
-        b"r" | b"rb" => Ok(()),
-        b"" => Err(Error::Errno(22)),
-        _ if !matches!(mode[0], b'r' | b'w' | b'a') => Err(Error::Errno(22)),
-        _ => Err(Error::Unsupported(
-            "FILE mode requires unsupported access policy",
-        )),
     }
 }
 #[cfg(test)]
@@ -269,6 +362,76 @@ mod tests {
         s.close(&mut d).unwrap();
         assert!(s.read_plan(&d, 1, 1).is_err());
     }
+    #[test]
+    fn update_directions_shared_contents_and_readonly_write_order() {
+        let mut files = Files::default();
+        files.register_writable(b"/save", b"abc".to_vec()).unwrap();
+        let mut d = Descriptors::default();
+        let options = OpenOptions {
+            read: true,
+            write: true,
+            ..OpenOptions::read_only()
+        };
+        let token = d
+            .open_file_options(&mut files, b"/save", options)
+            .unwrap()
+            .unwrap();
+        let mut stream = Stream::with_mode(token, Mode::parse(b"r+").unwrap()).unwrap();
+        let plan = stream.read_plan(&d, 1, 4).unwrap();
+        stream.commit_read(&mut d, &plan).unwrap();
+        assert!(stream.eof().unwrap());
+        let plan = stream.write_plan(&d, 1, 2, b"de").unwrap();
+        assert_eq!(plan.elements, 2);
+        stream.commit_write(&mut d, plan).unwrap();
+        assert!(!stream.eof().unwrap());
+        assert_eq!(stream.metadata(BASE).unwrap()[16], 2 | 8 | 16);
+        stream.seek(&mut d, 0, 0).unwrap();
+        let plan = stream.read_plan(&d, 1, 5).unwrap();
+        assert_eq!(plan.bytes(), b"abcde");
+        stream.commit_read(&mut d, &plan).unwrap();
+        assert_eq!(stream.metadata(BASE).unwrap()[16], 2 | 4 | 16);
+        let (mut d, mut ro) = setup();
+        let plan = ro.write_plan(&d, 2, u64::MAX, &[]).unwrap();
+        assert_eq!(plan.errno, Some(22));
+        ro.commit_write(&mut d, plan).unwrap();
+        assert!(!ro.orientation);
+        let plan = ro.write_plan(&d, 1, 1, &[]).unwrap();
+        assert_eq!(plan.errno, Some(9));
+        ro.commit_write(&mut d, plan).unwrap();
+        assert!(ro.orientation);
+        assert_eq!(ro.tell(&d), Ok(0));
+    }
+    #[test]
+    fn partial_final_element_sets_error_and_rejects_stale_write() {
+        let mut files = Files::default();
+        files.register_writable(b"/save", Vec::new()).unwrap();
+        let mut d = Descriptors::default();
+        let token = d
+            .open_file_options(
+                &mut files,
+                b"/save",
+                OpenOptions {
+                    write: true,
+                    ..OpenOptions::read_only()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let mut stream = Stream::with_mode(token, Mode::parse(b"r+").unwrap()).unwrap();
+        stream.seek(&mut d, 64 * 1024 * 1024 - 3, 0).unwrap();
+        let plan = stream.write_plan(&d, 2, 3, b"abc").unwrap();
+        assert_eq!(plan.elements, 1);
+        assert_eq!(plan.errno, Some(28));
+        stream.commit_write(&mut d, plan).unwrap();
+        assert!(stream.error().unwrap());
+        stream.seek(&mut d, -3, 2).unwrap();
+        let read = stream.read_plan(&d, 1, 3).unwrap();
+        assert_eq!(read.bytes(), b"abc");
+        let plan = stream.write_plan(&d, 1, 1, b"z").unwrap();
+        d.seek_file(&stream.token, 0, 0).unwrap();
+        assert!(stream.commit_write(&mut d, plan).is_err());
+        assert_eq!(stream.tell(&d), Ok(0));
+    }
 }
 
 pub const BASE: u64 = 0x7ffd_0000_0000;
@@ -279,6 +442,7 @@ pub const ARENA_SIZE: usize = SLOT_SIZE * SLOTS;
 pub enum Operation {
     Open,
     Read,
+    Write,
     Seek,
     Tell,
     Close,
@@ -315,6 +479,34 @@ fn diagnostic(error: Error) -> String {
     format!("Unsupported FILE operation: {error:?}")
 }
 impl Store {
+    pub fn flush(
+        &self,
+        _descriptors: &Descriptors,
+        memory: &crate::guest_memory::Memory<'_>,
+        address: u64,
+    ) -> crate::Result<()> {
+        for (index, stream) in self.streams.iter().enumerate() {
+            let identity = BASE + (index * SLOT_SIZE) as u64;
+            if stream.closed || (address != 0 && address != identity) {
+                continue;
+            }
+            if memory.read(identity, SLOT_SIZE)? != stream.metadata(identity).map_err(diagnostic)? {
+                return Err("Unsupported or modified FILE metadata".into());
+            }
+            // Every accepted byte was already written. No callback or host
+            // flush is substituted for the owned unbuffered invariant.
+            // FreeBSD __sflush invokes no descriptor operation when _p==_base,
+            // including if an external raw close retired the descriptor.
+            if address != 0 {
+                return Ok(());
+            }
+        }
+        if address == 0 {
+            Ok(())
+        } else {
+            Err("Unknown FILE identity".into())
+        }
+    }
     pub fn call(
         &mut self,
         kernel: &mut crate::kernel::Kernel,
@@ -343,12 +535,13 @@ impl Store {
             Ok(result)
         };
         if matches!(operation, Operation::Open) {
-            let mode = text(memory, args[1], 32)?;
-            match readonly_mode(&mode) {
-                Ok(()) => {}
-                Err(Error::Errno(e)) => return fail(memory, e, 0),
-                Err(e) => return Err(diagnostic(e)),
-            }
+            let mode = match Mode::parse(&text(memory, args[1], 32)?) {
+                Ok(mode) => mode,
+                Err(crate::stdio_write::ModeError::Invalid) => return fail(memory, 22, 0),
+                Err(crate::stdio_write::ModeError::VerifyUnsupported) => {
+                    return Err("Verified-execution FILE mode unsupported".into())
+                }
+            };
             let path = text(memory, args[0], 1024)?;
             let slot = self
                 .streams
@@ -364,11 +557,30 @@ impl Store {
             if memory.read(address, SLOT_SIZE)?.iter().any(|b| *b != 0) {
                 return Err("Unused FILE slot was modified".into());
             }
-            let token = match kernel.descriptors.open_file(&kernel.files, &path) {
-                Ok(token) => token,
-                Err(e) => return fail(memory, e, 0),
+            let options = OpenOptions {
+                read: mode.read,
+                write: mode.write,
+                create: mode.create,
+                truncate: mode.truncate,
+                append: mode.append,
+                exclusive: mode.exclusive,
+                cloexec: mode.cloexec,
             };
-            let stream = match Stream::new(token.clone()) {
+            let token =
+                match kernel
+                    .descriptors
+                    .open_file_options(&mut kernel.files, &path, options)?
+                {
+                    Ok(token) => token,
+                    Err(e) => return fail(memory, e, 0),
+                };
+            if mode.append {
+                kernel
+                    .descriptors
+                    .seek_file(&token, 0, 2)
+                    .map_err(|e| format!("New append FILE seek failed: {e}"))?;
+            }
+            let stream = match Stream::with_mode(token.clone(), mode) {
                 Ok(stream) => stream,
                 Err(error) => {
                     kernel.descriptors.close_file(&token);
@@ -384,7 +596,7 @@ impl Store {
             }
             return Ok(address);
         }
-        let address = if matches!(operation, Operation::Read) {
+        let address = if matches!(operation, Operation::Read | Operation::Write) {
             args[3]
         } else {
             args[0]
@@ -403,6 +615,40 @@ impl Store {
         }
         let mut update = false;
         let result = match operation {
+            Operation::Write => {
+                let preparation = stream
+                    .write_preparation(args[1], args[2])
+                    .map_err(diagnostic)?;
+                let bytes = if preparation.total == 0 {
+                    Vec::new()
+                } else {
+                    match kernel
+                        .descriptors
+                        .write_capacity(&stream.token, preparation.total)
+                    {
+                        Ok(length) if length != 0 => memory.read(args[0], length)?.to_vec(),
+                        _ => Vec::new(),
+                    }
+                };
+                let plan = stream
+                    .write_plan(&kernel.descriptors, args[1], args[2], &bytes)
+                    .map_err(diagnostic)?;
+                guard(memory, address, SLOT_SIZE)?;
+                memory.validate_write(address, SLOT_SIZE)?;
+                if plan.errno.is_some() {
+                    errno_guard(memory)?;
+                }
+                let result = plan.elements;
+                let errno = plan.errno;
+                stream
+                    .commit_write(&mut kernel.descriptors, plan)
+                    .map_err(diagnostic)?;
+                if let Some(errno) = errno {
+                    memory.store(errno_address, errno as u64, 4)?;
+                }
+                update = true;
+                result
+            }
             Operation::Read => {
                 let plan = stream
                     .read_plan(&kernel.descriptors, args[1], args[2])

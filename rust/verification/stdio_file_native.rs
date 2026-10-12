@@ -3,7 +3,7 @@ use native_ps5::{
     guest_memory::DataRegion,
     kernel::Kernel,
     loader::Image,
-    module_executor::{Execution, NativeExecutor, Service, memory_fixture},
+    module_executor::{memory_fixture, Execution, NativeExecutor, Service},
     stdio_file::Operation,
 };
 use std::{collections::BTreeSet, path::Path};
@@ -63,6 +63,12 @@ pub fn verify(file: &[u8], archive: &Path, directory: &Path) -> Result<(), Strin
         .unwrap()
         .files
         .register(b"/app0/data", b"abcde".to_vec())?;
+    n.kernel
+        .as_mut()
+        .unwrap()
+        .files
+        .register_writable(b"/app0/save", b"old".to_vec())?;
+    n.stdio.configure_capture(128)?;
     let mut real = Image::load(file, BIAS, 64 * 1024 * 1024)?;
     let mut adapter = Image::load(&fixture, 0x100000, 65536)?;
     for (index, (op, got)) in [
@@ -75,6 +81,7 @@ pub fn verify(file: &[u8], archive: &Path, directory: &Path) -> Result<(), Strin
         (Operation::Eof, None),
         (Operation::Error, Some(0x26f970)),
         (Operation::Clearerr, None),
+        (Operation::Write, Some(0x26f978)),
     ]
     .into_iter()
     .enumerate()
@@ -92,11 +99,20 @@ pub fn verify(file: &[u8], archive: &Path, directory: &Path) -> Result<(), Strin
             s.bytes[at..at + 8].copy_from_slice(&target.to_le_bytes());
         }
     }
+    n.register_service(0x7900a0, Service::Fflush)?;
+    let threaded_got = BIAS + 0x26f930;
+    let segment = real
+        .segments
+        .iter_mut()
+        .find(|s| threaded_got >= s.address && threaded_got + 8 <= s.address + s.bytes.len() as u64)
+        .ok_or("Missing __isthreaded GOT")?;
+    let offset = (threaded_got - segment.address) as usize;
+    segment.bytes[offset..offset + 8].copy_from_slice(&(DATA + 240).to_le_bytes());
     unsafe {
         n.compile_image(
             file,
             BIAS,
-            BTreeSet::from([0x118470, 0x1184d0, 0x318f0, 0x31950]),
+            BTreeSet::from([0x118470, 0x1184d0, 0x318f0, 0x31950, 0x319c0]),
             20000,
             archive,
             &directory.join("real"),
@@ -165,18 +181,16 @@ pub fn verify(file: &[u8], archive: &Path, directory: &Path) -> Result<(), Strin
     );
     // Bad destination cannot consume bytes or modify FILE metadata.
     let before = data;
-    assert!(
-        invoke(
-            &mut n,
-            &mut adapter,
-            &mut real,
-            [DATA + 254, 1, 5, stream, 0x790010],
-            &mut data,
-            true,
-            &mut errno
-        )
-        .is_err()
-    );
+    assert!(invoke(
+        &mut n,
+        &mut adapter,
+        &mut real,
+        [DATA + 254, 1, 5, stream, 0x790010],
+        &mut data,
+        true,
+        &mut errno
+    )
+    .is_err());
     assert_eq!(data, before);
     assert_eq!(
         invoke(
@@ -190,18 +204,16 @@ pub fn verify(file: &[u8], archive: &Path, directory: &Path) -> Result<(), Strin
         )?,
         0
     );
-    assert!(
-        invoke(
-            &mut n,
-            &mut adapter,
-            &mut real,
-            [DATA + 32, 1, 2, stream, 0x790010],
-            &mut data,
-            false,
-            &mut errno
-        )
-        .is_err()
-    );
+    assert!(invoke(
+        &mut n,
+        &mut adapter,
+        &mut real,
+        [DATA + 32, 1, 2, stream, 0x790010],
+        &mut data,
+        false,
+        &mut errno
+    )
+    .is_err());
     assert_eq!(
         invoke(
             &mut n,
@@ -308,18 +320,16 @@ pub fn verify(file: &[u8], archive: &Path, directory: &Path) -> Result<(), Strin
         )?,
         0
     );
-    assert!(
-        invoke(
-            &mut n,
-            &mut adapter,
-            &mut real,
-            [stream, 0, 0, 0, 0x790030],
-            &mut data,
-            true,
-            &mut errno
-        )
-        .is_err()
-    );
+    assert!(invoke(
+        &mut n,
+        &mut adapter,
+        &mut real,
+        [stream, 0, 0, 0, 0x790030],
+        &mut data,
+        true,
+        &mut errno
+    )
+    .is_err());
     assert_eq!(
         invoke(
             &mut n,
@@ -347,7 +357,7 @@ pub fn verify(file: &[u8], archive: &Path, directory: &Path) -> Result<(), Strin
     );
     assert_eq!(errno, 2u32.to_le_bytes());
     data[16] = b'w';
-    assert!(
+    assert_eq!(
         invoke(
             &mut n,
             &mut adapter,
@@ -356,11 +366,109 @@ pub fn verify(file: &[u8], archive: &Path, directory: &Path) -> Result<(), Strin
             &mut data,
             true,
             &mut errno
-        )
-        .is_err()
+        )?,
+        0
     );
+    // /app0 is not a registered creation directory in this fixture.
+    assert_eq!(errno, 2u32.to_le_bytes());
+    macro_rules! call {
+        ($args:expr) => {
+            invoke(
+                &mut n,
+                &mut adapter,
+                &mut real,
+                $args,
+                &mut data,
+                true,
+                &mut errno,
+            )?
+        };
+    }
+    data[..11].copy_from_slice(b"/app0/save\0");
+    data[16..20].copy_from_slice(b"w+b\0");
+    let writable = call!([DATA, DATA + 16, 0, 0, BIAS + 0x118470]);
+    assert!(writable > u32::MAX as u64);
+    assert_eq!(call!([writable, 0, 0, 0, 0x790030]), 0);
+    data[80..86].copy_from_slice(b"abcdef");
+    data[128 + 56..128 + 64].copy_from_slice(&writable.to_le_bytes());
+    assert_eq!(call!([DATA + 128, DATA + 80, 2, 3, BIAS + 0x319c0]), 3);
+    assert_eq!(
+        call!([DATA + 128, u64::MAX, 0, u64::MAX, BIAS + 0x319c0]),
+        0
+    );
+    assert_eq!(call!([writable, 0, 0, 0, 0x7900a0]), 0);
+    assert_eq!(call!([writable, 0, 0, 0, 0x790020]), 0);
+    assert_eq!(call!([DATA + 96, 1, 6, writable, 0x790010]), 6);
+    assert_eq!(&data[96..102], b"abcdef");
+    // Invalid source cannot advance the shared descriptor or modify file bytes.
+    assert!(invoke(
+        &mut n,
+        &mut adapter,
+        &mut real,
+        [DATA + 255, 1, 2, writable, 0x790090],
+        &mut data,
+        true,
+        &mut errno
+    )
+    .is_err());
+    assert_eq!(call!([writable, 0, 0, 0, 0x790030]), 6);
+    assert_eq!(call!([writable, 0, 0, 0, 0x790040]), 0);
+    data[16..20].copy_from_slice(b"a+b\0");
+    let append = call!([DATA, DATA + 16, 0, 0, BIAS + 0x118470]);
+    assert_eq!(call!([append, 0, 0, 0, 0x790030]), 6);
+    assert_eq!(call!([append, 0, 0, 0, 0x790020]), 0);
+    assert_eq!(call!([DATA + 80, 1, 2, append, 0x790090]), 2);
+    assert_eq!(call!([append, 0, 0, 0, 0x790030]), 8);
+    assert_eq!(call!([append, 0, 0, 0, 0x790020]), 0);
+    assert_eq!(call!([DATA + 96, 1, 8, append, 0x790010]), 8);
+    assert_eq!(&data[96..104], b"abcdefab");
+    assert_eq!(call!([append, 0, 0, 0, 0x790040]), 0);
+    data[16..19].copy_from_slice(b"rb\0");
+    let readonly = call!([DATA, DATA + 16, 0, 0, BIAS + 0x118470]);
+    assert_eq!(call!([u64::MAX, 0, u64::MAX, readonly, 0x790090]), 0);
+    // Overflow needs errno; truncated errno must stop before FILE error/orient
+    // changes, independently of the deliberately inaccessible source pointer.
+    assert!(invoke(
+        &mut n,
+        &mut adapter,
+        &mut real,
+        [u64::MAX, 2, u64::MAX, readonly, 0x790090],
+        &mut data,
+        true,
+        &mut errno[..3]
+    )
+    .is_err());
+    assert_eq!(call!([readonly, 0, 0, 0, 0x790070]), 0);
+    assert_eq!(call!([readonly, 0, 0, 0, 0x790030]), 0);
+    assert_eq!(call!([u64::MAX, 1, 1, readonly, 0x790090]), 0);
+    assert_eq!(errno, 9u32.to_le_bytes());
+    assert_eq!(call!([readonly, 0, 0, 0, 0x790070]), 1);
+    let fd = call!([readonly, 0, 0, 0, 0x790050]);
+    let token = n
+        .kernel
+        .as_ref()
+        .unwrap()
+        .descriptors
+        .file_token(fd)
+        .map_err(|e| e.to_string())?;
+    assert_eq!(n.kernel.as_mut().unwrap().descriptors.close_file(&token), 0);
+    assert_eq!(call!([readonly, 0, 0, 0, 0x7900a0]), 0);
+    assert_eq!(call!([0, 0, 0, 0, 0x7900a0]), 0);
+    assert_eq!(call!([readonly, 0, 0, 0, 0x790040]), u32::MAX as u64);
+    assert_eq!(
+        call!([
+            DATA + 80,
+            2,
+            3,
+            native_ps5::guest_stdio::FILE_ADDR,
+            0x790090
+        ]),
+        3
+    );
+    assert_eq!(n.stdio.bytes(), b"abcdef");
+    assert_eq!(call!([0, 0, 0, 0, 0x7900a0]), 0);
     println!(
-        "PASS: actual M_fopen/M_FileExists and SDL stdio read/seek consume registered bytes, partial elements/EOF, shared descriptor cursor, errno/error/clearerr/close and atomic memory guards; writable modes unsupported."
+        "PASS: actual M_fopen/M_FileExists and SDL stdio read/seek, registered bytes, writable update/append/truncate/readback, stderr capture/flush, partial elements/EOF, shared cursor, errno/error/clearerr/close and atomic memory guards."
     );
     Ok(())
 }

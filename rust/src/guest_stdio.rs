@@ -4,7 +4,7 @@
 //! LP64 __sFILE is 312 bytes; __mbstate_t is 128 bytes aligned to eight.
 //! FreeBSD releng/11.4 libc/stdio/fflush.c establishes zero on completed flush.
 //! Unsupported state/resource errors are diagnostics, not invented errno/EOF.
-use crate::{Result, format, guest_memory::Memory, strings::Fault};
+use crate::{format, guest_memory::Memory, strings::Fault, Result};
 pub const FILE_ADDR: u64 = 0x7fff_0000_1000;
 pub const STDERR_PTR_ADDR: u64 = 0x7fff_0000_1200;
 pub const FILE_SIZE: usize = 312;
@@ -40,6 +40,9 @@ impl GuestStdio {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+    pub fn configured(&self) -> bool {
+        self.capacity.is_some()
+    }
     pub fn take_bytes(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.bytes)
     }
@@ -56,6 +59,8 @@ impl GuestStdio {
             return Err("Unsupported wide-oriented stderr FILE".into());
         }
         actual[172..176].fill(0);
+        // Sticky error is maintained by fwrite's size-overflow path.
+        actual[16] &= !0x40;
         // Buffer content may change without changing the unbuffered invariant.
         actual[119] = 0;
         if actual != expected {
@@ -99,6 +104,48 @@ impl GuestStdio {
     pub fn fflush(&self, memory: &Memory<'_>, stream: u64) -> Result<i32> {
         self.validate(memory, if stream == 0 { FILE_ADDR } else { stream })?;
         Ok(0)
+    }
+    pub fn fwrite(
+        &mut self,
+        memory: &mut Memory<'_>,
+        source: u64,
+        size: u64,
+        count: u64,
+        errno: u64,
+        guard: impl Fn(&Memory<'_>, u64, usize) -> Result<()>,
+    ) -> Result<u64> {
+        let capacity = self.validate(memory, FILE_ADDR)?;
+        if size == 0 || count == 0 {
+            return Ok(0);
+        }
+        let Some(total) = size.checked_mul(count) else {
+            guard(memory, FILE_ADDR + 16, 2)?;
+            guard(memory, errno, 4)?;
+            memory.validate_write(FILE_ADDR + 16, 2)?;
+            memory.validate_write(errno, 4)?;
+            if errno < FILE_ADDR + FILE_SIZE as u64
+                && FILE_ADDR < errno.checked_add(4).ok_or("Stderr errno overflow")?
+            {
+                return Err("Stderr errno aliases FILE metadata".into());
+            }
+            let flags = memory.load(FILE_ADDR + 16, 2)? | 0x40;
+            memory.store(errno, 22, 4)?;
+            memory.store(FILE_ADDR + 16, flags, 2)?;
+            return Ok(0);
+        };
+        let available = capacity - self.bytes.len();
+        if total > available as u64 {
+            return Err("Stderr capture capacity exhausted; no output committed".into());
+        }
+        let bytes = memory.read(source, total as usize)?.to_vec();
+        guard(memory, FILE_ADDR + 172, 4)?;
+        memory.validate_write(FILE_ADDR + 172, 4)?;
+        self.bytes
+            .try_reserve(bytes.len())
+            .map_err(|_| "Cannot allocate stderr capture")?;
+        memory.store(FILE_ADDR + 172, (-1i32) as u32 as u64, 4)?;
+        self.bytes.extend_from_slice(&bytes);
+        Ok(count)
     }
 }
 #[cfg(test)]
@@ -144,33 +191,23 @@ mod tests {
         memory.add(0x1000, &mut text, false, false).unwrap();
         let mut stdio = GuestStdio::default();
         stdio.configure_capture(2).unwrap();
-        assert!(
-            stdio
-                .fprintf(&mut memory, FILE_ADDR, 0x1003, &mut |_| Ok(u64::MAX))
-                .is_err()
-        );
-        assert!(
-            stdio
-                .fprintf(&mut memory, FILE_ADDR, 0x1006, &mut |_| Ok(0))
-                .is_err()
-        );
-        assert!(
-            stdio
-                .fprintf(&mut memory, FILE_ADDR, 0x1009, &mut |_| Ok(0))
-                .is_err()
-        );
-        assert!(
-            stdio
-                .fprintf(&mut memory, FILE_ADDR, 0, &mut |_| Ok(0))
-                .is_err()
-        );
+        assert!(stdio
+            .fprintf(&mut memory, FILE_ADDR, 0x1003, &mut |_| Ok(u64::MAX))
+            .is_err());
+        assert!(stdio
+            .fprintf(&mut memory, FILE_ADDR, 0x1006, &mut |_| Ok(0))
+            .is_err());
+        assert!(stdio
+            .fprintf(&mut memory, FILE_ADDR, 0x1009, &mut |_| Ok(0))
+            .is_err());
+        assert!(stdio
+            .fprintf(&mut memory, FILE_ADDR, 0, &mut |_| Ok(0))
+            .is_err());
         assert!(stdio.fflush(&memory, FILE_ADDR + 8).is_err());
         memory.write(FILE_ADDR + 12, &1i32.to_le_bytes()).unwrap();
-        assert!(
-            stdio
-                .fprintf(&mut memory, FILE_ADDR, 0x1000, &mut |_| Ok(0))
-                .is_err()
-        );
+        assert!(stdio
+            .fprintf(&mut memory, FILE_ADDR, 0x1000, &mut |_| Ok(0))
+            .is_err());
         assert!(stdio.fflush(&memory, 0).is_err());
         memory.write(FILE_ADDR + 12, &0i32.to_le_bytes()).unwrap();
         assert!(stdio.bytes().is_empty());
@@ -180,11 +217,9 @@ mod tests {
                 .unwrap(),
             2
         );
-        assert!(
-            stdio
-                .fprintf(&mut memory, FILE_ADDR, 0x1000, &mut |_| Ok(0))
-                .is_err()
-        );
+        assert!(stdio
+            .fprintf(&mut memory, FILE_ADDR, 0x1000, &mut |_| Ok(0))
+            .is_err());
         assert_eq!(stdio.bytes(), b"ok");
     }
 }
@@ -200,28 +235,22 @@ mod guarded_tests {
         memory.add(0x1000, &mut text, false, false).unwrap();
         let mut stdio = GuestStdio::default();
         stdio.configure_capture(128).unwrap();
-        assert!(
-            stdio
-                .fprintf(&mut memory, FILE_ADDR, 0x1003, &mut |_| Ok(0))
-                .is_err()
-        );
+        assert!(stdio
+            .fprintf(&mut memory, FILE_ADDR, 0x1003, &mut |_| Ok(0))
+            .is_err());
         assert!(stdio.bytes().is_empty());
         drop(memory);
         let mut memory = Memory::default();
         memory.add(FILE_ADDR, &mut file, true, false).unwrap();
         memory.add(0x1000, &mut text, false, false).unwrap();
-        assert!(
-            stdio
-                .fprintf(&mut memory, FILE_ADDR, 0x1000, &mut |_| Err(Fault::Read))
-                .is_err()
-        );
+        assert!(stdio
+            .fprintf(&mut memory, FILE_ADDR, 0x1000, &mut |_| Err(Fault::Read))
+            .is_err());
         assert_eq!(memory.load(FILE_ADDR + 172, 4).unwrap(), 0);
         memory.write(FILE_ADDR + 172, &1i32.to_le_bytes()).unwrap();
-        assert!(
-            stdio
-                .fprintf(&mut memory, FILE_ADDR, 0x1003, &mut |_| Ok(0))
-                .is_err()
-        );
+        assert!(stdio
+            .fprintf(&mut memory, FILE_ADDR, 0x1003, &mut |_| Ok(0))
+            .is_err());
         assert!(stdio.bytes().is_empty());
         memory.write(FILE_ADDR + 172, &0i32.to_le_bytes()).unwrap();
         assert_eq!(

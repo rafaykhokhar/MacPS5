@@ -418,6 +418,7 @@ fn main() -> Result<(), String> {
         ("fseeko", Service::File(FileOperation::Seek)),
         ("ftello", Service::File(FileOperation::Tell)),
         ("fstat", Service::Fstat),
+        ("fwrite", Service::File(FileOperation::Write)),
     ]
     .into_iter()
     .enumerate()
@@ -1310,6 +1311,7 @@ fn main() -> Result<(), String> {
                 (704, 0x730610),
                 (712, 0x730580),
                 (720, 0x7305e0),
+                (728, 0x730630),
             ] {
                 if locale_segment.bytes[locale_offset + delta..locale_offset + delta + 8]
                     != expected.to_le_bytes()
@@ -1336,13 +1338,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 104 libc exports: (104+1)*24=2520 symbol bytes (rounded2528)
-                // and 1+104*12=1249 NID bytes (rounded1264). File services
-                // add288+144bytes to17696; retain the exact32KiB cap.
-                || native.bytes_allocated() != 18128
+                // 105 libc exports: (105+1)*24=2544 aligned symbol bytes
+                // and 1+105*12=1261 NID bytes (rounded1264). fwrite adds
+                // 16 symbol bytes to18128; retain the exact32KiB cap.
+                || native.bytes_allocated() != 18144
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'fwrite'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'sem_init'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1352,7 +1354,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; read-only file imports bound; unresolved fwrite causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; file imports including fwrite bound; unresolved sem_init causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1414,7 +1416,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved fwrite triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved sem_init triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     Ok(())

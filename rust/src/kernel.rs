@@ -3,6 +3,7 @@
 use crate::{Result, descriptors::Descriptors, guest_memory::Memory};
 #[path = "guest_files.rs"]
 mod guest_files;
+pub(crate) use guest_files::{FileBacking, Quota};
 pub use guest_files::{Files, STAT_SIZE, StatRequest, StatTrace};
 
 struct Region {
@@ -205,14 +206,41 @@ impl Kernel {
     ) -> Result<(u64, bool)> {
         if !matches!(
             number,
-            3 | 4 | 5 | 6 | 73 | 105 | 188 | 189 | 326 | 477 | 478 | 601 | 602 | 616 | 649
+            3 | 4 | 5 | 6 | 73 | 105 | 188 | 189 | 326 | 477 | 478 | 480 | 601 | 602 | 616 | 649
         ) {
             return Err(format!("Unsupported Rust kernel syscall {number}"));
         }
-        // This backend accepts only the audited O_RDONLY subset; other flags
-        // remain unsupported instead of silently losing create/write semantics.
-        if number == 5 && args[1] as u32 != 0 {
-            return Err("Registered file open flags outside O_RDONLY are unsupported".into());
+        let open_options = if number == 5 {
+            let flags = args[1] as u32;
+            if flags & !(3 | 8 | 0x200 | 0x400 | 0x800 | 0x100000) != 0 {
+                return Err("Unsupported registered-file open flags".into());
+            }
+            if flags & 3 == 0 && flags & 0x400 != 0 {
+                return Err("Read-only O_TRUNC remains unsupported".into());
+            }
+            Some(crate::descriptors::OpenOptions {
+                read: flags & 3 != 1,
+                write: flags & 3 == 1 || flags & 3 == 2,
+                create: flags & 0x200 != 0,
+                truncate: flags & 0x400 != 0,
+                append: flags & 8 != 0,
+                exclusive: flags & 0x800 != 0,
+                cloexec: flags & 0x100000 != 0,
+            })
+        } else {
+            None
+        };
+        if number == 480
+            && (args[1] as i64) >= 0
+            && matches!(
+                self.descriptors.kind(args[0] as u32 as u64),
+                Some(
+                    crate::descriptors::DescriptorKind::Pipe
+                        | crate::descriptors::DescriptorKind::Control
+                )
+            )
+        {
+            return Err("ftruncate for non-file endpoints is unsupported".into());
         }
         if number == 478 && matches!(args[2] as u32, 3 | 4) {
             return Err("Registered file SEEK_DATA/SEEK_HOLE are unsupported".into());
@@ -236,11 +264,43 @@ impl Kernel {
         let result = match number {
             // Pinned SDK SYS_open=5, SYS_lseek=478; fd/flags/whence are int,
             // off_t is signed64. No host syscall or implicit cwd resolution.
-            5 => guest_files::read_path(user, args[0]).and_then(|path| {
-                self.descriptors
-                    .open_file(&self.files, &path)
-                    .map(|token| u64::from(token.descriptor()))
-            }),
+            5 => {
+                if args[1] as u32 & 3 == 3 {
+                    Err(22)
+                } else {
+                    match guest_files::read_path(user, args[0]) {
+                        Err(error) => Err(error),
+                        Ok(path) => {
+                            let options = open_options.expect("Open options decoded");
+                            // Explicit virtual writable directories currently use
+                            // mode0666 with no umask; other creation modes are not
+                            // silently rewritten. Existing file mode is untouched.
+                            if options.create
+                                && self.files.backing(&path).is_err()
+                                && args[2] as u32 != 0o666
+                            {
+                                return Err(
+                                    "Registered-file creation mode outside0666 is unsupported"
+                                        .into(),
+                                );
+                            }
+                            self.descriptors
+                                .open_file_options(&mut self.files, &path, options)?
+                                .map(|token| u64::from(token.descriptor()))
+                        }
+                    }
+                }
+            }
+            480 => {
+                if (args[1] as i64) < 0 {
+                    Err(22)
+                } else {
+                    self.descriptors
+                        .file_token(args[0] as u32 as u64)
+                        .and_then(|token| self.descriptors.truncate_file(&token, args[1]))
+                        .map(|()| 0)
+                }
+            }
             478 => {
                 self.descriptors
                     .seek(args[0] as u32 as u64, args[1] as i64, args[2] as u32 as i32)
@@ -548,12 +608,13 @@ mod tests {
         );
         assert_eq!(user.load(0x1000, 4).unwrap(), 84);
         assert_eq!(kernel.descriptors.file_position(&token), Ok(6));
-        assert!(
+        assert_eq!(
             kernel
                 .syscall(&mut user, 5, [0x1010, 1, 0, 0, 0, 0])
-                .unwrap_err()
-                .contains("unsupported")
+                .unwrap(),
+            (u64::MAX, true)
         );
+        assert_eq!(user.load(0x1000, 4).unwrap(), 13);
         assert_eq!(
             kernel.syscall(&mut user, 6, [3, 0, 0, 0, 0, 0]).unwrap(),
             (0, false)

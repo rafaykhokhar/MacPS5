@@ -1,4 +1,5 @@
-//! Bounded process-local descriptors for registered read-only files and control pairs.
+//! Bounded process-local descriptors for registered files and control pairs.
+//! Writable files share memory-backed contents, cursor ownership and quota accounting.
 //! No host filesystem, sockets, or network access.
 //! File ABI sources: pinned SDK sys/syscall.h, sys/sysproto.h, sys/errno.h at
 //! 10b539de8f2b6773a9a78caa7576a97dbd99b29a; FreeBSD releng/11.4
@@ -27,10 +28,53 @@ pub struct FileReadPlan {
     token: FileToken,
     position: u64,
     revision: u64,
+    file_revision: u64,
 }
 impl FileReadPlan {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenOptions {
+    pub read: bool,
+    pub write: bool,
+    pub create: bool,
+    pub truncate: bool,
+    pub append: bool,
+    pub exclusive: bool,
+    pub cloexec: bool,
+}
+impl OpenOptions {
+    pub fn read_only() -> Self {
+        Self {
+            read: true,
+            write: false,
+            create: false,
+            truncate: false,
+            append: false,
+            exclusive: false,
+            cloexec: false,
+        }
+    }
+}
+pub struct FileWritePlan {
+    token: FileToken,
+    cursor: u64,
+    position: u64,
+    revision: u64,
+    file_revision: u64,
+    quota_revision: u64,
+    replacement: Box<[u8]>,
+    amount: usize,
+    terminal_error: Option<u32>,
+}
+impl FileWritePlan {
+    pub fn bytes_written(&self) -> usize {
+        self.amount
+    }
+    pub fn terminal_error(&self) -> Option<u32> {
+        self.terminal_error
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,8 +84,8 @@ pub enum DescriptorKind {
     Control,
 }
 struct OpenFile {
-    stat: [u8; crate::kernel::STAT_SIZE],
-    bytes: Rc<[u8]>,
+    backing: Rc<crate::kernel::FileBacking>,
+    options: OpenOptions,
     identity: u64,
     position: Cell<u64>,
     revision: Cell<u64>,
@@ -67,6 +111,7 @@ pub struct Descriptors {
     endpoints: [Option<Endpoint>; LIMIT],
     owner: Rc<()>,
     next_file: u64,
+    file_quota: Option<Rc<crate::kernel::Quota>>,
 }
 impl Default for Descriptors {
     fn default() -> Self {
@@ -74,17 +119,76 @@ impl Default for Descriptors {
             endpoints: std::array::from_fn(|_| None),
             owner: Rc::new(()),
             next_file: 1,
+            file_quota: None,
         }
     }
 }
 impl Descriptors {
+    /// A table may rebind a host namespace only after all its file endpoints close.
+    pub fn registered_file_bytes(&self) -> usize {
+        self.file_quota.as_ref().map_or(0, |quota| quota.used.get())
+    }
+    pub fn validate_file_namespace(&self, files: &crate::kernel::Files) -> Result<()> {
+        if let Some(quota) = &self.file_quota {
+            if self
+                .endpoints
+                .iter()
+                .any(|e| matches!(e, Some(Endpoint::File(_))))
+                && !Rc::ptr_eq(quota, &files.quota())
+            {
+                return Err(
+                    "Cannot mix registered-file quota domains while file descriptors remain live"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
     pub fn open_file(
         &mut self,
         files: &crate::kernel::Files,
         path: &[u8],
     ) -> std::result::Result<FileToken, u32> {
-        let bytes = files.contents(path)?;
-        let stat = files.stat_record(path)?;
+        self.validate_file_namespace(files).map_err(|_| 9u32)?;
+        let backing = files.backing(path)?;
+        self.install_file(backing, OpenOptions::read_only())
+    }
+    pub fn open_file_options(
+        &mut self,
+        files: &mut crate::kernel::Files,
+        path: &[u8],
+        options: OpenOptions,
+    ) -> Result<std::result::Result<FileToken, u32>> {
+        self.validate_file_namespace(files)?;
+        Ok((|| {
+            if (!options.read && !options.write) || (options.truncate && !options.write) {
+                return Err(22);
+            }
+            // Capacity/identity checks precede namespace or content mutation.
+            if !self.endpoints.iter().any(Option::is_none) || self.next_file == u64::MAX {
+                return Err(24);
+            }
+            let backing = match files.backing(path) {
+                Ok(file) => {
+                    if options.create && options.exclusive {
+                        return Err(17);
+                    }
+                    file
+                }
+                Err(2) if options.create => files.create(path)?,
+                Err(error) => return Err(error),
+            };
+            self.install_file(backing, options)
+        })())
+    }
+    fn install_file(
+        &mut self,
+        backing: Rc<crate::kernel::FileBacking>,
+        options: OpenOptions,
+    ) -> std::result::Result<FileToken, u32> {
+        if options.write && !backing.writable {
+            return Err(13);
+        }
         let index = self
             .endpoints
             .iter()
@@ -92,9 +196,13 @@ impl Descriptors {
             .ok_or(24u32)?;
         let identity = self.next_file;
         let next = identity.checked_add(1).ok_or(24u32)?;
+        if options.truncate {
+            Self::resize_backing(&backing, 0)?;
+        }
+        self.file_quota = Some(backing.quota.clone());
         self.endpoints[index] = Some(Endpoint::File(OpenFile {
-            bytes,
-            stat,
+            backing,
+            options,
             identity,
             position: Cell::new(0),
             revision: Cell::new(0),
@@ -105,6 +213,135 @@ impl Descriptors {
             identity,
             owner: self.owner.clone(),
         })
+    }
+    fn resized(bytes: &[u8], length: usize) -> std::result::Result<Box<[u8]>, u32> {
+        let mut replacement = Vec::new();
+        replacement.try_reserve_exact(length).map_err(|_| 12u32)?;
+        replacement.resize(length, 0);
+        let retained = bytes.len().min(length);
+        replacement[..retained].copy_from_slice(&bytes[..retained]);
+        Ok(replacement.into_boxed_slice())
+    }
+    fn resize_backing(
+        backing: &crate::kernel::FileBacking,
+        length: u64,
+    ) -> std::result::Result<(), u32> {
+        let mut state = backing.state.borrow_mut();
+        let length = usize::try_from(length).map_err(|_| 28u32)?;
+        if length > state.bytes.len() + backing.quota.remaining() {
+            return Err(28);
+        }
+        let revision = state.revision.checked_add(1).ok_or(28u32)?;
+        let replacement = Self::resized(&state.bytes, length)?;
+        backing.quota.change(state.bytes.len(), replacement.len())?;
+        state.bytes = replacement;
+        state.revision = revision;
+        Ok(())
+    }
+    pub fn write_capacity(
+        &self,
+        token: &FileToken,
+        requested: u64,
+    ) -> std::result::Result<usize, u32> {
+        let file = self.file(token)?;
+        if !file.options.write {
+            return Err(9);
+        }
+        let state = file.backing.state.borrow();
+        let position = if file.options.append {
+            state.bytes.len() as u64
+        } else {
+            file.position.get()
+        };
+        let maximum = state.bytes.len() + file.backing.quota.remaining();
+        Ok(requested.min((maximum as u64).saturating_sub(position)) as usize)
+    }
+    pub fn preview_write(
+        &self,
+        token: &FileToken,
+        bytes: &[u8],
+    ) -> std::result::Result<FileWritePlan, u32> {
+        let capacity = self.write_capacity(token, bytes.len() as u64)?;
+        self.preview_write_count(token, &bytes[..capacity], bytes.len() as u64)
+    }
+    /// Input is exactly the accepted prefix; requested retains the original
+    /// full64 byte count so a short write carries its terminal quota condition.
+    pub fn preview_write_count(
+        &self,
+        token: &FileToken,
+        bytes: &[u8],
+        requested: u64,
+    ) -> std::result::Result<FileWritePlan, u32> {
+        let amount = self.write_capacity(token, requested)?;
+        if bytes.len() != amount {
+            return Err(22);
+        }
+        let file = self.file(token)?;
+        let state = file.backing.state.borrow();
+        let position = if file.options.append {
+            state.bytes.len() as u64
+        } else {
+            file.position.get()
+        };
+        let terminal_error = ((amount as u64) < requested).then_some(28);
+        let length = if amount == 0 {
+            state.bytes.len()
+        } else {
+            state.bytes.len().max(position as usize + amount)
+        };
+        let mut replacement = if amount == 0 {
+            Box::default()
+        } else {
+            Self::resized(&state.bytes, length)?
+        };
+        if amount != 0 {
+            replacement[position as usize..position as usize + amount].copy_from_slice(bytes);
+        }
+        Ok(FileWritePlan {
+            token: token.clone(),
+            cursor: file.position.get(),
+            position,
+            revision: file.revision.get(),
+            file_revision: state.revision,
+            quota_revision: file.backing.quota.revision.get(),
+            replacement,
+            amount,
+            terminal_error,
+        })
+    }
+    /// Consumes the prepared replacement only after all caller output guards.
+    pub fn commit_write(&self, plan: FileWritePlan) -> std::result::Result<(), u32> {
+        let file = self.file(&plan.token)?;
+        let mut state = file.backing.state.borrow_mut();
+        if file.position.get() != plan.cursor
+            || file.revision.get() != plan.revision
+            || state.revision != plan.file_revision
+            || file.backing.quota.revision.get() != plan.quota_revision
+        {
+            return Err(9);
+        }
+        let revision = plan.revision.checked_add(1).ok_or(22u32)?;
+        let file_revision = state.revision.checked_add(1).ok_or(28u32)?;
+        if plan.amount != 0 {
+            file.backing
+                .quota
+                .change(state.bytes.len(), plan.replacement.len())?;
+            state.bytes = plan.replacement;
+            state.revision = file_revision;
+            file.position.set(plan.position + plan.amount as u64);
+        }
+        file.revision.set(revision);
+        Ok(())
+    }
+    pub fn truncate_file(&self, token: &FileToken, length: u64) -> std::result::Result<(), u32> {
+        let file = self.file(token)?;
+        if !file.options.write {
+            return Err(22);
+        }
+        Self::resize_backing(&file.backing, length)
+    }
+    pub fn file_options(&self, token: &FileToken) -> std::result::Result<OpenOptions, u32> {
+        Ok(self.file(token)?.options)
     }
     pub fn kind(&self, descriptor: u64) -> Option<DescriptorKind> {
         Self::index(descriptor)
@@ -119,7 +356,7 @@ impl Descriptors {
         &self,
         token: &FileToken,
     ) -> std::result::Result<[u8; crate::kernel::STAT_SIZE], u32> {
-        Ok(self.file(token)?.stat)
+        Ok(self.file(token)?.backing.stat())
     }
     pub fn file_token(&self, descriptor: u64) -> std::result::Result<FileToken, u32> {
         let Some(Endpoint::File(file)) =
@@ -146,7 +383,7 @@ impl Descriptors {
         Ok(self.file(token)?.position.get())
     }
     pub fn file_len(&self, token: &FileToken) -> std::result::Result<u64, u32> {
-        Ok(self.file(token)?.bytes.len() as u64)
+        Ok(self.file(token)?.backing.state.borrow().bytes.len() as u64)
     }
     pub fn preview_read(
         &self,
@@ -154,24 +391,32 @@ impl Descriptors {
         count: u64,
     ) -> std::result::Result<FileReadPlan, u32> {
         let file = self.file(token)?;
+        if !file.options.read {
+            return Err(9);
+        }
+        let state = file.backing.state.borrow();
         let position = file.position.get();
-        let amount = count.min((file.bytes.len() as u64).saturating_sub(position)) as usize;
-        let bytes = if amount == 0 {
-            Vec::new()
-        } else {
-            file.bytes[position as usize..position as usize + amount].to_vec()
-        };
+        let amount = count.min((state.bytes.len() as u64).saturating_sub(position)) as usize;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(amount).map_err(|_| 12u32)?;
+        if amount != 0 {
+            bytes.extend_from_slice(&state.bytes[position as usize..position as usize + amount]);
+        }
         Ok(FileReadPlan {
             bytes,
             token: token.clone(),
             position,
             revision: file.revision.get(),
+            file_revision: state.revision,
         })
     }
     /// Call only after all output guards. One-shot even for an EOF/zero-byte read.
     pub fn commit_read(&self, plan: &FileReadPlan) -> std::result::Result<(), u32> {
         let file = self.file(&plan.token)?;
-        if file.position.get() != plan.position || file.revision.get() != plan.revision {
+        if file.position.get() != plan.position
+            || file.revision.get() != plan.revision
+            || file.backing.state.borrow().revision != plan.file_revision
+        {
             return Err(9);
         }
         let next = plan.revision.checked_add(1).ok_or(22u32)?;
@@ -212,7 +457,7 @@ impl Descriptors {
         let base = match whence {
             0 => 0,
             1 => file.position.get(),
-            2 => file.bytes.len() as u64,
+            2 => file.backing.state.borrow().bytes.len() as u64,
             _ => return Err(22),
         };
         let position = i128::from(base) + i128::from(offset);
@@ -360,7 +605,24 @@ impl Descriptors {
     ) -> std::result::Result<u64, u32> {
         if let Ok(token) = self.file_token(descriptor) {
             if write {
-                return Err(9);
+                if count > i64::MAX as u64 {
+                    return Err(22);
+                }
+                let capacity = self.write_capacity(&token, count)?;
+                let bytes = if capacity == 0 {
+                    &[][..]
+                } else {
+                    user.read(address, capacity).map_err(|_| 14u32)?
+                };
+                let plan = self.preview_write_count(&token, bytes, count)?;
+                let amount = plan.bytes_written();
+                let error = plan.terminal_error();
+                self.commit_write(plan)?;
+                return if amount == 0 && count != 0 {
+                    Err(error.unwrap_or(28))
+                } else {
+                    Ok(amount as u64)
+                };
             }
             if count > i64::MAX as u64 {
                 return Err(22);
@@ -453,6 +715,168 @@ impl Descriptors {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn writable_options() -> OpenOptions {
+        OpenOptions {
+            read: true,
+            write: true,
+            ..OpenOptions::read_only()
+        }
+    }
+    #[test]
+    fn mutable_contents_are_shared_while_cursors_and_access_modes_are_independent() {
+        let mut files = crate::kernel::Files::default();
+        files
+            .register_writable(b"/save/file", b"abcd".to_vec())
+            .unwrap();
+        files.register(b"/asset", b"fixed".to_vec()).unwrap();
+        files.allow_create_directory(b"/save").unwrap();
+        let mut d = Descriptors::default();
+        let a = d
+            .open_file_options(&mut files, b"/save/file", writable_options())
+            .unwrap()
+            .unwrap();
+        let b = d.open_file(&files, b"/save/file").unwrap();
+        let stale_read = d.preview_read(&b, 4).unwrap();
+        d.seek_file(&a, 6, 0).unwrap();
+        let write = d.preview_write(&a, b"XY").unwrap();
+        assert_eq!(write.bytes_written(), 2);
+        d.commit_write(write).unwrap();
+        assert_eq!(d.preview_read(&b, 8).unwrap().bytes(), b"abcd\0\0XY");
+        assert_eq!(d.commit_read(&stale_read), Err(9));
+        assert_eq!(d.file_position(&b), Ok(0));
+        assert_eq!(d.file_position(&a), Ok(8));
+        assert_eq!(
+            u64::from_le_bytes(d.stat_file(&b).unwrap()[72..80].try_into().unwrap()),
+            8
+        );
+        assert!(matches!(d.preview_write(&b, b"!"), Err(9)));
+        assert!(matches!(
+            d.open_file_options(&mut files, b"/asset", writable_options())
+                .unwrap(),
+            Err(13)
+        ));
+        let append = d
+            .open_file_options(
+                &mut files,
+                b"/save/file",
+                OpenOptions {
+                    append: true,
+                    ..writable_options()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.file_position(&append), Ok(0));
+        d.seek_file(&append, 1, 0).unwrap();
+        let plan = d.preview_write(&append, b"!").unwrap();
+        d.commit_write(plan).unwrap();
+        assert_eq!(d.file_position(&append), Ok(9));
+        assert_eq!(d.preview_read(&b, 20).unwrap().bytes(), b"abcd\0\0XY!");
+        let stale = d.preview_write(&a, b"old").unwrap();
+        d.truncate_file(&append, 2).unwrap();
+        assert_eq!(d.commit_write(stale), Err(9));
+        assert_eq!(d.file_position(&a), Ok(8));
+        assert_eq!(d.preview_read(&b, 20).unwrap().bytes(), b"ab");
+        assert_eq!(files.content_bytes(), 7);
+        let create = OpenOptions {
+            create: true,
+            exclusive: true,
+            ..writable_options()
+        };
+        assert!(matches!(
+            d.open_file_options(&mut files, b"/save/file", create)
+                .unwrap(),
+            Err(17)
+        ));
+        assert!(matches!(
+            d.open_file_options(&mut files, b"/missing/new", create)
+                .unwrap(),
+            Err(2)
+        ));
+        let new = d
+            .open_file_options(&mut files, b"/save/new", create)
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.file_len(&new), Ok(0));
+        let truncated = d
+            .open_file_options(
+                &mut files,
+                b"/save/file",
+                OpenOptions {
+                    truncate: true,
+                    ..writable_options()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.file_len(&a), Ok(0));
+        assert_eq!(d.file_len(&truncated), Ok(0));
+    }
+    #[test]
+    fn quota_partial_write_prefix_guards_and_namespace_lifetime() {
+        const CAP: usize = 64 * 1024 * 1024;
+        let mut files = crate::kernel::Files::default();
+        files.register_writable(b"/file", b"abcd".to_vec()).unwrap();
+        files.register(b"/filler", vec![0; CAP - 6]).unwrap();
+        let mut d = Descriptors::default();
+        let token = d
+            .open_file_options(&mut files, b"/file", writable_options())
+            .unwrap()
+            .unwrap();
+        d.seek_file(&token, 4, 0).unwrap();
+        assert_eq!(d.write_capacity(&token, u64::MAX), Ok(2));
+        let mut input = *b"XY";
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut input, false, false).unwrap();
+        let mut kernel = Memory::default();
+        assert_eq!(
+            d.transfer(
+                &mut memory,
+                &mut kernel,
+                token.descriptor().into(),
+                0x1000,
+                4,
+                true
+            ),
+            Ok(2)
+        );
+        assert_eq!(
+            d.transfer(
+                &mut memory,
+                &mut kernel,
+                token.descriptor().into(),
+                u64::MAX,
+                1,
+                true
+            ),
+            Err(28)
+        );
+        assert_eq!(files.content_bytes(), CAP);
+        d.seek_file(&token, 0, 0).unwrap();
+        assert_eq!(d.preview_read(&token, 8).unwrap().bytes(), b"abcdXY");
+        let stale = d.preview_write(&token, b"Z").unwrap();
+        d.truncate_file(&token, 2).unwrap();
+        assert_eq!(files.content_bytes(), CAP - 4);
+        assert_eq!(d.commit_write(stale), Err(9));
+        // Dropping the namespace releases filler, but the open file remains charged.
+        drop(files);
+        assert_eq!(d.registered_file_bytes(), 2);
+        let mut replacement = crate::kernel::Files::default();
+        replacement.register(b"/file", vec![9]).unwrap();
+        assert!(
+            d.open_file_options(&mut replacement, b"/file", OpenOptions::read_only())
+                .unwrap_err()
+                .contains("quota domains")
+        );
+        assert_eq!(d.close_file(&token), 0);
+        assert_eq!(d.registered_file_bytes(), 0);
+        assert!(
+            d.open_file_options(&mut replacement, b"/file", OpenOptions::read_only())
+                .unwrap()
+                .is_ok()
+        );
+        assert_eq!(d.registered_file_bytes(), 1);
+    }
     #[test]
     fn files_share_cursor_guard_copies_and_reject_stale_tokens() {
         let mut files = crate::kernel::Files::default();

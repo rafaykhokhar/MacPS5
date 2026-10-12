@@ -85,3 +85,4 @@ pub mod scan_float;
 pub mod guest_time;
 pub mod guest_sleep;
 pub mod stdio_file;
+pub mod stdio_write;
