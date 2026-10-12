@@ -71,6 +71,11 @@ impl GuestTls {
     pub fn live_threads(&self) -> usize {
         self.threads.len()
     }
+    pub fn next_thread_id(&self) -> Result<u64> {
+        self.last_thread_id
+            .checked_add(1)
+            .ok_or("Guest TLS thread identity exhausted".into())
+    }
     pub fn contains_thread(&self, id: u64) -> bool {
         self.threads.iter().any(|t| t.id == id)
     }

@@ -358,7 +358,7 @@ pub fn verify(archive: &Path, directory: &Path) -> Result<(), String> {
         .ok_or("Missing TLS parent data")?;
     assert_eq!(stored, first);
     println!(
-        "PASS: translated TLS create/get/set/delete, 64-bit values, generation reset, guarded outputs/destructors/return frame, explicit guest-context isolation, captured suspension identity, cross-image calls, and rejected foreign-thread module dispatch with successful originating-thread retry. No worker scheduler/destructors implemented."
+        "PASS: translated TLS create/get/set/delete, 64-bit values, generation reset, guarded outputs/destructors/return frame, explicit guest-context isolation, captured suspension identity, cross-image calls, and rejected foreign-thread module dispatch with successful originating-thread retry. These checks do not exercise worker scheduling; TLS destructors remain unsupported."
     );
     Ok(())
 }

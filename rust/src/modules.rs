@@ -82,6 +82,7 @@ struct Module {
     bytes: usize,
 }
 pub struct Modules {
+    thread_scheduler: Option<crate::scheduler::Scheduler>,
     exit_request: Option<crate::module_executor::ExitRequest>,
     native_paths: BTreeMap<String, u64>,
     sysmodules: BTreeMap<u32, (u64, u32)>,
@@ -129,6 +130,7 @@ impl Modules {
     }
     pub fn new(budget: usize) -> Self {
         Self {
+            thread_scheduler: None,
             exit_request: None,
             native_paths: BTreeMap::new(),
             sysmodules: BTreeMap::new(),

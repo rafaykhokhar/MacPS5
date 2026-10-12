@@ -414,6 +414,10 @@ pub enum Service {
     ThreadAttrDestroy,
     ThreadAttrSetDetachState,
     ThreadAttrSetStackSize,
+    ThreadCreate,
+    ThreadSelf,
+    ThreadJoin,
+    ThreadDetach,
     MutexAttrInit,
     MutexAttrSetType,
     MutexAttrDestroy,
@@ -449,6 +453,10 @@ impl Service {
             | Self::ThreadAttrDestroy
             | Self::ThreadAttrSetDetachState
             | Self::ThreadAttrSetStackSize
+            | Self::ThreadCreate
+            | Self::ThreadSelf
+            | Self::ThreadJoin
+            | Self::ThreadDetach
             | Self::MutexAttrInit
             | Self::MutexAttrSetType
             | Self::MutexAttrDestroy
@@ -723,7 +731,66 @@ impl QuantumYield {
             .stack_region())
     }
 }
+#[derive(Clone, Copy, Debug)]
+pub enum ThreadOperation {
+    Completed(u64),
+    Create {
+        output: u64,
+        entry: u64,
+        argument: u64,
+        options: crate::guest_thread_attr::ThreadOptions,
+    },
+    Join {
+        thread: u64,
+        output: u64,
+    },
+    Detach {
+        thread: u64,
+    },
+}
+pub struct ThreadRequest {
+    owner: Rc<()>,
+    continuation: Option<Continuation>,
+    operation: ThreadOperation,
+}
+impl ThreadRequest {
+    pub(crate) fn set_quantum(&mut self, quantum: u64) -> Result<()> {
+        self.continuation
+            .as_mut()
+            .ok_or("Thread request consumed")?
+            .quantum = Some(quantum);
+        Ok(())
+    }
+    pub(crate) fn belongs_to(&self, native: &NativeExecutor) -> bool {
+        Rc::ptr_eq(&self.owner, &native.mutex_wait_owner)
+    }
+    pub(crate) fn complete(&mut self, result: u64) {
+        self.operation = ThreadOperation::Completed(result);
+    }
+    pub(crate) fn stack_region(&mut self) -> Result<DataRegion<'_>> {
+        Ok(self
+            .continuation
+            .as_mut()
+            .ok_or("Thread request consumed")?
+            .stack_region())
+    }
+    pub fn operation(&self) -> ThreadOperation {
+        self.operation
+    }
+    pub fn guest_thread_id(&self) -> Option<u64> {
+        self.continuation.as_ref().map(|c| c.guest_thread)
+    }
+    pub fn mxcsr(&self) -> Result<u32> {
+        Ok(self
+            .continuation
+            .as_ref()
+            .ok_or("Thread request consumed")?
+            .cpu
+            .padding as u32)
+    }
+}
 pub enum Execution {
+    ThreadRequest(Box<ThreadRequest>),
     QuantumYield(Box<QuantumYield>),
     /// Full-width pointer return from an explicitly invoked worker entry.
     WorkerReturned(u64),
@@ -753,6 +820,7 @@ impl Execution {
     /// extra fuel and never changes CPU registers or execution position.
     pub fn cap_instruction_fuel(&mut self, limit: u64) {
         let continuation = match self {
+            Self::ThreadRequest(request) => request.continuation.as_mut(),
             Self::QuantumYield(wait) => wait.continuation.as_mut(),
             Self::MutexWait(wait) => wait.continuation.as_mut(),
             Self::Dlsym { continuation, .. }
@@ -769,6 +837,13 @@ impl Execution {
     /// The scheduler must map every live stack to preserve shared stack arguments.
     pub fn stack_region(&mut self) -> Result<Option<DataRegion<'_>>> {
         match self {
+            Self::ThreadRequest(request) => Ok(Some(
+                request
+                    .continuation
+                    .as_mut()
+                    .ok_or("Thread request consumed")?
+                    .stack_region(),
+            )),
             Self::QuantumYield(wait) => wait.stack_region().map(Some),
             Self::MutexWait(wait) => Ok(Some(
                 wait.continuation
@@ -840,6 +915,139 @@ pub struct NativeExecutor {
     stack_size: usize,
 }
 impl NativeExecutor {
+    pub(crate) fn with_thread_request_memory<T>(
+        &mut self,
+        request: &mut ThreadRequest,
+        image: &mut Image,
+        dependencies: &mut [&mut Image],
+        data: &mut [DataRegion<'_>],
+        operation: impl FnOnce(&mut Memory<'_>) -> Result<T>,
+    ) -> Result<T> {
+        if !Rc::ptr_eq(&request.owner, &self.mutex_wait_owner) {
+            return Err("Foreign thread request".into());
+        }
+        let continuation = request
+            .continuation
+            .as_mut()
+            .ok_or("Thread request consumed")?;
+        self.with_suspended_runtime(continuation, image, dependencies, data, |memory, _| {
+            operation(memory)
+        })
+    }
+    pub(crate) fn finish_thread_request(
+        &mut self,
+        request: &mut ThreadRequest,
+        image: &mut Image,
+        dependencies: &mut [&mut Image],
+        data: &mut [DataRegion<'_>],
+        result: u64,
+    ) -> Result<Execution> {
+        self.require_running()?;
+        if !Rc::ptr_eq(&request.owner, &self.mutex_wait_owner)
+            || request.guest_thread_id() != Some(self.selected_guest_thread)
+            || !self.tls.contains_thread(self.selected_guest_thread)
+        {
+            return Err("Foreign or retired thread request".into());
+        }
+        let continuation = request
+            .continuation
+            .take()
+            .ok_or("Thread request consumed")?;
+        self.resume_with_data(image, dependencies, continuation, result, data)
+    }
+    /// Reserve and validate a child before publishing its guest handle. No child
+    /// instruction executes here. The scheduler registers TLS after preparation.
+    pub(crate) fn prepare_worker(
+        &mut self,
+        image: &Image,
+        dependencies: &[&mut Image],
+        setup: (u64, u64, u64, u32, u64),
+        data: &mut [DataRegion<'_>],
+    ) -> Result<QuantumYield> {
+        let (thread, entry, argument, mxcsr, stack_size) = setup;
+        if stack_size != self.stack_size as u64 {
+            return Err("Requested thread stack size is unsupported by configured executor".into());
+        }
+        let owner = std::iter::once(image)
+            .chain(dependencies.iter().map(|i| &**i))
+            .find(|mapped| {
+                mapped.segments.iter().any(|segment| {
+                    segment.flags & 1 != 0
+                        && entry >= segment.address
+                        && entry - segment.address < (segment.bytes.len() as u64)
+                })
+            })
+            .ok_or("Worker entry is not executable")?;
+        if !self
+            .image_blocks
+            .contains_key(&(owner.bias, entry - owner.bias))
+            && !self.blocks.contains_key(&(entry - owner.bias))
+        {
+            let source = self
+                .translation_sources
+                .get(&owner.bias)
+                .ok_or("Worker entry has no translation owner")?;
+            let archive = source.archive.clone();
+            let directory = source.directory.clone();
+            // SAFETY: the source archive inherits compile_image's trusted contract.
+            unsafe {
+                self.extend_image_translation(owner, entry, &archive, &directory)?;
+            }
+        }
+        let mut address = self.stack_address;
+        let mut selected = None;
+        for _ in 0..128 {
+            let end = address
+                .checked_add(stack_size)
+                .ok_or("Worker stack overflow")?;
+            let data_overlap = data.iter().any(|region| {
+                address < region.address.saturating_add(region.bytes.len() as u64)
+                    && region.address < end
+            });
+            let image_overlap = std::iter::once(image)
+                .chain(dependencies.iter().map(|i| &**i))
+                .any(|mapped| {
+                    mapped.segments.iter().any(|segment| {
+                        address < segment.address.saturating_add(segment.bytes.len() as u64)
+                            && segment.address < end
+                    })
+                });
+            if !data_overlap && !image_overlap {
+                selected = Some(address);
+                break;
+            }
+            address = end;
+        }
+        let address = selected.ok_or("Worker stack slots exhausted")?;
+        let mut stack = Vec::new();
+        stack
+            .try_reserve_exact(self.stack_size)
+            .map_err(|_| "Cannot reserve worker stack")?;
+        stack.resize(self.stack_size, 0);
+        stack[self.stack_size - 8..].copy_from_slice(&u64::MAX.to_le_bytes());
+        let mut cpu = Cpu {
+            bias: owner.bias,
+            rip: entry - owner.bias,
+            fuel: self.fuel,
+            padding: u64::from(mxcsr),
+            ..Cpu::default()
+        };
+        cpu.registers[4] = address + stack_size - 8;
+        cpu.registers[7] = argument;
+        Ok(QuantumYield {
+            owner: self.mutex_wait_owner.clone(),
+            continuation: Some(Continuation {
+                quantum: self.worker_quantum,
+                return_convention: ReturnConvention::WorkerPointer,
+                guest_thread: thread,
+                cpu,
+                stack,
+                stack_address: address,
+                remaining: self.transitions,
+                caller_bias: image.bias,
+            }),
+        })
+    }
     pub(crate) fn execution_identity(&self) -> Rc<()> {
         self.mutex_wait_owner.clone()
     }
@@ -1396,6 +1604,9 @@ impl NativeExecutor {
         dependencies: &mut [&mut Image],
     ) -> Result<i32> {
         match self.run(image, address, arguments, dependencies)? {
+            Execution::ThreadRequest(_) => {
+                Err("Thread request requires scheduler orchestration".into())
+            }
             Execution::QuantumYield(_) => {
                 Err("Quantum requires resumable worker orchestration".into())
             }
@@ -2044,6 +2255,75 @@ impl NativeExecutor {
                     self.consumed_instruction_fuel += 1;
                     if matches!(
                         service,
+                        Service::ThreadCreate | Service::ThreadJoin | Service::ThreadDetach
+                    ) {
+                        let operation = if matches!(service, Service::ThreadCreate) {
+                            let output = cpu.registers[7];
+                            memory.validate_write(output, 8)?;
+                            if output < sp + 8
+                                && sp < output.checked_add(8).ok_or("Thread output overflow")?
+                            {
+                                return Err("Thread output overlaps return frame".into());
+                            }
+                            let options = self
+                                .thread_attributes
+                                .snapshot(&memory, cpu.registers[6])?
+                                .ok_or("Invalid thread attributes")?;
+                            let entry = cpu.registers[2];
+                            if !memory.executable(entry) {
+                                return Err("Thread entry is not executable".into());
+                            }
+                            ThreadOperation::Create {
+                                output,
+                                entry,
+                                argument: cpu.registers[1],
+                                options,
+                            }
+                        } else if matches!(service, Service::ThreadJoin) {
+                            let output = cpu.registers[6];
+                            if output != 0 {
+                                memory.validate_write(output, 8)?;
+                                if output < sp + 8
+                                    && sp < output.checked_add(8).ok_or("Join output overflow")?
+                                {
+                                    return Err("Join output overlaps return frame".into());
+                                }
+                            }
+                            ThreadOperation::Join {
+                                thread: cpu.registers[7],
+                                output,
+                            }
+                        } else {
+                            ThreadOperation::Detach {
+                                thread: cpu.registers[7],
+                            }
+                        };
+                        if terminal {
+                            cpu.stop = 3;
+                        } else {
+                            cpu.registers[4] = sp + 8;
+                        }
+                        cpu.memory = 0;
+                        drop(memory);
+                        return Ok(Flow::Finished(Execution::ThreadRequest(Box::new(
+                            ThreadRequest {
+                                owner: self.mutex_wait_owner.clone(),
+                                operation,
+                                continuation: Some(Continuation {
+                                    quantum: slice.0,
+                                    return_convention,
+                                    guest_thread,
+                                    cpu,
+                                    stack,
+                                    stack_address,
+                                    remaining: remaining - transition - 1,
+                                    caller_bias,
+                                }),
+                            },
+                        ))));
+                    }
+                    if matches!(
+                        service,
                         Service::Dlsym
                             | Service::LoadStartModule
                             | Service::StopUnloadModule
@@ -2093,7 +2373,9 @@ impl NativeExecutor {
                             },
                         ));
                     }
-                    let value = if matches!(service, Service::Getpid | Service::Syscall) {
+                    let value = if matches!(service, Service::ThreadSelf) {
+                        guest_thread
+                    } else if matches!(service, Service::Getpid | Service::Syscall) {
                         let direct = matches!(service, Service::Getpid);
                         let number = if direct { 20 } else { cpu.registers[0] };
                         if number != 20 && self.kernel.is_none() {

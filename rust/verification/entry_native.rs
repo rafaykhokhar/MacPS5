@@ -9,6 +9,7 @@ mod audio_native;
 mod direct_memory_native;
 mod equeue_native;
 mod exit_native;
+mod fma213_native;
 mod ime_native;
 mod keyboard_native;
 mod libc_memory_native;
@@ -25,6 +26,10 @@ mod stat_native;
 mod stdio_native;
 mod system_service_native;
 mod threadattr_native;
+mod thread_services_native;
+mod thread_module_native;
+mod tiler_native;
+mod tiler_threads_native;
 mod tls_native;
 mod truncate_native;
 mod user_service_native;
@@ -53,6 +58,11 @@ fn main() -> Result<(), String> {
     truncate_native::verify(Path::new(&archive), Path::new(&directory))?;
     scheduler_native::verify(Path::new(&archive), Path::new(&directory))?;
     vmulsd_native::verify(Path::new(&archive), Path::new(&directory))?;
+    fma213_native::verify(Path::new(&archive), Path::new(&directory))?;
+    thread_services_native::verify(Path::new(&archive), Path::new(&directory))?;
+    thread_module_native::verify(Path::new(&archive), Path::new(&directory))?;
+    tiler_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+    tiler_threads_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     user_service_native::verify(Path::new(&archive), Path::new(&directory))?;
     pad_native::verify(Path::new(&archive), Path::new(&directory))?;
     puts_native::verify(Path::new(&archive), Path::new(&directory))?;
@@ -76,7 +86,12 @@ fn main() -> Result<(), String> {
         image.unresolved.len()
     );
     println!("Guest DT_NEEDED dependencies: {:?}", image.dependencies);
-    let mut native = NativeExecutor::new(0x20000000, 65536, 30_000_000, 30_000_000)?;
+    let mut native = NativeExecutor::new(
+        0x20000000,
+        native_ps5::guest_thread_attr::DEFAULT_STACK_SIZE as usize,
+        30_000_000,
+        30_000_000,
+    )?;
     native.register_service(0x700020, Service::Dlsym)?;
     native.register_service(0x710000, Service::Getpid)?;
     native.register_service(0x71000a, Service::Syscall)?;
@@ -295,6 +310,10 @@ fn main() -> Result<(), String> {
         ),
         ("pthread_attr_setstacksize", Service::ThreadAttrSetStackSize),
         ("pthread_attr_destroy", Service::ThreadAttrDestroy),
+        ("pthread_create", Service::ThreadCreate),
+        ("pthread_self", Service::ThreadSelf),
+        ("pthread_join", Service::ThreadJoin),
+        ("pthread_detach", Service::ThreadDetach),
     ]
     .into_iter()
     .enumerate()
@@ -1129,6 +1148,8 @@ fn main() -> Result<(), String> {
                 (168, 0x730210),
                 (176, 0x730220),
                 (184, 0x730230),
+                (192, 0x730250),
+                (200, 0x730260),
             ] {
                 if locale_segment.bytes[locale_offset + delta..locale_offset + delta + 8]
                     != expected.to_le_bytes()
@@ -1155,12 +1176,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                || native.bytes_allocated() != 15888
-                // Each accepted SPRX adds owned dependency/symbol records;
-                // seven providers now exceed the previous8KiB stage bound.
+                // Four thread exports add four 24-byte symbols and four
+                // 12-byte NIDs. The two 16-byte-rounded allocations grow
+                // by96+48 bytes from the previous15888-byte checkpoint.
+                || native.bytes_allocated() != 16032
                 || native.bytes_allocated() > 16 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'pthread_create'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'pthread_set_name_np'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1170,7 +1192,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted and realloc, seven mutex imports and three thread attribute imports bound; unresolved pthread_create causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; mutex, thread attributes, pthread_create and pthread_self bound; unresolved pthread_set_name_np causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1232,7 +1254,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved pthread_create triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved pthread_set_name_np triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     Ok(())

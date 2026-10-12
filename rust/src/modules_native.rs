@@ -1,7 +1,9 @@
 //! Resumable native initialization; pending calls remain fault-pinned until complete.
 #![allow(unsafe_code)]
 use super::*;
-use crate::module_executor::{Continuation, Execution, ExitRequest, MutexWait, NativeExecutor};
+use crate::module_executor::{
+    Continuation, Execution, ExitRequest, MutexWait, NativeExecutor, ThreadRequest,
+};
 use std::collections::VecDeque;
 pub struct ProcessData {
     pub address: u64,
@@ -18,6 +20,7 @@ pub struct Bootstrap {
 }
 
 pub enum StartEvent {
+    ThreadRequest { thread: u64 },
     MutexWait { thread: u64, slot: u64 },
     ExitRequested(ExitRequest),
     SysmoduleLoadInternal { arguments: [u64; 6] },
@@ -28,6 +31,7 @@ pub enum StartEvent {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartOutcome {
+    ThreadRequest { handle: u64, thread: u64 },
     MutexWait { handle: u64, thread: u64, slot: u64 },
     Started,
     ExitRequested(ExitRequest),
@@ -51,6 +55,8 @@ pub struct LoadPlan<'a> {
     pub directory: &'a std::path::Path,
 }
 pub(super) struct StartState {
+    scheduled_thread: Option<u64>,
+    thread_request: Option<Box<ThreadRequest>>,
     calls: VecDeque<(u64, bool)>,
     arguments: Arguments,
     status_return: bool,
@@ -64,13 +70,108 @@ pub(super) struct StartState {
     stopping: Option<u64>,
 }
 impl Modules {
+    /// Advance a retained initializer through real worker scheduling. The
+    /// process-wide (quantum, dispatch, instruction) budgets are installed only
+    /// on first use and never reset by another module or another call. This
+    /// bridge requires children quiescent before returning to module loading;
+    /// outstanding background workers retain the fault-pinned initializer and
+    /// report an explicit unsupported boundary until process image pinning exists.
+    pub fn resume_native_threads(
+        &mut self,
+        handle: u64,
+        executor: &mut NativeExecutor,
+        budgets: (u64, u64, u64),
+        max_steps: usize,
+    ) -> Result<StartEvent> {
+        if max_steps == 0 || max_steps > 10000 {
+            return Err("Invalid thread scheduling step limit".into());
+        }
+        self.require_native_running(executor)?;
+        self.require_pending_thread(handle, executor)?;
+        let mut state = self
+            .pending_starts
+            .remove(&handle)
+            .ok_or("No pending module start")?;
+        let thread = state.scheduled_thread.or_else(|| {
+            state
+                .thread_request
+                .as_ref()
+                .and_then(|request| request.guest_thread_id())
+        });
+        let Some(thread) = thread else {
+            self.pending_starts.insert(handle, state);
+            return Err("No pending module thread request".into());
+        };
+        let mut scheduler = match self.thread_scheduler.take() {
+            Some(scheduler) => scheduler,
+            None => match crate::scheduler::Scheduler::new(budgets.0, budgets.1, budgets.2) {
+                Ok(scheduler) => scheduler,
+                Err(error) => {
+                    self.pending_starts.insert(handle, state);
+                    return Err(error);
+                }
+            },
+        };
+        let result = (|| -> Result<Option<Execution>> {
+            if state.scheduled_thread.is_none() {
+                scheduler.adopt_parent(executor, &mut state.thread_request)?;
+                state.scheduled_thread = Some(thread);
+            }
+            for _ in 0..max_steps {
+                if scheduler.parent_boundary_has_live_workers(thread) {
+                    return Err("Module parent boundary with live workers requires process-wide image pinning".into());
+                }
+                self.with_native_images(handle, |image, dependencies, data| {
+                    scheduler.step(executor, image, dependencies, data)
+                })?;
+                if let Some(request) = scheduler.exit_request() {
+                    return Ok(Some(Execution::ExitRequested(request)));
+                }
+                if let Some(outcome) = scheduler.take_parent_boundary(thread) {
+                    return Ok(Some(outcome));
+                }
+                if scheduler.parent_boundary_has_live_workers(thread) {
+                    return Err("Module parent boundary with live workers requires process-wide image pinning".into());
+                }
+            }
+            Ok(None)
+        })();
+        self.thread_scheduler = Some(scheduler);
+        // Parent TLS is externally owned; scheduling must never retire it.
+        let selected = executor.select_guest_thread(thread);
+        match result {
+            Ok(Some(outcome)) => {
+                state.scheduled_thread = None;
+                if !matches!(outcome, Execution::ExitRequested(_)) {
+                    if let Err(error) = selected {
+                        self.pending_starts.insert(handle, state);
+                        return Err(error);
+                    }
+                }
+                self.advance_native(handle, executor, state, Some(outcome))
+            }
+            other => {
+                self.pending_starts.insert(handle, state);
+                selected?;
+                match other {
+                    Ok(None) => Ok(StartEvent::ThreadRequest { thread }),
+                    Err(error) => Err(error),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
     /// Until a scheduler supplies per-request thread contexts, reject dispatch
     /// under a different selected guest identity before loading, writing results,
     /// acquiring pins, or taking the caller's continuation. A caller may select
     /// the originating identity and retry the unchanged pending request.
     fn require_pending_thread(&self, caller: u64, executor: &NativeExecutor) -> Result<()> {
         if let Some(state) = self.pending_starts.get(&caller) {
-            let thread = if let Some(wait) = &state.mutex_wait {
+            let thread = if let Some(thread) = state.scheduled_thread {
+                thread
+            } else if let Some(request) = &state.thread_request {
+                request.guest_thread_id().ok_or("Thread request consumed")?
+            } else if let Some(wait) = &state.mutex_wait {
                 wait.guest_thread_id()
             } else {
                 state
@@ -204,6 +305,8 @@ impl Modules {
                 arguments: Arguments::default(),
                 status_return: true,
                 continuation: Some(bootstrap.continuation),
+                scheduled_thread: None,
+                thread_request: None,
                 mutex_wait: None,
                 request: Some(bootstrap.arguments),
                 loaded: None,
@@ -457,6 +560,12 @@ impl Modules {
         let mut requests = 0usize;
         loop {
             match event {
+                StartEvent::ThreadRequest { thread } => {
+                    return Ok(StartOutcome::ThreadRequest {
+                        handle: active,
+                        thread,
+                    });
+                }
                 StartEvent::MutexWait { thread, slot } => {
                     return Ok(StartOutcome::MutexWait {
                         handle: active,
@@ -839,6 +948,8 @@ impl Modules {
                 arguments,
                 status_return: false,
                 continuation: None,
+                scheduled_thread: None,
+                thread_request: None,
                 mutex_wait: None,
                 request: None,
                 loaded: None,
@@ -859,11 +970,11 @@ impl Modules {
     ) -> Result<StartEvent> {
         self.require_native_running(executor)?;
         self.require_pending_thread(handle, executor)?;
-        if self
-            .pending_starts
-            .get(&handle)
-            .is_some_and(|state| state.mutex_wait.is_some())
-        {
+        if self.pending_starts.get(&handle).is_some_and(|state| {
+            state.mutex_wait.is_some()
+                || state.thread_request.is_some()
+                || state.scheduled_thread.is_some()
+        }) {
             return Err("Mutex wait requires dedicated checked resume".into());
         }
         let mut state = self
@@ -936,7 +1047,9 @@ impl Modules {
             .remove(&handle)
             .ok_or("No pending module start")?;
         let result = self.with_native_images(handle, |image, dependencies, data| {
-            if let Some(wait) = state.mutex_wait.as_mut() {
+            if let Some(request) = state.thread_request.as_mut() {
+                executor.with_thread_request_memory(request, image, dependencies, data, operation)
+            } else if let Some(wait) = state.mutex_wait.as_mut() {
                 executor.with_mutex_wait_memory(wait, image, dependencies, data, operation)
             } else {
                 let continuation = state
@@ -967,6 +1080,12 @@ impl Modules {
         loop {
             if let Some(execution) = outcome.take() {
                 match execution {
+                    Execution::ThreadRequest(request) => {
+                        let thread = request.guest_thread_id().ok_or("Thread request consumed")?;
+                        state.thread_request = Some(request);
+                        self.pending_starts.insert(handle, state);
+                        return Ok(StartEvent::ThreadRequest { thread });
+                    }
                     Execution::QuantumYield(_) => {
                         return Err("Worker quantum cannot complete module initialization".into());
                     }
@@ -984,6 +1103,7 @@ impl Modules {
                     }
                     Execution::ExitRequested(request) => {
                         self.exit_request = Some(request);
+                        self.pending_starts.insert(handle, state);
                         return Ok(StartEvent::ExitRequested(request));
                     }
                     Execution::SysmoduleLoadInternal {
@@ -1063,6 +1183,8 @@ mod exit_request_tests {
             arguments: Arguments::default(),
             status_return: false,
             continuation: None,
+            scheduled_thread: None,
+            thread_request: None,
             mutex_wait: None,
             request: None,
             loaded: None,
