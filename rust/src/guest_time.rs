@@ -69,6 +69,35 @@ impl GuestTime {
     pub fn set_source(&mut self, source: TimeSource) {
         self.source = source;
     }
+    /// CLOCK_REALTIME uses the same configured source as gettimeofday, retaining
+    /// nanoseconds for host time instead of truncating timed-wait deadlines.
+    pub fn realtime_parts(&self) -> Result<(i64, i64)> {
+        match self.source {
+            TimeSource::Fixed(time) => {
+                time.bytes()?;
+                Ok((time.seconds, time.microseconds * 1000))
+            }
+            TimeSource::HostRealtime => {
+                let (duration, before) = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                    Ok(d) => (d, false),
+                    Err(e) => (e.duration(), true),
+                };
+                let seconds = i128::from(duration.as_secs());
+                let nanos = i64::from(duration.subsec_nanos());
+                let (seconds, nanos) = if before && nanos != 0 {
+                    (-seconds - 1, 1_000_000_000 - nanos)
+                } else if before {
+                    (-seconds, 0)
+                } else {
+                    (seconds, nanos)
+                };
+                Ok((
+                    i64::try_from(seconds).map_err(|_| "Guest realtime seconds overflow")?,
+                    nanos,
+                ))
+            }
+        }
+    }
     fn sample(&self) -> Result<Timeval> {
         match self.source {
             TimeSource::Fixed(time) => Ok(time),
@@ -125,22 +154,18 @@ mod tests {
             );
         }
         assert!(Timeval::from_epoch_duration(Duration::new(u64::MAX, 0), false).is_err());
-        assert!(
-            Timeval {
-                seconds: 0,
-                microseconds: -1
-            }
-            .bytes()
-            .is_err()
-        );
-        assert!(
-            Timeval {
-                seconds: 0,
-                microseconds: 1_000_000
-            }
-            .bytes()
-            .is_err()
-        );
+        assert!(Timeval {
+            seconds: 0,
+            microseconds: -1
+        }
+        .bytes()
+        .is_err());
+        assert!(Timeval {
+            seconds: 0,
+            microseconds: 1_000_000
+        }
+        .bytes()
+        .is_err());
     }
     #[test]
     fn nullable_outputs_explicit_timezone_and_order() {

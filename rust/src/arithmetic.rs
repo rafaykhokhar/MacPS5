@@ -1,5 +1,6 @@
 //! Arithmetic status flags, independent of host pointers and the legacy CPU layout.
-//! Operation numbers 0..3 preserve the existing translator ABI; 4 is SBB, 5 is DEC, and 6 is truncated IMUL.
+//! Operation numbers 0..3 preserve the existing translator ABI; 4 is SBB, 5 is DEC,
+//! 6 is truncated IMUL and 7 is ADC (Intel SDM Vol.2A, ADC).
 #[repr(C)]
 #[derive(Debug, PartialEq, Eq)]
 pub struct FlagsResult {
@@ -8,7 +9,7 @@ pub struct FlagsResult {
 }
 
 pub fn flags(old: u64, a: u64, b: u64, result: u64, bits: u64, operation: u64) -> FlagsResult {
-    if ![8, 16, 32, 64].contains(&bits) || operation > 6 {
+    if ![8, 16, 32, 64].contains(&bits) || operation > 7 {
         return FlagsResult {
             flags: old,
             fault: 3,
@@ -62,6 +63,7 @@ pub fn flags(old: u64, a: u64, b: u64, result: u64, bits: u64, operation: u64) -
         let carry = match operation {
             0 => a < b,
             4 => (a as u128) < b as u128 + (old & 1) as u128,
+            7 => (a as u128 + b as u128 + (old & 1) as u128) > mask as u128,
             3 | 5 => old & 1 != 0,
             _ => (a as u128 + b as u128) > mask as u128,
         };
@@ -107,12 +109,12 @@ mod tests {
         let exact = if subtract {
             a as i128 - b as i128 - borrow as i128
         } else {
-            a as i128 + b as i128
+            a as i128 + b as i128 + borrow as i128
         };
         let signed_result = if subtract {
             signed(a) - signed(b) - borrow as i128
         } else {
-            signed(a) + signed(b)
+            signed(a) + signed(b) + borrow as i128
         };
         let result = exact.rem_euclid(modulus) as u64;
         let mut f = (old & !0x8d5) | 2;
@@ -129,7 +131,7 @@ mod tests {
         let low = if subtract {
             (a & 15) as i32 - (b & 15) as i32 - borrow as i32
         } else {
-            (a & 15) as i32 + (b & 15) as i32
+            (a & 15) as i32 + (b & 15) as i32 + borrow as i32
         };
         if !(0..16).contains(&low) {
             f |= 16;
@@ -149,9 +151,14 @@ mod tests {
     fn exhaustive_byte_add_sub_and_borrow() {
         for a in 0..256 {
             for b in 0..256 {
-                for (op, subtract, borrow) in
-                    [(0, true, 0), (1, false, 0), (4, true, 0), (4, true, 1)]
-                {
+                for (op, subtract, borrow) in [
+                    (0, true, 0),
+                    (1, false, 0),
+                    (4, true, 0),
+                    (4, true, 1),
+                    (7, false, 0),
+                    (7, false, 1),
+                ] {
                     let old = 0xfedcba9876543ed6 | borrow;
                     let (result, expected) = reference(old, a, b, 8, subtract, borrow);
                     assert_eq!(
@@ -188,6 +195,12 @@ mod tests {
                             flags(old, a, b, result, bits as u64, 4).flags,
                             expected,
                             "bits={bits} a={a:x} b={b:x} c={carry}"
+                        );
+                        let (result, expected) = reference(old, a, b, bits, false, carry);
+                        assert_eq!(
+                            flags(old, a, b, result, bits as u64, 7).flags,
+                            expected,
+                            "ADC bits={bits} a={a:x} b={b:x} c={carry}"
                         );
                     }
                 }
@@ -260,7 +273,7 @@ mod tests {
                 }
             );
         }
-        assert_eq!(flags(0x202, 1, 2, 3, 64, 7).fault, 3);
+        assert_eq!(flags(0x202, 1, 2, 3, 64, 8).fault, 3);
     }
 }
 

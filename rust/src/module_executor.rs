@@ -1,20 +1,149 @@
 //! Rust-owned translated-module executor with dependency mappings and bounded services.
+//! Hosts using the standalone executor must retain the exact supplied Image
+//! objects and backing throughout suspension, including image-resident semaphore
+//! waits. Equal bytes at a reused load bias do not fulfill that host contract.
+//! Managed Modules enforce guest stop/unload lifetime guards; this low-level API
+//! does not pin host-owned images or detect host replacement of their backing.
 #![allow(unsafe_code)]
 use crate::{
-    Result,
     guest_memory::{DataRegion, Memory},
     legacy_cpu::Cpu,
     loader::Image,
     modules::{Arguments, Executor},
+    Result,
 };
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
+type FaultStack = Rc<RefCell<Vec<(u64, Vec<u8>, Rc<()>)>>>;
+struct StackIdentity {
+    address: u64,
+    length: usize,
+    backing: usize,
+    lease: Weak<()>,
+}
+/// A failed dispatch cannot release backing still owned by a semaphore waiter.
+/// Successful suspension transfers the bytes out, leaving this guard empty.
+struct ExecutionStack {
+    lease: Rc<()>,
+    bytes: Vec<u8>,
+    address: u64,
+    pending: Rc<Cell<bool>>,
+    fault: FaultStack,
+}
+impl std::ops::Deref for ExecutionStack {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
+impl std::ops::DerefMut for ExecutionStack {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.bytes
+    }
+}
+impl ExecutionStack {
+    fn take(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.bytes)
+    }
+}
+impl Drop for ExecutionStack {
+    fn drop(&mut self) {
+        if self.pending.get() && !self.bytes.is_empty() {
+            let bytes = self.take();
+            self.fault
+                .borrow_mut()
+                .push((self.address, bytes, self.lease.clone()));
+        }
+    }
+}
 const ERROR_TEXT: u64 = 0x7fff00000000;
 // Disjoint from the 128-byte ERROR_TEXT buffer. Owned per executor; future
 // multi-thread guest execution will need per-guest-thread network errno slots.
 const NET_ERRNO: u64 = 0x7fff00000100;
 const LOCALE_NAME: u64 = 0x7fff00000200;
 pub const MAIN_GUEST_THREAD: u64 = 1;
+fn semaphore_storage_owned(
+    memory: &Memory<'_>,
+    address: u64,
+    images: &[(u64, usize)],
+    stacks: &[StackIdentity],
+) -> Result<bool> {
+    let length = crate::guest_semaphore::SIZE;
+    let end = address
+        .checked_add(length as u64)
+        .ok_or("Semaphore storage overflow")?;
+    if memory.owned_allocation_contains(address, length)
+        || images
+            .iter()
+            .any(|&(base, size)| address >= base && end <= base + size as u64)
+    {
+        return Ok(true);
+    }
+    let backing = memory.read(address, length)?.as_ptr() as usize;
+    Ok(stacks.iter().any(|s| {
+        s.lease.strong_count() != 0
+            && address >= s.address
+            && end <= s.address + s.length as u64
+            && backing == s.backing + (address - s.address) as usize
+    }))
+}
+fn guard_semaphore_plan(
+    memory: &Memory<'_>,
+    plan: &crate::guest_semaphore::Plan,
+    value_output: Option<u64>,
+    errno: u64,
+    sp: u64,
+    ret: u64,
+) -> Result<()> {
+    use crate::guest_semaphore::Outcome;
+    if memory.load(sp, 8)? != ret {
+        return Err("Semaphore return frame changed".into());
+    }
+    if let Some((address, length)) = plan.write_range() {
+        validate_net_output(memory, address, length, sp, ret)?;
+        memory.validate_write(address, length)?;
+    }
+    let output = match plan.outcome() {
+        Outcome::Errno(_) => Some(errno),
+        Outcome::Value(_) => value_output,
+        _ => None,
+    };
+    if let Some(output) = output {
+        validate_net_output(memory, output, 4, sp, ret)?;
+        memory.validate_write(output, 4)?;
+        if let Some((address, length)) = plan.object_range() {
+            if output < address + length as u64 && address < output + 4 {
+                return Err("Semaphore output aliases its inline object".into());
+            }
+        }
+    }
+    Ok(())
+}
+fn finish_semaphore_outcome(
+    memory: &mut Memory<'_>,
+    outcome: crate::guest_semaphore::Outcome,
+    output: Option<u64>,
+    errno: u64,
+) -> Result<Option<u64>> {
+    use crate::guest_semaphore::Outcome;
+    match outcome {
+        Outcome::Success => Ok(Some(0)),
+        Outcome::Value(value) => {
+            memory.store(
+                output.ok_or("Missing semaphore value output")?,
+                value.into(),
+                4,
+            )?;
+            Ok(Some(0))
+        }
+        Outcome::Errno(error) => {
+            memory.store(errno, error.into(), 4)?;
+            Ok(Some(u32::MAX as u64))
+        }
+        Outcome::Pending(_) => Ok(None),
+    }
+}
 fn validate_net_output(
     memory: &Memory<'_>,
     output: u64,
@@ -104,6 +233,140 @@ pub const MEMORY_FIXTURE_CODE: &[u8] = &[
 mod equeue_return_tests {
     use super::*;
     #[test]
+    fn consuming_bad_resume_retains_all_pending_stack_backings() {
+        fn pending(native: &mut NativeExecutor, address: u64, thread: u64) -> Continuation {
+            let mut stack = vec![0; 4096];
+            let mut memory = Memory::default();
+            memory.add(address, &mut stack, true, false).unwrap();
+            let p = native.semaphores.init(&memory, address, 0, 0).unwrap();
+            native.semaphores.commit(&mut memory, p).unwrap();
+            let p = native
+                .semaphores
+                .wait(&memory, address, thread, 0, || panic!("untimed"))
+                .unwrap();
+            assert!(matches!(
+                native.semaphores.commit(&mut memory, p).unwrap(),
+                crate::guest_semaphore::Outcome::Pending(_)
+            ));
+            drop(memory);
+            let stack_lease = Rc::new(());
+            native
+                .register_stack(address, &stack, &stack_lease)
+                .unwrap();
+            Continuation {
+                stack_lease,
+                quantum: None,
+                return_convention: ReturnConvention::WorkerPointer,
+                guest_thread: thread,
+                cpu: Cpu::default(),
+                stack,
+                stack_address: address,
+                remaining: 10,
+                caller_bias: 0x100000,
+            }
+        }
+        let mut native = NativeExecutor::new(0x900000, 4096, 100, 100).unwrap();
+        let first = pending(&mut native, 0x900000, 1);
+        let second = pending(&mut native, 0x901000, 2);
+        let pointers = [
+            first.stack.as_ptr() as usize,
+            second.stack.as_ptr() as usize,
+        ];
+        let mut wrong = Image::load(&memory_fixture(), 0x200000, 65536).unwrap();
+        assert!(native
+            .resume_with_data(&mut wrong, &mut [], first, 0, &mut [])
+            .err()
+            .unwrap()
+            .contains("different mappings"));
+        assert!(native
+            .resume_with_data(&mut wrong, &mut [], second, 0, &mut [])
+            .err()
+            .unwrap()
+            .contains("fault pinned"));
+        assert_eq!(native.semaphores.pending_count(), 2);
+        let held = native.fault_stack.borrow();
+        assert_eq!(held.len(), 2);
+        for (i, (_, bytes, _)) in held.iter().enumerate() {
+            assert_eq!(bytes.as_ptr() as usize, pointers[i]);
+            assert_eq!(&bytes[..4], &crate::guest_semaphore::MAGIC.to_le_bytes());
+        }
+    }
+    #[test]
+    fn pending_semaphore_provenance_tracks_live_backing_not_equal_bytes() {
+        let mut owned = crate::guest_memory::OwnedMappings::default();
+        let mut native = NativeExecutor::new(0x900000, 4096, 100, 100).unwrap();
+        let lease = Rc::new(());
+        let mut real = vec![0; 64];
+        native.register_stack(0x1000, &real, &lease).unwrap();
+        let mut copy = real.clone();
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut copy, true, false).unwrap();
+        assert!(!semaphore_storage_owned(&memory, 0x1010, &[], &native.stack_identities).unwrap());
+        drop(memory);
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut real, true, false).unwrap();
+        assert!(semaphore_storage_owned(&memory, 0x1010, &[], &native.stack_identities).unwrap());
+        drop(lease);
+        assert!(!semaphore_storage_owned(&memory, 0x1010, &[], &native.stack_identities).unwrap());
+        memory.attach_owned(&mut owned).unwrap();
+        let heap = memory.malloc(32).unwrap();
+        assert!(
+            semaphore_storage_owned(&memory, heap + 16, &[], &native.stack_identities).unwrap()
+        );
+        assert!(!memory.owned_allocation_contains(heap + 17, 16));
+        drop(memory);
+    }
+    #[test]
+    fn pending_stack_error_retains_actual_bytes_but_suspension_transfers_them() {
+        let fault = Rc::new(RefCell::new(Vec::new()));
+        let pending = Rc::new(Cell::new(false));
+        {
+            let mut stack = ExecutionStack {
+                lease: Rc::new(()),
+                bytes: vec![0; 64],
+                address: 0x9000,
+                pending: pending.clone(),
+                fault: fault.clone(),
+            };
+            stack[17] = 0xab;
+            pending.set(true); // a guest wait committed while this stack was mapped
+        }
+        let (address, bytes, lease) = fault.borrow_mut().pop().unwrap();
+        assert_eq!(address, 0x9000);
+        assert_eq!(bytes[17], 0xab);
+        let mut stack = ExecutionStack {
+            lease,
+            bytes,
+            address,
+            pending,
+            fault: fault.clone(),
+        };
+        let transferred = stack.take();
+        drop(stack);
+        assert!(fault.borrow().is_empty());
+        assert_eq!(transferred[17], 0xab);
+    }
+    #[test]
+    fn semaphore_output_guards_precede_state_and_errno_commit() {
+        use crate::guest_semaphore::{GuestSemaphore, Outcome};
+        let mut bytes = [0; 128];
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut bytes, true, false).unwrap();
+        memory.store(0x1060, 0x4000, 8).unwrap();
+        let mut semaphores = GuestSemaphore::default();
+        let init = semaphores.init(&memory, 0x1000, 0, 0).unwrap();
+        semaphores.commit(&mut memory, init).unwrap();
+        let plan = semaphores.getvalue(&memory, 0x1000).unwrap();
+        assert!(
+            guard_semaphore_plan(&memory, &plan, Some(0x100d), 0x1050, 0x1060, 0x4000).is_err()
+        );
+        let plan = semaphores.trywait(&memory, 0x1000).unwrap();
+        assert!(matches!(plan.outcome(), Outcome::Errno(35)));
+        assert!(guard_semaphore_plan(&memory, &plan, None, 0x1060, 0x1060, 0x4000).is_err());
+        assert_eq!(memory.load(0x1060, 8).unwrap(), 0x4000);
+        assert_eq!(memory.load(0x1004, 4).unwrap(), 0);
+    }
+    #[test]
     fn network_outputs_cannot_overwrite_or_wrap_return_frame() {
         let mut bytes = [0xa5; 128];
         let mut memory = Memory::default();
@@ -184,10 +447,14 @@ mod equeue_return_tests {
             assert_eq!(memory.read(0x2000, 512).unwrap(), before);
         }
         memory.store(0x2080, 0x2000, 8).unwrap();
-        assert!(
-            validate_equeue_return(&memory, (0x2000, 1, 0x2040), (0x2080, 0x2000), false, true)
-                .is_err()
-        );
+        assert!(validate_equeue_return(
+            &memory,
+            (0x2000, 1, 0x2040),
+            (0x2080, 0x2000),
+            false,
+            true
+        )
+        .is_err());
         assert_eq!(queues.pending_count(handle).unwrap(), 1);
         memory.store(0x2080, 0x4000, 8).unwrap();
         // Adjacent outputs are allowed, and a genuine registered return permits
@@ -360,7 +627,15 @@ pub enum Service {
     Gettimeofday,
     File(crate::stdio_file::Operation),
     Fstat,
+    Stat,
     Nanosleep,
+    SemInit,
+    SemDestroy,
+    SemPost,
+    SemGetValue,
+    SemTryWait,
+    SemWait,
+    SemTimedWait,
     Malloc,
     Realloc,
     Calloc,
@@ -518,7 +793,15 @@ impl Service {
             | Self::Gettimeofday
             | Self::File(_)
             | Self::Fstat
+            | Self::Stat
             | Self::Nanosleep
+            | Self::SemInit
+            | Self::SemDestroy
+            | Self::SemPost
+            | Self::SemGetValue
+            | Self::SemTryWait
+            | Self::SemWait
+            | Self::SemTimedWait
             | Self::ThreadSigmask
             | Self::ThreadSetCancelType
             | Self::ThreadGetschedparam
@@ -630,6 +913,7 @@ impl ReturnConvention {
     }
 }
 pub struct Continuation {
+    stack_lease: Rc<()>,
     quantum: Option<u64>,
     return_convention: ReturnConvention,
     guest_thread: u64,
@@ -811,8 +1095,14 @@ impl QuantumYield {
             .stack_region())
     }
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum ThreadOperation {
+    SemaphoreWait {
+        ticket: crate::guest_semaphore::WaitTicket,
+        return_sp: u64,
+        return_address: u64,
+        errno: u64,
+    },
     Sleep {
         deadline: crate::guest_sleep::Deadline,
     },
@@ -858,7 +1148,7 @@ impl ThreadRequest {
             .stack_region())
     }
     pub fn operation(&self) -> ThreadOperation {
-        self.operation
+        self.operation.clone()
     }
     pub fn guest_thread_id(&self) -> Option<u64> {
         self.continuation.as_ref().map(|c| c.guest_thread)
@@ -979,6 +1269,8 @@ pub struct NativeExecutor {
     exit_request: Option<ExitRequest>,
     // Kept owned for future cleanup and diagnostics; never an ordinary resumable call.
     exit_context: Option<Box<Continuation>>,
+    fault_stack: FaultStack,
+    stack_identities: Vec<StackIdentity>,
     pub user_service: crate::user_service::UserService,
     pub pad: crate::pad::Pad,
     pub keyboard: crate::keyboard::Keyboard,
@@ -988,6 +1280,7 @@ pub struct NativeExecutor {
     network_errno: [u8; 4],
     pub locale: crate::guest_locale::GuestLocale,
     pub guest_time: crate::guest_time::GuestTime,
+    pub semaphores: crate::guest_semaphore::GuestSemaphore,
     sleep_clock: crate::guest_sleep::Clock,
     pub stdout: crate::captured_stdout::CapturedStdout,
     pub stdio: crate::guest_stdio::GuestStdio,
@@ -1022,6 +1315,161 @@ pub struct NativeExecutor {
     stack_size: usize,
 }
 impl NativeExecutor {
+    fn register_stack(&mut self, address: u64, bytes: &[u8], lease: &Rc<()>) -> Result<()> {
+        self.stack_identities
+            .retain(|s| s.lease.strong_count() != 0);
+        if let Some(existing) = self
+            .stack_identities
+            .iter()
+            .find(|s| Weak::ptr_eq(&s.lease, &Rc::downgrade(lease)))
+        {
+            if existing.address != address
+                || existing.length != bytes.len()
+                || existing.backing != bytes.as_ptr() as usize
+            {
+                return Err("Retained stack backing changed".into());
+            }
+            return Ok(());
+        }
+        if self.stack_identities.len() >= 128 {
+            return Err("Retained stack identity limit".into());
+        }
+        self.stack_identities
+            .try_reserve(1)
+            .map_err(|_| "Cannot reserve stack identity")?;
+        self.stack_identities.push(StackIdentity {
+            address,
+            length: bytes.len(),
+            backing: bytes.as_ptr() as usize,
+            lease: Rc::downgrade(lease),
+        });
+        Ok(())
+    }
+    fn protect_stack(&self, address: u64, bytes: Vec<u8>, lease: Rc<()>) -> ExecutionStack {
+        let pending = Rc::new(Cell::new(
+            self.semaphores.has_pending_overlap(address, bytes.len()),
+        ));
+        ExecutionStack {
+            lease,
+            bytes,
+            address,
+            pending,
+            fault: self.fault_stack.clone(),
+        }
+    }
+    pub fn semaphore_realtime(&self) -> Result<crate::guest_semaphore::Realtime> {
+        let (seconds, nanoseconds) = self.guest_time.realtime_parts()?;
+        Ok(crate::guest_semaphore::Realtime {
+            seconds,
+            nanoseconds,
+        })
+    }
+    /// Retry a retained semaphore service without executing or charging another
+    /// guest instruction. Guard failures retain both ticket and continuation.
+    pub fn resume_semaphore_request(
+        &mut self,
+        request: &mut ThreadRequest,
+        image: &mut Image,
+        dependencies: &mut [&mut Image],
+        data: &mut [DataRegion<'_>],
+    ) -> Result<Option<u64>> {
+        self.resume_semaphore_at(request, image, dependencies, data, None)
+    }
+    pub(crate) fn resume_semaphore_at(
+        &mut self,
+        request: &mut ThreadRequest,
+        image: &mut Image,
+        dependencies: &mut [&mut Image],
+        data: &mut [DataRegion<'_>],
+        sampled: Option<crate::guest_semaphore::Realtime>,
+    ) -> Result<Option<u64>> {
+        self.require_running()?;
+        let thread = request
+            .guest_thread_id()
+            .ok_or("Consumed semaphore request")?;
+        if !request.belongs_to(self)
+            || thread != self.selected_guest_thread
+            || !self.tls.contains_thread(thread)
+        {
+            return Err("Foreign or retired semaphore request".into());
+        }
+        let ThreadOperation::SemaphoreWait {
+            ticket,
+            return_sp,
+            return_address,
+            errno,
+        } = request.operation()
+        else {
+            return Err("Not a pending semaphore request".into());
+        };
+        let now = if self.semaphores.needs_realtime(&ticket, thread)? {
+            Some(match sampled {
+                Some(now) => now,
+                None => self.semaphore_realtime()?,
+            })
+        } else {
+            None
+        };
+        if !self.semaphores.ready(&ticket, thread, now)? {
+            return Ok(None);
+        }
+        let saved = request
+            .continuation
+            .as_ref()
+            .ok_or("Consumed semaphore request")?;
+        if saved.caller_bias != image.bias {
+            return Err("Semaphore request belongs to different image".into());
+        }
+        let terminal = saved.cpu.stop == 3;
+        let target = if terminal {
+            if return_address != u64::MAX
+                || return_sp != saved.stack_address + saved.stack.len() as u64 - 8
+                || saved.cpu.registers[4] != return_sp
+            {
+                return Err("Semaphore terminal return changed".into());
+            }
+            None
+        } else {
+            if saved.cpu.bias.checked_add(saved.cpu.next_rip) != Some(return_address)
+                || return_sp.checked_add(8) != Some(saved.cpu.registers[4])
+            {
+                return Err("Semaphore return target changed".into());
+            }
+            let block = self
+                .image_blocks
+                .get(&(saved.cpu.bias, saved.cpu.next_rip))
+                .or_else(|| self.blocks.get(&saved.cpu.next_rip))
+                .ok_or("Semaphore return target no longer registered")?;
+            Some((
+                saved
+                    .cpu
+                    .bias
+                    .checked_add(block.start)
+                    .ok_or("Semaphore return code overflow")?,
+                block.bytes.clone(),
+            ))
+        };
+        let mut semaphores = std::mem::take(&mut self.semaphores);
+        let result =
+            self.with_thread_request_memory(request, image, dependencies, data, |memory| {
+                if let Some((source, bytes)) = &target {
+                    if !memory.executable(return_address)
+                        || memory.read(*source, bytes.len())? != &**bytes
+                    {
+                        return Err("Semaphore return code changed before acquisition".into());
+                    }
+                }
+                let plan = semaphores.resume(memory, &ticket, thread, now)?;
+                guard_semaphore_plan(memory, &plan, None, errno, return_sp, return_address)?;
+                let outcome = semaphores.commit(memory, plan)?;
+                finish_semaphore_outcome(memory, outcome, None, errno)
+            });
+        self.semaphores = semaphores;
+        if let Ok(Some(value)) = result {
+            request.complete(value);
+        }
+        result
+    }
     pub fn configure_manual_sleep_clock(&mut self, now: u128) -> Result<()> {
         self.sleep_clock.configure_manual(now)
     }
@@ -1152,9 +1600,12 @@ impl NativeExecutor {
         };
         cpu.registers[4] = address + stack_size - 8;
         cpu.registers[7] = argument;
+        let stack_lease = Rc::new(());
+        self.register_stack(address, &stack, &stack_lease)?;
         Ok(QuantumYield {
             owner: self.mutex_wait_owner.clone(),
             continuation: Some(Continuation {
+                stack_lease,
                 quantum: self.worker_quantum,
                 return_convention: ReturnConvention::WorkerPointer,
                 guest_thread: thread,
@@ -1237,6 +1688,12 @@ impl NativeExecutor {
         self.exit_context.as_ref().map(|context| context.cpu.fuel)
     }
     pub(crate) fn require_running(&self) -> Result<()> {
+        if !self.fault_stack.borrow().is_empty() {
+            return Err(
+                "Guest stack retirement blocked by a pending semaphore; process fault pinned"
+                    .into(),
+            );
+        }
         if let Some(request) = self.exit_request {
             return Err(format!(
                 "Guest exit requested ({:?}, status {}); cleanup remains pending",
@@ -1309,11 +1766,12 @@ impl NativeExecutor {
                 writable: false,
             });
         }
-        if self
-            .services
-            .values()
-            .any(|service| matches!(service, Service::Fprintf | Service::Fflush | Service::File(_)))
-        {
+        if self.services.values().any(|service| {
+            matches!(
+                service,
+                Service::Fprintf | Service::Fflush | Service::File(_)
+            )
+        }) {
             mapped_data.push(DataRegion {
                 address: crate::guest_stdio::FILE_ADDR,
                 bytes: &mut self.stderr_file,
@@ -1325,8 +1783,16 @@ impl NativeExecutor {
                 writable: false,
             });
         }
-        if self.services.values().any(|service| matches!(service, Service::File(_))) {
-            mapped_data.push(DataRegion { address: crate::stdio_file::BASE, bytes: &mut self.file_metadata, writable: true });
+        if self
+            .services
+            .values()
+            .any(|service| matches!(service, Service::File(_)))
+        {
+            mapped_data.push(DataRegion {
+                address: crate::stdio_file::BASE,
+                bytes: &mut self.file_metadata,
+                writable: true,
+            });
         }
         continuation.with_memory_context(
             image,
@@ -1624,6 +2090,8 @@ impl NativeExecutor {
             selected_guest_thread: MAIN_GUEST_THREAD,
             exit_request: None,
             exit_context: None,
+            fault_stack: Rc::new(RefCell::new(Vec::new())),
+            stack_identities: Vec::new(),
             user_service: crate::user_service::UserService::default(),
             pad: crate::pad::Pad::default(),
             audio: crate::audio_out::AudioOut::new(crate::audio_queue::AudioQueueBackend),
@@ -1635,6 +2103,7 @@ impl NativeExecutor {
             network_errno: [0; 4],
             locale: crate::guest_locale::GuestLocale::default(),
             guest_time: crate::guest_time::GuestTime::default(),
+            semaphores: crate::guest_semaphore::GuestSemaphore::default(),
             sleep_clock: crate::guest_sleep::Clock::default(),
             stdout: crate::captured_stdout::CapturedStdout::default(),
             stdio: crate::guest_stdio::GuestStdio::default(),
@@ -1830,10 +2299,15 @@ impl NativeExecutor {
         result: u64,
         data: &mut [DataRegion<'_>],
     ) -> Result<Execution> {
+        let mut retained = self.protect_stack(
+            continuation.stack_address,
+            std::mem::take(&mut continuation.stack),
+            continuation.stack_lease.clone(),
+        );
         self.require_running()?;
         if continuation.caller_bias != image.bias
             || continuation.stack_address < self.stack_address
-            || continuation.stack.len() != self.stack_size
+            || retained.len() != self.stack_size
             || (continuation.stack_address - self.stack_address) % self.stack_size as u64 != 0
         {
             return Err("Continuation belongs to different mappings".into());
@@ -1843,6 +2317,7 @@ impl NativeExecutor {
             continuation.cpu.rip = continuation.cpu.next_rip;
             continuation.cpu.stop = 0;
         }
+        continuation.stack = retained.take();
         self.execute_flow(
             image,
             0,
@@ -2008,7 +2483,17 @@ impl NativeExecutor {
         mut continuation: Option<Continuation>,
         data: &mut [DataRegion<'_>],
     ) -> Result<Execution> {
+        let mut retained = continuation.as_mut().map(|saved| {
+            self.protect_stack(
+                saved.stack_address,
+                std::mem::take(&mut saved.stack),
+                saved.stack_lease.clone(),
+            )
+        });
         self.require_running()?;
+        if let (Some(saved), Some(retained)) = (continuation.as_mut(), retained.as_mut()) {
+            saved.stack = retained.take();
+        }
         let quantum = continuation.as_ref().map(|c| c.quantum).unwrap_or_else(|| {
             if matches!(entry.2, ReturnConvention::WorkerPointer) {
                 self.worker_quantum
@@ -2039,6 +2524,11 @@ impl NativeExecutor {
                 } => {
                     // All borrowed mappings are gone. Guest addresses stay fixed;
                     // no host reference survives the owned arena mutation.
+                    let mut retained = self.protect_stack(
+                        saved.stack_address,
+                        std::mem::take(&mut saved.stack),
+                        saved.stack_lease.clone(),
+                    );
                     let result = if let Some(mut environment) = imported {
                         let result = environment.set(&name, &value, overwrite);
                         if result.is_ok() {
@@ -2058,16 +2548,22 @@ impl NativeExecutor {
                     saved.cpu.registers[0] = if result.is_ok() { 0 } else { u32::MAX as u64 };
                     environment_completion =
                         Some((errno, result.err().map(|e| e.errno()), terminal));
+                    saved.stack = retained.take();
                     continuation = Some(*saved);
                 }
                 Flow::TranslationMiss {
                     bias,
                     target,
-                    continuation: saved,
+                    continuation: mut saved,
                 } => {
                     // execute_step dropped every borrowed mapping before yielding;
                     // compilation cannot hold a stale guest/stack pointer or invoke
                     // an old native block while its library is being replaced.
+                    let mut retained = self.protect_stack(
+                        saved.stack_address,
+                        std::mem::take(&mut saved.stack),
+                        saved.stack_lease.clone(),
+                    );
                     let source = self
                         .translation_sources
                         .get(&bias)
@@ -2091,6 +2587,7 @@ impl NativeExecutor {
                     })?;
                     // Unlike a host-service resume, do not replace RAX, consume a
                     // return frame or advance RIP. Retry the exact saved phase.
+                    saved.stack = retained.take();
                     continuation = Some(*saved);
                 }
             }
@@ -2108,54 +2605,78 @@ impl NativeExecutor {
         let (continuation, environment_completion) = resume;
         let (address, arguments, initial_convention) = entry;
         let caller_bias = image.bias;
-        let (saved_cpu, mut stack, remaining, stack_address, guest_thread, return_convention) =
-            match continuation {
-                Some(state) => (
-                    Some(state.cpu),
-                    state.stack,
-                    state.remaining,
-                    state.stack_address,
-                    state.guest_thread,
-                    state.return_convention,
-                ),
-                None => {
-                    let mut candidate = self.stack_address;
-                    let mut selected = None;
-                    for _ in 0..128 {
-                        let end = candidate
-                            .checked_add(self.stack_size as u64)
-                            .ok_or("Guest stack address overflow")?;
-                        let mut overlap = false;
-                        for region in data.iter() {
-                            let region_end = region
-                                .address
-                                .checked_add(region.bytes.len() as u64)
-                                .ok_or("Guest data mapping overflow")?;
-                            overlap |= candidate < region_end && region.address < end;
-                        }
-                        if !overlap {
-                            selected = Some(candidate);
-                            break;
-                        }
-                        candidate = end;
+        let (
+            saved_cpu,
+            stack,
+            remaining,
+            stack_address,
+            guest_thread,
+            return_convention,
+            stack_lease,
+        ) = match continuation {
+            Some(state) => (
+                Some(state.cpu),
+                state.stack,
+                state.remaining,
+                state.stack_address,
+                state.guest_thread,
+                state.return_convention,
+                state.stack_lease,
+            ),
+            None => {
+                let mut candidate = self.stack_address;
+                let mut selected = None;
+                for _ in 0..128 {
+                    let end = candidate
+                        .checked_add(self.stack_size as u64)
+                        .ok_or("Guest stack address overflow")?;
+                    let mut overlap = false;
+                    for region in data.iter() {
+                        let region_end = region
+                            .address
+                            .checked_add(region.bytes.len() as u64)
+                            .ok_or("Guest data mapping overflow")?;
+                        overlap |= candidate < region_end && region.address < end;
                     }
-                    (
-                        None,
-                        vec![0; self.stack_size],
-                        self.transitions,
-                        selected.ok_or("Guest stack slots exhausted")?,
-                        self.selected_guest_thread,
-                        initial_convention,
-                    )
+                    if !overlap {
+                        selected = Some(candidate);
+                        break;
+                    }
+                    candidate = end;
                 }
-            };
+                (
+                    None,
+                    vec![0; self.stack_size],
+                    self.transitions,
+                    selected.ok_or("Guest stack slots exhausted")?,
+                    self.selected_guest_thread,
+                    initial_convention,
+                    Rc::new(()),
+                )
+            }
+        };
+        let stack_length = stack.len();
+        let pending_stack = Rc::new(Cell::new(
+            self.semaphores
+                .has_pending_overlap(stack_address, stack_length),
+        ));
+        let mut stack = ExecutionStack {
+            lease: stack_lease.clone(),
+            bytes: stack,
+            address: stack_address,
+            pending: pending_stack.clone(),
+            fault: self.fault_stack.clone(),
+        };
+        self.register_stack(stack_address, &stack, &stack_lease)?;
         if !self.tls.contains_thread(guest_thread) {
             return Err("Guest execution thread identity is not registered".into());
         }
         let top = stack_address + stack.len() as u64 - 8;
         let mut ranges = Vec::new();
+        let mut image_storage = Vec::new();
         for mapped in std::iter::once(&*image).chain(dependencies.iter().map(|i| &**i)) {
             for segment in &mapped.segments {
+                image_storage.push((segment.address, segment.bytes.len()));
                 if segment.flags & 1 != 0 {
                     ranges.push((
                         segment.address,
@@ -2233,11 +2754,12 @@ impl NativeExecutor {
         {
             memory.add_service_data(LOCALE_NAME, &mut self.locale_name)?;
         }
-        if self
-            .services
-            .values()
-            .any(|service| matches!(service, Service::Fprintf | Service::Fflush | Service::File(_)))
-        {
+        if self.services.values().any(|service| {
+            matches!(
+                service,
+                Service::Fprintf | Service::Fflush | Service::File(_)
+            )
+        }) {
             memory.add(
                 crate::guest_stdio::FILE_ADDR,
                 &mut self.stderr_file,
@@ -2249,8 +2771,17 @@ impl NativeExecutor {
                 &mut self.stderr_pointer,
             )?;
         }
-        if self.services.values().any(|service| matches!(service, Service::File(_))) {
-            memory.add(crate::stdio_file::BASE, &mut self.file_metadata, true, false)?;
+        if self
+            .services
+            .values()
+            .any(|service| matches!(service, Service::File(_)))
+        {
+            memory.add(
+                crate::stdio_file::BASE,
+                &mut self.file_metadata,
+                true,
+                false,
+            )?;
         }
         for &address in self.services.keys() {
             memory.reserve_service(address);
@@ -2279,14 +2810,24 @@ impl NativeExecutor {
             cpu.registers[6] = arguments.pointer;
             cpu
         };
+        macro_rules! completed {
+            ($value:expr) => {{
+                let value = $value;
+                drop(memory);
+                let pinned = self.semaphores.has_pending_overlap(stack_address, stack.len());
+                if pinned {
+                    pending_stack.set(true);
+                    return Err("Guest returned while its stack contains a pending semaphore; process fault pinned".into());
+                }
+                return Ok(Flow::Finished(return_convention.completed(value)));
+            }};
+        }
         if let Some((errno, error, terminal)) = environment_completion {
             if let Some(error) = error {
                 memory.store(errno, error as u64, 4)?;
             }
             if terminal {
-                return Ok(Flow::Finished(
-                    return_convention.completed(cpu.registers[0]),
-                ));
+                completed!(cpu.registers[0]);
             }
         }
         for transition in 0..remaining {
@@ -2298,9 +2839,7 @@ impl NativeExecutor {
                     ));
                 }
                 if cpu.stop == 3 && cpu.registers[4] == top && memory.load(top, 8)? == u64::MAX {
-                    return Ok(Flow::Finished(
-                        return_convention.completed(cpu.registers[0]),
-                    ));
+                    completed!(cpu.registers[0]);
                 }
                 if cpu.fuel == 0 {
                     return Err("Module fuel exhausted".into());
@@ -2311,11 +2850,12 @@ impl NativeExecutor {
                     QuantumYield {
                         owner: self.mutex_wait_owner.clone(),
                         continuation: Some(Continuation {
+                            stack_lease: stack_lease.clone(),
                             quantum: slice.0,
                             return_convention,
                             guest_thread,
                             cpu,
-                            stack,
+                            stack: stack.take(),
                             stack_address,
                             remaining: remaining - transition,
                             caller_bias,
@@ -2342,11 +2882,12 @@ impl NativeExecutor {
                             bias: missing_bias,
                             target: missing_target,
                             continuation: Box::new(Continuation {
+                                stack_lease: stack_lease.clone(),
                                 quantum: slice.0,
                                 return_convention,
                                 guest_thread,
                                 cpu,
-                                stack,
+                                stack: stack.take(),
                                 stack_address,
                                 remaining: remaining - transition - 1,
                                 caller_bias,
@@ -2364,9 +2905,7 @@ impl NativeExecutor {
             if cpu.stop == 3 {
                 let target = memory.load(cpu.registers[4], 8)?;
                 if target == u64::MAX && cpu.registers[4] == top {
-                    return Ok(Flow::Finished(
-                        return_convention.completed(cpu.registers[0]),
-                    ));
+                    completed!(cpu.registers[0]);
                 }
                 if !memory.executable(target) {
                     return Err("Invalid guest return target".into());
@@ -2404,11 +2943,12 @@ impl NativeExecutor {
                         self.consumed_instruction_fuel += 1;
                         drop(memory);
                         self.exit_context = Some(Box::new(Continuation {
+                            stack_lease: stack_lease.clone(),
                             quantum: slice.0,
                             return_convention,
                             guest_thread,
                             cpu,
-                            stack,
+                            stack: stack.take(),
                             stack_address,
                             remaining: remaining - transition - 1,
                             caller_bias,
@@ -2452,6 +2992,111 @@ impl NativeExecutor {
                     cpu.registers[4] = sp;
                     cpu.fuel -= 1;
                     self.consumed_instruction_fuel += 1;
+                    let mut semaphore_value = None;
+                    if matches!(
+                        service,
+                        Service::SemInit
+                            | Service::SemDestroy
+                            | Service::SemPost
+                            | Service::SemGetValue
+                            | Service::SemTryWait
+                            | Service::SemWait
+                            | Service::SemTimedWait
+                    ) {
+                        let address = cpu.registers[7];
+                        let plan = match service {
+                            Service::SemInit => self.semaphores.init(
+                                &memory,
+                                address,
+                                cpu.registers[6] as i32,
+                                cpu.registers[2] as u32,
+                            )?,
+                            Service::SemDestroy => self.semaphores.destroy(&memory, address)?,
+                            Service::SemPost => self.semaphores.post(&memory, address)?,
+                            Service::SemGetValue => self.semaphores.getvalue(&memory, address)?,
+                            Service::SemTryWait => self.semaphores.trywait(&memory, address)?,
+                            _ => self.semaphores.wait(
+                                &memory,
+                                address,
+                                guest_thread,
+                                if matches!(service, Service::SemTimedWait) {
+                                    cpu.registers[6]
+                                } else {
+                                    0
+                                },
+                                || {
+                                    let (seconds, nanoseconds) =
+                                        self.guest_time.realtime_parts()?;
+                                    Ok(crate::guest_semaphore::Realtime {
+                                        seconds,
+                                        nanoseconds,
+                                    })
+                                },
+                            )?,
+                        };
+                        let errno = self
+                            .kernel
+                            .as_ref()
+                            .ok_or("Missing semaphore errno context")?
+                            .errno_address();
+                        let output =
+                            matches!(service, Service::SemGetValue).then_some(cpu.registers[6]);
+                        guard_semaphore_plan(&memory, &plan, output, errno, sp, ret)?;
+                        // Allocate retained ownership before committing HAS_WAITERS
+                        // or a ticket. No fallible handoff follows the commit.
+                        let pending = if let crate::guest_semaphore::Outcome::Pending(ticket) =
+                            plan.outcome()
+                        {
+                            if !semaphore_storage_owned(
+                                &memory,
+                                address,
+                                &image_storage,
+                                &self.stack_identities,
+                            )? {
+                                return Err("Blocking semaphore requires owned allocation, live image, or retained stack backing".into());
+                            }
+                            Some(Box::new(ThreadRequest {
+                                owner: self.mutex_wait_owner.clone(),
+                                continuation: None,
+                                operation: ThreadOperation::SemaphoreWait {
+                                    ticket: ticket.clone(),
+                                    return_sp: sp,
+                                    return_address: ret,
+                                    errno,
+                                },
+                            }))
+                        } else {
+                            None
+                        };
+                        let outcome = self.semaphores.commit(&mut memory, plan)?;
+                        pending_stack.set(
+                            self.semaphores
+                                .has_pending_overlap(stack_address, stack_length),
+                        );
+                        if let Some(mut request) = pending {
+                            if terminal {
+                                cpu.stop = 3;
+                            } else {
+                                cpu.registers[4] = sp + 8;
+                            }
+                            cpu.memory = 0;
+                            drop(memory);
+                            request.continuation = Some(Continuation {
+                                stack_lease: stack_lease.clone(),
+                                quantum: slice.0,
+                                return_convention,
+                                guest_thread,
+                                cpu,
+                                stack: stack.take(),
+                                stack_address,
+                                remaining: remaining - transition - 1,
+                                caller_bias,
+                            });
+                            return Ok(Flow::Finished(Execution::ThreadRequest(request)));
+                        }
+                        semaphore_value =
+                            finish_semaphore_outcome(&mut memory, outcome, output, errno)?;
+                    }
                     let sleep_request = if matches!(service, Service::Nanosleep) {
                         Some(crate::guest_sleep::Request::decode(
                             &memory,
@@ -2528,11 +3173,12 @@ impl NativeExecutor {
                                 owner: self.mutex_wait_owner.clone(),
                                 operation,
                                 continuation: Some(Continuation {
+                                    stack_lease: stack_lease.clone(),
                                     quantum: slice.0,
                                     return_convention,
                                     guest_thread,
                                     cpu,
-                                    stack,
+                                    stack: stack.take(),
                                     stack_address,
                                     remaining: remaining - transition - 1,
                                     caller_bias,
@@ -2558,11 +3204,12 @@ impl NativeExecutor {
                         let arguments = [7, 6, 2, 1, 8, 9].map(|i| cpu.registers[i]);
                         drop(memory);
                         let continuation = Box::new(Continuation {
+                            stack_lease: stack_lease.clone(),
                             quantum: slice.0,
                             return_convention,
                             guest_thread,
                             cpu,
-                            stack,
+                            stack: stack.take(),
                             stack_address,
                             remaining: remaining - transition - 1,
                             caller_bias,
@@ -2591,7 +3238,9 @@ impl NativeExecutor {
                             },
                         ));
                     }
-                    let value = if matches!(service, Service::ThreadSelf) {
+                    let value = if let Some(value) = semaphore_value {
+                        value
+                    } else if matches!(service, Service::ThreadSelf) {
                         guest_thread
                     } else if matches!(
                         service,
@@ -2743,6 +3392,18 @@ impl NativeExecutor {
                     } else if matches!(service, Service::Getpid | Service::Syscall) {
                         let direct = matches!(service, Service::Getpid);
                         let number = if direct { 20 } else { cpu.registers[0] };
+                        if number == 73 {
+                            if let Ok(length) =
+                                memory.anonymous_release_size(cpu.registers[7], cpu.registers[6])
+                            {
+                                if self
+                                    .semaphores
+                                    .has_pending_overlap(cpu.registers[7], length)
+                                {
+                                    return Err("Cannot munmap a pending semaphore object".into());
+                                }
+                            }
+                        }
                         if number != 20 && self.kernel.is_none() {
                             return Err(format!(
                                 "Unsupported Rust kernel syscall {number} at {:#x}",
@@ -2863,11 +3524,12 @@ impl NativeExecutor {
                                             MutexWait {
                                                 owner: self.mutex_wait_owner.clone(),
                                                 continuation: Some(Continuation {
+                                                    stack_lease: stack_lease.clone(),
                                                     quantum: slice.0,
                                                     return_convention,
                                                     guest_thread,
                                                     cpu,
-                                                    stack,
+                                                    stack: stack.take(),
                                                     stack_address,
                                                     remaining: remaining - transition - 1,
                                                     caller_bias,
@@ -2923,12 +3585,21 @@ impl NativeExecutor {
                         }
                         if matches!(service, Service::Fflush) {
                             let stream = cpu.registers[7];
-                            if stream == crate::guest_stdio::FILE_ADDR || (stream == 0 && self.stdio.configured()) {
-                                self.stdio.fflush(&memory,stream)?;
+                            if stream == crate::guest_stdio::FILE_ADDR
+                                || (stream == 0 && self.stdio.configured())
+                            {
+                                self.stdio.fflush(&memory, stream)?;
                             }
                             if stream != crate::guest_stdio::FILE_ADDR {
-                                if let Some(kernel) = &self.kernel { self.file_streams.flush(&kernel.descriptors,&memory,stream)?; }
-                                else if stream != 0 { return Err("Missing FILE kernel context".into()); }
+                                if let Some(kernel) = &self.kernel {
+                                    self.file_streams.flush(
+                                        &kernel.descriptors,
+                                        &memory,
+                                        stream,
+                                    )?;
+                                } else if stream != 0 {
+                                    return Err("Missing FILE kernel context".into());
+                                }
                             }
                             0
                         } else {
@@ -3141,11 +3812,12 @@ impl NativeExecutor {
                                     drop(memory);
                                     return Ok(Flow::EnvironmentSet {
                                         continuation: Box::new(Continuation {
+                                            stack_lease: stack_lease.clone(),
                                             quantum: slice.0,
                                             return_convention,
                                             guest_thread,
                                             cpu,
-                                            stack,
+                                            stack: stack.take(),
                                             stack_address,
                                             remaining: remaining - transition - 1,
                                             caller_bias,
@@ -3242,28 +3914,71 @@ impl NativeExecutor {
                         } else {
                             0
                         }
+                    } else if matches!(service, Service::Stat) {
+                        let kernel = self.kernel.as_mut().ok_or("Missing stat kernel context")?;
+                        validate_net_output(&memory, kernel.errno_address(), 4, sp, ret)?;
+                        // Preserve pathname-error ordering: protect the destination
+                        // only when the kernel would actually write a stat record.
+                        // Guest execution cannot mutate the path between these reads.
+                        if kernel.stat_will_write(&memory, cpu.registers[7]) {
+                            validate_net_output(&memory, cpu.registers[6], 120, sp, ret)?;
+                        }
+                        let (value, _) = kernel.syscall(
+                            &mut memory,
+                            188,
+                            [cpu.registers[7], cpu.registers[6], 0, 0, 0, 0],
+                        )?;
+                        value as u32 as u64
                     } else if matches!(service, Service::Fstat) {
                         let kernel = self.kernel.as_mut().ok_or("Missing fstat kernel context")?;
                         validate_net_output(&memory, kernel.errno_address(), 4, sp, ret)?;
                         let descriptor = cpu.registers[7] as u32 as u64;
-                        if matches!(kernel.descriptors.kind(descriptor), Some(crate::descriptors::DescriptorKind::RegisteredFile)) {
+                        if matches!(
+                            kernel.descriptors.kind(descriptor),
+                            Some(crate::descriptors::DescriptorKind::RegisteredFile)
+                        ) {
                             validate_net_output(&memory, cpu.registers[6], 120, sp, ret)?;
                         }
-                        let (value, _) = kernel.syscall(&mut memory, 189, [descriptor,cpu.registers[6],0,0,0,0])?;
+                        let (value, _) = kernel.syscall(
+                            &mut memory,
+                            189,
+                            [descriptor, cpu.registers[6], 0, 0, 0, 0],
+                        )?;
                         value as u32 as u64
                     } else if let Service::File(operation) = service {
-                        if matches!(operation,crate::stdio_file::Operation::Write) && cpu.registers[1] == crate::guest_stdio::FILE_ADDR {
-                            self.stdio.fwrite(&mut memory,cpu.registers[7],cpu.registers[6],cpu.registers[2],
-                                self.kernel.as_ref().ok_or("Missing fwrite errno context")?.errno_address(),
-                                |memory,address,length| validate_net_output(memory,address,length,sp,ret))?
-                        } else { self.file_streams.call(
-                            self.kernel.as_mut().ok_or("Missing FILE kernel context")?,
-                            &mut memory, *operation,
-                            [cpu.registers[7],cpu.registers[6],cpu.registers[2],cpu.registers[1]],
-                            |memory,address,length| validate_net_output(memory,address,length,sp,ret),
-                        )? }
+                        if matches!(operation, crate::stdio_file::Operation::Write)
+                            && cpu.registers[1] == crate::guest_stdio::FILE_ADDR
+                        {
+                            self.stdio.fwrite(
+                                &mut memory,
+                                cpu.registers[7],
+                                cpu.registers[6],
+                                cpu.registers[2],
+                                self.kernel
+                                    .as_ref()
+                                    .ok_or("Missing fwrite errno context")?
+                                    .errno_address(),
+                                |memory, address, length| {
+                                    validate_net_output(memory, address, length, sp, ret)
+                                },
+                            )?
+                        } else {
+                            self.file_streams.call(
+                                self.kernel.as_mut().ok_or("Missing FILE kernel context")?,
+                                &mut memory,
+                                *operation,
+                                [
+                                    cpu.registers[7],
+                                    cpu.registers[6],
+                                    cpu.registers[2],
+                                    cpu.registers[1],
+                                ],
+                                |memory, address, length| {
+                                    validate_net_output(memory, address, length, sp, ret)
+                                },
+                            )?
+                        }
                     } else if matches!(service, Service::Gettimeofday) {
-
                         let plan = self.guest_time.plan(cpu.registers[7], cpu.registers[6])?;
                         for write in &plan.writes {
                             validate_net_output(
@@ -3460,6 +4175,12 @@ impl NativeExecutor {
                             // Realloc releases the old object on success. It
                             // must not revoke its own live guest return frame.
                             let length = memory.heap_allocation_size(cpu.registers[7])?;
+                            if self
+                                .semaphores
+                                .has_pending_overlap(cpu.registers[7], length)
+                            {
+                                return Err("Cannot realloc a pending semaphore object".into());
+                            }
                             validate_net_output(&memory, cpu.registers[7], length, sp, ret)?;
                         }
                         match crate::libc_memory::realloc(
@@ -3475,6 +4196,14 @@ impl NativeExecutor {
                         }
                     } else if matches!(service, Service::Malloc | Service::Calloc | Service::Free) {
                         if matches!(service, Service::Free) {
+                            if cpu.registers[7] != 0
+                                && self.semaphores.has_pending_overlap(
+                                    cpu.registers[7],
+                                    memory.heap_allocation_size(cpu.registers[7])?,
+                                )
+                            {
+                                return Err("Cannot free a pending semaphore object".into());
+                            }
                             memory.free(cpu.registers[7])?;
                             0
                         } else {
@@ -3727,6 +4456,14 @@ impl NativeExecutor {
                             cpu.registers[9],
                         )? as u32 as u64
                     } else if matches!(service, Service::DirectRelease) {
+                        if let Some((address, length)) = self
+                            .direct_memory
+                            .release_mapping(cpu.registers[7], cpu.registers[6])?
+                        {
+                            if self.semaphores.has_pending_overlap(address, length) {
+                                return Err("Cannot unmap a pending semaphore object".into());
+                            }
+                        }
                         self.direct_memory.release(
                             &mut memory,
                             cpu.registers[7],
@@ -3862,7 +4599,7 @@ impl NativeExecutor {
                     cpu.registers[4] = sp.checked_add(8).ok_or("Service stack overflow")?;
                     cpu.registers[0] = value;
                     if terminal {
-                        return Ok(Flow::Finished(return_convention.completed(value)));
+                        completed!(value);
                     }
                     cpu.rip = cpu.next_rip;
                     cpu.stop = 0;
@@ -3978,6 +4715,15 @@ impl NativeExecutor {
     }
 }
 impl Executor for NativeExecutor {
+    fn validate_image_retirement(&self, image: &Image) -> Result<()> {
+        if image.segments.iter().any(|segment| {
+            self.semaphores
+                .has_pending_overlap(segment.address, segment.bytes.len())
+        }) {
+            return Err("Cannot retire an image containing a pending semaphore object".into());
+        }
+        Ok(())
+    }
     fn exit_request(&self) -> Option<ExitRequest> {
         self.exit_request
     }
@@ -4015,11 +4761,9 @@ mod service_registration_tests {
     fn loader_export_publication_is_atomic_and_resolves_name_and_nid() {
         let mut modules = crate::modules::Modules::new(65536);
         let mut native = NativeExecutor::new(0x900000, 4096, 100, 100).unwrap();
-        assert!(
-            native
-                .register_loader_module(&mut modules, "../bad", 0x700000)
-                .is_err()
-        );
+        assert!(native
+            .register_loader_module(&mut modules, "../bad", 0x700000)
+            .is_err());
         assert!(native.services.is_empty());
         native
             .register_loader_module(&mut modules, "libkernel.prx", 0x700000)
@@ -4032,20 +4776,16 @@ mod service_registration_tests {
             let identity = crate::imports::identify(name, &BTreeMap::new(), &[]).unwrap();
             assert_eq!(modules.resolve(&identity), Some(0x700000));
         }
-        assert!(
-            native
-                .register_loader_module(&mut modules, "libkernel.prx", 0x710000)
-                .is_err()
-        );
+        assert!(native
+            .register_loader_module(&mut modules, "libkernel.prx", 0x710000)
+            .is_err());
         assert_eq!(native.services.len(), 3);
         let stop =
             crate::imports::identify("sceKernelStopUnloadModule", &BTreeMap::new(), &[]).unwrap();
         assert_eq!(modules.resolve(&stop), Some(0x700010));
-        assert!(
-            native
-                .register_loader_module(&mut modules, "other.prx", 0x700000)
-                .is_err()
-        );
+        assert!(native
+            .register_loader_module(&mut modules, "other.prx", 0x700000)
+            .is_err());
     }
     #[test]
     fn loader_request_validates_all_inputs_before_side_effects() {
@@ -4089,24 +4829,18 @@ mod service_registration_tests {
         let mut native = NativeExecutor::new(0x900000, 4096, 100, 100).unwrap();
         let plain = |name: &str| crate::imports::identify(name, &BTreeMap::new(), &[]).unwrap();
         native.register_service(0x700020, Service::Strlen).unwrap();
-        assert!(
-            native
-                .register_string_module(&mut modules, "libstrings.prx", 0x700000)
-                .is_err()
-        );
+        assert!(native
+            .register_string_module(&mut modules, "libstrings.prx", 0x700000)
+            .is_err());
         assert_eq!(native.services.len(), 1);
         assert_eq!(modules.resolve(&plain("strcpy")), None);
-        assert!(
-            native
-                .register_string_module(&mut modules, "libstrings.prx", u64::MAX - 16)
-                .is_err()
-        );
+        assert!(native
+            .register_string_module(&mut modules, "libstrings.prx", u64::MAX - 16)
+            .is_err());
         assert_eq!(native.services.len(), 1);
-        assert!(
-            native
-                .register_string_module(&mut modules, "../bad", 0x710000)
-                .is_err()
-        );
+        assert!(native
+            .register_string_module(&mut modules, "../bad", 0x710000)
+            .is_err());
         assert_eq!(native.services.len(), 1);
         let handle = native
             .register_string_module(&mut modules, "libstrings.prx", 0x710000)
@@ -4124,11 +4858,9 @@ mod service_registration_tests {
                 Some(0x710000 + i as u64 * 16)
             );
         }
-        assert!(
-            native
-                .register_string_module(&mut modules, "libstrings.prx", 0x720000)
-                .is_err()
-        );
+        assert!(native
+            .register_string_module(&mut modules, "libstrings.prx", 0x720000)
+            .is_err());
         assert_eq!(native.services.len(), 6);
     }
 }
@@ -4150,6 +4882,7 @@ mod exit_request_tests {
         // Tail exit must not dereference a return address, even if RSP is unmapped.
         cpu.registers[4] = if tail { 0 } else { 0x900ff8 };
         Continuation {
+            stack_lease: Rc::new(()),
             quantum: None,
             return_convention: ReturnConvention::ModuleStatus,
             guest_thread: MAIN_GUEST_THREAD,
@@ -4196,20 +4929,16 @@ mod exit_request_tests {
                     );
                     assert_eq!(executor.exit_request(), Some(expected));
                     assert_eq!(executor.exit_remaining_fuel(), Some(2));
-                    assert!(
-                        executor
-                            .run(&mut image, 0x100100, Arguments::default(), &mut [])
-                            .err()
-                            .unwrap()
-                            .contains("exit requested")
-                    );
-                    assert!(
-                        executor
-                            .resume(&mut image, &mut [], stale, 0)
-                            .err()
-                            .unwrap()
-                            .contains("exit requested")
-                    );
+                    assert!(executor
+                        .run(&mut image, 0x100100, Arguments::default(), &mut [])
+                        .err()
+                        .unwrap()
+                        .contains("exit requested"));
+                    assert!(executor
+                        .resume(&mut image, &mut [], stale, 0)
+                        .err()
+                        .unwrap()
+                        .contains("exit requested"));
                 }
             }
         }
@@ -4220,20 +4949,18 @@ mod exit_request_tests {
         let pending = suspended(&image, true, 1, 0);
         let mut executor = NativeExecutor::new(0x900000, 4096, 10, 10).unwrap();
         executor.register_service(0x700000, Service::Exit).unwrap();
-        assert!(
-            executor
-                .execute_flow(
-                    &mut image,
-                    0,
-                    Arguments::default(),
-                    &mut [],
-                    Some(pending),
-                    &mut []
-                )
-                .err()
-                .unwrap()
-                .contains("fuel")
-        );
+        assert!(executor
+            .execute_flow(
+                &mut image,
+                0,
+                Arguments::default(),
+                &mut [],
+                Some(pending),
+                &mut []
+            )
+            .err()
+            .unwrap()
+            .contains("fuel"));
         assert_eq!(executor.exit_request(), None);
     }
 }

@@ -1,7 +1,7 @@
 //! Owned subset used by pinned PS5 SDL: type3 allocations and prot0x33 mappings.
 //! No physical host addresses are exposed. Aliases, subrange mappings and fixed
 //! addresses are explicit unsupported cases. Reservations share a 256 MiB cap.
-use crate::{Result, guest_memory::Memory};
+use crate::{guest_memory::Memory, Result};
 
 struct Allocation {
     physical: u64,
@@ -113,6 +113,16 @@ impl DirectMemory {
         allocation.virtual_address = Some(address);
         Ok(0)
     }
+    pub fn release_mapping(&self, physical: u64, size: u64) -> Result<Option<(u64, usize)>> {
+        let allocation = self
+            .allocations
+            .iter()
+            .find(|a| a.physical == physical && a.size == size)
+            .ok_or("Unknown direct-memory release range")?;
+        Ok(allocation
+            .virtual_address
+            .map(|address| (address, size as usize)))
+    }
     pub fn release(&mut self, memory: &mut Memory<'_>, physical: u64, size: u64) -> Result<i32> {
         let index = self
             .allocations
@@ -215,11 +225,9 @@ mod tests {
                 .unwrap(),
             physical
         );
-        assert!(
-            direct
-                .release(&mut memory, physical, 64 * 1024 * 1024)
-                .is_err()
-        );
+        assert!(direct
+            .release(&mut memory, physical, 64 * 1024 * 1024)
+            .is_err());
         direct.unpin(physical).unwrap();
         direct
             .release(&mut memory, physical, 64 * 1024 * 1024)
@@ -240,31 +248,23 @@ mod tests {
         memory.attach_owned(&mut owner).unwrap();
         memory.add(0, &mut null_storage, true, false).unwrap();
         assert!(direct.allocate(&mut memory, 16384, 16384, 3, 0).is_err());
-        assert!(
-            direct
-                .allocate(&mut memory, 16384, 16384, 3, 0x1009)
-                .is_err()
-        );
+        assert!(direct
+            .allocate(&mut memory, 16384, 16384, 3, 0x1009)
+            .is_err());
         assert_eq!(direct.reserved_bytes(), 0);
         direct
             .allocate(&mut memory, 16384, 16384, 3, 0x1000)
             .unwrap();
         let physical = memory.load(0x1000, 8).unwrap();
-        assert!(
-            direct
-                .map(&mut memory, 0, 16384, 0x33, 0, physical, 16384)
-                .is_err()
-        );
-        assert!(
-            direct
-                .map(&mut memory, 0x1009, 16384, 0x33, 0, physical, 16384)
-                .is_err()
-        );
-        assert!(
-            direct
-                .map(&mut memory, 0x1008, 32768, 0x33, 0, physical, 16384)
-                .is_err()
-        );
+        assert!(direct
+            .map(&mut memory, 0, 16384, 0x33, 0, physical, 16384)
+            .is_err());
+        assert!(direct
+            .map(&mut memory, 0x1009, 16384, 0x33, 0, physical, 16384)
+            .is_err());
+        assert!(direct
+            .map(&mut memory, 0x1008, 32768, 0x33, 0, physical, 16384)
+            .is_err());
         assert_eq!(memory.load(0x1008, 8).unwrap(), 0);
         direct
             .map(&mut memory, 0x1008, 16384, 0x33, 0, physical, 16384)

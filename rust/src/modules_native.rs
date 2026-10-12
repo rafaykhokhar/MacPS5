@@ -87,6 +87,9 @@ impl Modules {
     /// remaining fallible operation. Failed preflight leaves both registrations.
     pub fn unload_native(&mut self, handle: u64, executor: &mut NativeExecutor) -> Result<()> {
         self.validate_unload(handle)?;
+        if let Some(image) = self.modules.get(&handle).and_then(|module| module.image.as_ref()) {
+            executor.validate_image_retirement(image)?;
+        }
         let bias = self
             .modules
             .get(&handle)
@@ -547,6 +550,7 @@ impl Modules {
         if module.phase != Phase::Started || module.image.is_none() {
             return Err("Dynamic module cannot stop in its current state".into());
         }
+        executor.validate_image_retirement(module.image.as_ref().unwrap())?;
         if self
             .modules
             .iter()
@@ -588,6 +592,9 @@ impl Modules {
     ) -> Result<()> {
         self.check_thread_pin(child)?;
         let module = self.modules.get_mut(&child).ok_or("Missing stop image")?;
+        if let Some(image) = &module.image {
+            executor.validate_image_retirement(image)?;
+        }
         let calls: Vec<_> = module
             .entries
             .stop
@@ -1159,6 +1166,15 @@ impl Modules {
     /// unloadable or retryable. It remains fault-pinned until process teardown.
     pub fn abandon_native_start(&mut self, handle: u64) -> Result<()> {
         self.check_thread_pin(handle)?;
+        if self.pending_starts.get(&handle)
+            .and_then(|state| state.thread_request.as_ref())
+            .is_some_and(|request| matches!(
+                request.operation(),
+                crate::module_executor::ThreadOperation::SemaphoreWait { .. }
+            ))
+        {
+            return Err("Pending semaphore wait retains module-start continuation".into());
+        }
         self.pending_starts
             .remove(&handle)
             .ok_or("No pending module start")?;

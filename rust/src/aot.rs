@@ -1,5 +1,5 @@
 //! Native ARM64 emission. Guest accesses continue through the guarded runtime ABI.
-use crate::{Result, decode};
+use crate::{decode, Result};
 use iced_x86::{Instruction, Mnemonic as M, OpKind, Register as R};
 use std::collections::BTreeSet;
 
@@ -237,8 +237,27 @@ impl Emitter {
         self.emit("str x9, [x19, #176]\nb .Lexit");
     }
     fn instruction(&mut self, i: &Instruction) -> Result<()> {
-        if i.has_lock_prefix() || i.has_rep_prefix() || i.has_repne_prefix() {
+        let locked_xadd32 = i.has_lock_prefix()
+            && i.mnemonic() == M::Xadd
+            && i.op0_kind() == OpKind::Memory
+            && i.op1_kind() == OpKind::Register
+            && bits(i, 0) == 32
+            && i.op1_register().size() == 4;
+        if (i.has_lock_prefix() && !locked_xadd32) || i.has_rep_prefix() || i.has_repne_prefix() {
             return Err("LOCK/REP prefixes are not implemented".into());
+        }
+        if locked_xadd32 {
+            let (offset, width) = gpr(i.op1_register())?;
+            if width != 32 || offset % 8 != 0 {
+                return Err("Invalid LOCK XADD32 source".into());
+            }
+            self.address(i)?;
+            self.emit(format!(
+                "mov x0, x19\nmov x2, #{}\nbl _native_ps5_module_atomic_xadd32_v1",
+                offset / 8
+            ));
+            self.fault();
+            return Ok(());
         }
         let m = i.mnemonic();
         let width = bits(i, 0);
@@ -631,6 +650,7 @@ impl Emitter {
             M::Cmp
             | M::Sub
             | M::Add
+            | M::Adc
             | M::Xor
             | M::Inc
             | M::Dec
@@ -658,6 +678,7 @@ impl Emitter {
                     M::Cmp | M::Sub | M::Neg => ("sub", 0),
                     M::Sbb => ("sub", 4),
                     M::Add => ("add", 1),
+                    M::Adc => ("add", 7),
                     M::Inc => ("add", 3),
                     M::Dec => ("sub", 5),
                     M::Xor => ("eor", 2),
@@ -665,9 +686,10 @@ impl Emitter {
                     _ => ("orr", 2),
                 };
                 self.emit(format!("{op} {p}22, {p}21, {p}20"));
-                if m == M::Sbb {
+                if matches!(m, M::Sbb | M::Adc) {
+                    let carry_op = if m == M::Adc { "add" } else { "sub" };
                     self.emit(format!(
-                        "ldr x9, [x19, #136]\nand x9, x9, #1\nsub {p}22, {p}22, {p}9"
+                        "ldr x9, [x19, #136]\nand x9, x9, #1\n{carry_op} {p}22, {p}22, {p}9"
                     ));
                 }
                 if !matches!(m, M::Cmp | M::Test) {
@@ -693,13 +715,17 @@ impl Emitter {
                 self.read(i, 0, width, 20)?;
                 self.emit("ldr x21, [x19, #0]");
                 if width < 64 {
-                    self.emit(format!("sbfx x20, x20, #0, #{width}\nsbfx x21, x21, #0, #{width}"));
+                    self.emit(format!(
+                        "sbfx x20, x20, #0, #{width}\nsbfx x21, x21, #0, #{width}"
+                    ));
                 }
                 self.emit("mul x22, x21, x20");
                 if width == 64 {
                     self.emit("smulh x9, x21, x20\nstr x22, [x19, #0]\nstr x9, [x19, #16]");
                 } else if width == 32 {
-                    self.emit("lsr x9, x22, #32\nmov w22, w22\nstr x22, [x19, #0]\nstr x9, [x19, #16]");
+                    self.emit(
+                        "lsr x9, x22, #32\nmov w22, w22\nstr x22, [x19, #0]\nstr x9, [x19, #16]",
+                    );
                 } else if width == 16 {
                     self.emit("lsr x9, x22, #16\nstrh w22, [x19, #0]\nstrh w9, [x19, #16]");
                 } else {

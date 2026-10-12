@@ -39,6 +39,7 @@ pub enum Step {
     Yielded(u64),
     MutexPending(u64),
     JoinPending(u64),
+    SemaphorePending(u64),
     ThreadService(u64),
     /// No runnable worker; host driver may wait until this monotonic deadline.
     /// Observing this state consumes neither dispatch nor instruction fuel.
@@ -157,6 +158,7 @@ impl Scheduler {
         image: &mut Image,
         dependencies: &mut [&mut Image],
         parent_data: &mut [DataRegion<'_>],
+        realtime: crate::guest_semaphore::Realtime,
     ) -> Result<Step> {
         let parent = self.workers[index].thread;
         let lease = self.workers[index].lease.clone();
@@ -180,6 +182,7 @@ impl Scheduler {
             return Err("Missing thread request".into());
         };
         let operation = request.operation();
+        let semaphore = matches!(operation, ThreadOperation::SemaphoreWait { .. });
         let target_id = match operation {
             ThreadOperation::Join { thread, .. } | ThreadOperation::Detach { thread } => {
                 Some(thread)
@@ -232,6 +235,13 @@ impl Scheduler {
         let mut joiner = None;
         let result = (|| -> Result<Option<u64>> {
             match operation {
+                ThreadOperation::SemaphoreWait { .. } => native.resume_semaphore_at(
+                    &mut request,
+                    image,
+                    dependencies,
+                    &mut mappings,
+                    Some(realtime),
+                ),
                 ThreadOperation::Sleep { deadline } => {
                     if !deadline.ready(native.sleep_clock_now()) {
                         return Err("Unready sleep selected for dispatch".into());
@@ -365,6 +375,8 @@ impl Scheduler {
                 }
                 Ok(if result.is_some() {
                     Step::ThreadService(parent)
+                } else if semaphore {
+                    Step::SemaphorePending(parent)
                 } else {
                     Step::JoinPending(parent)
                 })
@@ -464,12 +476,23 @@ impl Scheduler {
     pub fn blocked_sleep_deadline(&self) -> Option<u128> {
         self.blocked_deadline
     }
-    fn runnable(&self, native: &NativeExecutor, index: usize, now: u128) -> bool {
+    fn runnable(
+        &self,
+        native: &NativeExecutor,
+        index: usize,
+        now: u128,
+        realtime: crate::guest_semaphore::Realtime,
+    ) -> Result<bool> {
         let worker = &self.workers[index];
-        match &worker.state {
+        Ok(match &worker.state {
             State::Completed(_) | State::Reaped | State::ExternalBoundary(_) => false,
             State::Suspended(Execution::ThreadRequest(request)) => match request.operation() {
                 ThreadOperation::Sleep { deadline } => deadline.ready(now),
+                ThreadOperation::SemaphoreWait { ticket, .. } => {
+                    native
+                        .semaphores
+                        .ready(&ticket, worker.thread, Some(realtime))?
+                }
                 ThreadOperation::Join { thread, .. } => !self.workers.iter().any(|target| {
                     target.thread == thread
                         && target.joiner == Some(worker.thread)
@@ -480,7 +503,34 @@ impl Scheduler {
             },
             State::Suspended(Execution::MutexWait(wait)) => wait.pending_owner(native).is_none(),
             _ => true,
+        })
+    }
+    /// Realtime waits must be resampled after wallclock changes. These monotonic
+    /// hints are capped at 100ms and never establish timeout completion.
+    fn next_blocked_deadline(
+        &self,
+        native: &NativeExecutor,
+        now: u128,
+        realtime: crate::guest_semaphore::Realtime,
+    ) -> Result<Option<u128>> {
+        let mut deadline = self.next_sleep_deadline();
+        for worker in &self.workers {
+            if let State::Suspended(Execution::ThreadRequest(request)) = &worker.state {
+                if let ThreadOperation::SemaphoreWait { ticket, .. } = request.operation() {
+                    if let Some(delay) =
+                        native
+                            .semaphores
+                            .delay_ns(&ticket, worker.thread, realtime)?
+                    {
+                        let target = now
+                            .checked_add(delay.min(100_000_000))
+                            .ok_or("Semaphore polling deadline overflow")?;
+                        deadline = Some(deadline.map_or(target, |old| old.min(target)));
+                    }
+                }
+            }
         }
+        Ok(deadline)
     }
     pub fn next_sleep_deadline(&self) -> Option<u128> {
         self.workers
@@ -517,11 +567,26 @@ impl Scheduler {
         parent_data: &mut [DataRegion<'_>],
     ) -> Result<Step> {
         let now = native.sleep_clock_now();
+        let realtime = if native.semaphores.has_realtime_waits() {
+            native.semaphore_realtime()?
+        } else {
+            crate::guest_semaphore::Realtime {
+                seconds: 0,
+                nanoseconds: 0,
+            }
+        };
         let len = self.workers.len();
-        let bias = (0..len)
-            .map(|n| (self.cursor + n) % len)
-            .find(|&i| self.runnable(native, i, now))
-            .and_then(|i| self.workers[i].lease.as_ref().map(|lease| lease.bias));
+        let mut selected_index = None;
+        for n in 0..len {
+            let index = (self.cursor + n) % len;
+            if self.runnable(native, index, now, realtime)? {
+                selected_index = Some(index);
+                break;
+            }
+        }
+        let deadline = self.next_blocked_deadline(native, now, realtime)?;
+        let bias =
+            selected_index.and_then(|i| self.workers[i].lease.as_ref().map(|lease| lease.bias));
         if let Some(bias) = bias.filter(|bias| *bias != image.bias) {
             let index = dependencies
                 .iter()
@@ -535,9 +600,21 @@ impl Scheduler {
                 .map(|mapped| &mut **mapped)
                 .collect();
             others.push(image);
-            self.step_mapped(native, selected, &mut others, parent_data, now)
+            self.step_mapped(
+                native,
+                selected,
+                &mut others,
+                parent_data,
+                (selected_index, deadline, realtime),
+            )
         } else {
-            self.step_mapped(native, image, dependencies, parent_data, now)
+            self.step_mapped(
+                native,
+                image,
+                dependencies,
+                parent_data,
+                (selected_index, deadline, realtime),
+            )
         }
     }
     fn step_mapped(
@@ -546,7 +623,11 @@ impl Scheduler {
         image: &mut Image,
         dependencies: &mut [&mut Image],
         parent_data: &mut [DataRegion<'_>],
-        now: u128,
+        selection: (
+            Option<usize>,
+            Option<u128>,
+            crate::guest_semaphore::Realtime,
+        ),
     ) -> Result<Step> {
         self.require_owner(native)?;
         if let Some(request) = self.exit_request {
@@ -557,11 +638,8 @@ impl Scheduler {
         }
         let len = self.workers.len();
         self.blocked_deadline = None;
-        let Some(index) = (0..len)
-            .map(|n| (self.cursor + n) % len)
-            .find(|&i| self.runnable(native, i, now))
-        else {
-            if let Some(deadline_ns) = self.next_sleep_deadline() {
+        let Some(index) = selection.0 else {
+            if let Some(deadline_ns) = selection.1 {
                 self.blocked_deadline = Some(deadline_ns);
                 return Ok(Step::Sleeping { deadline_ns });
             }
@@ -598,7 +676,14 @@ impl Scheduler {
         native.set_worker_quantum(Some(self.quantum))?;
         if matches!(&self.workers[index].state, State::Suspended(Execution::ThreadRequest(request)) if !matches!(request.operation(),ThreadOperation::Completed(_)))
         {
-            return self.service_thread(index, native, image, dependencies, parent_data);
+            return self.service_thread(
+                index,
+                native,
+                image,
+                dependencies,
+                parent_data,
+                selection.2,
+            );
         }
         let mut state = std::mem::replace(&mut self.workers[index].state, State::Dispatching);
         let mut mappings = Vec::new();
@@ -750,11 +835,9 @@ mod tests {
     fn overflowing_enqueue_identity_does_not_register_tls() {
         let mut scheduler = Scheduler::new(1, 10, 10).unwrap();
         let mut native = NativeExecutor::new(0x900000, 4096, 10, 10).unwrap();
-        assert!(
-            scheduler
-                .enqueue(&mut native, u64::MAX, 0x100100, 0)
-                .is_err()
-        );
+        assert!(scheduler
+            .enqueue(&mut native, u64::MAX, 0x100100, 0)
+            .is_err());
         assert_eq!(native.tls.live_threads(), 1);
         assert_eq!(native.tls.next_thread_id().unwrap(), 2);
         assert!(scheduler.workers.is_empty());

@@ -42,3 +42,16 @@ These are examples of current focused checks, **not an exhaustive coverage matri
 - [Implementation history and recorded checks](../../rust/README.md): scope and limitations of individual milestones.
 
 The next tracking step is to construct the target inventory, then link each row to this evidence or mark the gap. Until that inventory is audited, even a ratio of passing tests cannot serve as a CPU completion percentage.
+
+## Observed allocator gaps
+
+The native semaphore verifier exercises the pinned homebrew's actual SDL allocator rather than replacing its guest instruction sequence. The executable SHA-256 is `308fbb17946974f0c2e888988d4f16f98681ea91a8a957a314b3518e5e45a567`. These are concrete required forms discovered in that path, not the complete CPU inventory:
+
+| Guest offset and bytes | Required behavior | Evidence and verification still required |
+| --- | --- | --- |
+| `0x18d0a`: `48 83 d7 00` (`ADC rdi, 0`) | Add incoming carry to the allocator size, with correct 64-bit result and arithmetic flags | Implemented. [Native verifier](../../rust/verification/adc_native.rs) passes 58,752 independent edge/random cases across selected 8/16/32/64-bit register, memory, immediate and alias forms, plus carry chains, guarded accesses and the allocator's CMP/ADC pair. The actual SDL allocator also passes in the semaphore fixture. |
+| `0x18b52`: `f0 0f c1 07` (`LOCK XADD [rdi], eax`) | Atomically update SDL's allocation counter, return its previous value in EAX, and update arithmetic flags | Aligned 32-bit form implemented with sequentially consistent atomic RMW. Actual SDL allocator/counter execution passes in the semaphore fixture. [Dedicated native checks](../../rust/verification/atomic_xadd_native.rs) pass for flags, fuel, register preservation, address/source aliasing, access boundaries and guest/host alignment guards. A separate helper test exercises host-thread atomic contention; this does not prove concurrent guest execution. |
+
+Evidence for this checkpoint: `allocator-cpu-native.log` (ADC), `atomic-xadd-native.log` (corrected standalone XADD verifier), and `semaphore-native.log` (actual SDL paths), against the matching release build. The ADC comparison uses an independently written widened-integer oracle, not an x86 hardware differential run.
+
+Unsupported instruction forms, such as misaligned locked accesses, remain explicit gaps. These allocator and semaphore checks do not establish full atomics, memory-ordering or CPU coverage.

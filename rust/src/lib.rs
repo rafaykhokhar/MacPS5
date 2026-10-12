@@ -1,5 +1,6 @@
 pub mod aot;
 pub mod arithmetic;
+pub mod atomic_xadd;
 pub mod checks;
 pub mod condition;
 pub mod decode;
@@ -84,5 +85,6 @@ pub mod scan;
 pub mod scan_float;
 pub mod guest_time;
 pub mod guest_sleep;
+pub mod guest_semaphore;
 pub mod stdio_file;
 pub mod stdio_write;

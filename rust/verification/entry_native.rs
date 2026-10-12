@@ -29,6 +29,10 @@ mod stdio_native;
 mod stdio_file_native;
 mod file_syscalls_native;
 mod fstat_native;
+mod stat_service_native;
+mod semaphore_native;
+mod atomic_xadd_native;
+mod adc_native;
 mod system_service_native;
 mod threadattr_native;
 mod thread_services_native;
@@ -75,6 +79,10 @@ fn main() -> Result<(), String> {
     stdio_native::verify(Path::new(&archive), Path::new(&directory))?;
     file_syscalls_native::verify(Path::new(&archive), Path::new(&directory))?;
     fstat_native::verify(Path::new(&archive), Path::new(&directory))?;
+    stat_service_native::verify(Path::new(&archive), Path::new(&directory))?;
+    atomic_xadd_native::verify(Path::new(&archive), Path::new(&directory))?;
+    adc_native::verify(Path::new(&archive), Path::new(&directory))?;
+    semaphore_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     stdio_file_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     system_service_native::verify(Path::new(&archive), Path::new(&directory))?;
     tls_native::verify(Path::new(&archive), Path::new(&directory))?;
@@ -419,6 +427,14 @@ fn main() -> Result<(), String> {
         ("ftello", Service::File(FileOperation::Tell)),
         ("fstat", Service::Fstat),
         ("fwrite", Service::File(FileOperation::Write)),
+        ("sem_init", Service::SemInit),
+        ("sem_destroy", Service::SemDestroy),
+        ("sem_trywait", Service::SemTryWait),
+        ("sem_wait", Service::SemWait),
+        ("sem_timedwait", Service::SemTimedWait),
+        ("sem_getvalue", Service::SemGetValue),
+        ("sem_post", Service::SemPost),
+        ("stat", Service::Stat),
     ]
     .into_iter()
     .enumerate()
@@ -1312,6 +1328,15 @@ fn main() -> Result<(), String> {
                 (712, 0x730580),
                 (720, 0x7305e0),
                 (728, 0x730630),
+                (736, 0x730640),
+                (744, 0x730650),
+                (752, 0x730660),
+                (760, 0x730670),
+                (768, 0x730680),
+                (776, 0x730690),
+                (784, 0x7306a0),
+                (792, 0x7306b0),
+                (800, 0x730050),
             ] {
                 if locale_segment.bytes[locale_offset + delta..locale_offset + delta + 8]
                     != expected.to_le_bytes()
@@ -1338,13 +1363,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 105 libc exports: (105+1)*24=2544 aligned symbol bytes
-                // and 1+105*12=1261 NID bytes (rounded1264). fwrite adds
-                // 16 symbol bytes to18128; retain the exact32KiB cap.
-                || native.bytes_allocated() != 18144
+                // 113 libc exports: (113+1)*24=2736 aligned symbol bytes
+                // and 1+113*12=1357 NID bytes (rounded1360). Semaphore/stat
+                // exports add192+96bytes to18144; retain the exact32KiB cap.
+                || native.bytes_allocated() != 18432
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'sem_init'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'sysconf'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1354,7 +1379,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; file imports including fwrite bound; unresolved sem_init causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; semaphore and stat imports bound; unresolved sysconf causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1416,7 +1441,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved sem_init triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved sysconf triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     Ok(())

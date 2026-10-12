@@ -85,6 +85,38 @@ impl<'a> Memory<'a> {
     pub fn reserve_service(&mut self, address: u64) {
         self.reserved.push(address);
     }
+    pub fn owned_allocation_contains(&self, address: u64, length: usize) -> bool {
+        let Some(end) = address.checked_add(length as u64) else {
+            return false;
+        };
+        self.owned.is_some()
+            && self.regions.iter().any(|r| {
+                matches!(r.bytes, Bytes::Owned(_))
+                    && address >= r.address
+                    && end <= r.address + r.bytes.len() as u64
+            })
+    }
+    pub fn anonymous_release_size(
+        &self,
+        address: u64,
+        length: u64,
+    ) -> std::result::Result<usize, u32> {
+        if address % 16384 != 0 || length == 0 || length.checked_add(16383).is_none() {
+            return Err(22);
+        }
+        let size = (length + 16383) & !16383;
+        self.regions
+            .iter()
+            .find(|r| {
+                r.address == address
+                    && !r.heap
+                    && !r.direct
+                    && r.bytes.len() as u64 == size
+                    && matches!(r.bytes, Bytes::Owned(_))
+            })
+            .map(|r| r.bytes.len())
+            .ok_or(22)
+    }
     pub fn attach_owned(&mut self, owner: &'a mut OwnedMappings) -> Result<()> {
         if self.owned.is_some() {
             return Err("Anonymous mapping owner already attached".into());
@@ -345,6 +377,31 @@ impl<'a> Memory<'a> {
             return Err("Invalid scalar width".into());
         }
         self.write(address, &value.to_le_bytes()[..size as usize])
+    }
+    /// Scoped LOCK XADD32: host atomic RMW, with no outstanding byte references.
+    /// Current Memory ownership is exclusive/cooperative; this does not permit
+    /// unsynchronized host threads to access the same non-atomic byte mappings.
+    #[allow(unsafe_code)]
+    pub fn atomic_xadd_u32(&mut self, address: u64, addend: u32) -> Result<u32> {
+        use std::sync::atomic::AtomicU32;
+        if address % 4 != 0 {
+            return Err("Unaligned LOCK XADD32 unsupported".into());
+        }
+        self.validate_write(address, 4)?;
+        let index = self.region(address, 4)?;
+        let region = &mut self.regions[index];
+        let offset = (address - region.address) as usize;
+        let pointer = region.bytes[offset..offset + 4].as_mut_ptr();
+        if (pointer as usize) % std::mem::align_of::<AtomicU32>() != 0 {
+            return Err("Unaligned host backing for LOCK XADD32 unsupported".into());
+        }
+        // SAFETY: one live writable 4-byte allocation range, aligned, exclusively
+        // borrowed through self; no references derived from the slice survive.
+        // Atomic reference ends before subsequent non-atomic mapping operations.
+        Ok(crate::atomic_xadd::exchange_add(
+            unsafe { AtomicU32::from_ptr(pointer.cast()) },
+            addend,
+        ))
     }
     pub fn write(&mut self, address: u64, bytes: &[u8]) -> Result<()> {
         if bytes.is_empty() {
@@ -711,6 +768,10 @@ mod tests {
             assert_eq!(memory.read(address, 16384).unwrap(), &[0; 16384]);
             memory.store(address, 0x1234, 8).unwrap();
             assert!(!memory.executable(address));
+            assert_eq!(memory.anonymous_release_size(address, 1), Ok(16384));
+            assert_eq!(memory.anonymous_release_size(address, 16385), Err(22));
+            assert_eq!(memory.anonymous_release_size(address, u64::MAX), Err(22));
+            assert_eq!(memory.load(address, 8).unwrap(), 0x1234);
             assert_eq!(memory.unmap_anonymous(address, 16385), Err(22));
             let readonly = memory
                 .map_anonymous([0, 1, 1, 0x1002, u64::MAX, 0])

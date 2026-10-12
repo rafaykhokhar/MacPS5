@@ -25,6 +25,13 @@ pub struct Kernel {
     logs: Vec<Vec<u8>>,
 }
 impl Kernel {
+    /// Read-only preflight for the callable stat return-frame guard. The syscall
+    /// still performs its normal pathname/error handling and tracing afterward.
+    pub(crate) fn stat_will_write(&self, memory: &Memory<'_>, path: u64) -> bool {
+        guest_files::read_path(memory, path)
+            .and_then(|path| self.files.stat_record(&path))
+            .is_ok()
+    }
     pub fn errno_address(&self) -> u64 {
         self.errno_address
     }

@@ -34,6 +34,11 @@ pub struct LoadStartError {
     pub message: String,
 }
 pub trait Executor {
+    /// Reject stop/unload while executor-owned waits borrow this image's data.
+    /// Synchronous executors that retain no guest state need no extra checks.
+    fn validate_image_retirement(&self, _image: &Image) -> Result<()> {
+        Ok(())
+    }
     /// Legacy synchronous adapters expose termination separately from their
     /// i32 status result, so process exit cannot become module-start success.
     fn exit_request(&self) -> Option<crate::module_executor::ExitRequest> {
@@ -374,6 +379,7 @@ impl Modules {
         if module.phase != Phase::Started || module.image.is_none() {
             return Err("Module cannot be stopped in its current state".into());
         }
+        executor.validate_image_retirement(module.image.as_ref().unwrap())?;
         if self.modules.values().any(|m| {
             matches!(m.phase, Phase::Started | Phase::Faulted) && m.dependencies.contains(&handle)
         }) {
@@ -877,6 +883,40 @@ mod tests {
         let identity =
             crate::imports::identify("sceAgcDriverSubmitDcb", &BTreeMap::new(), &[]).unwrap();
         assert_eq!(modules.resolve(&identity), None);
+    }
+    #[test]
+    fn semaphore_wait_prevents_image_retirement_before_phase_or_code_changes() {
+        use crate::{guest_memory::Memory, guest_semaphore::Outcome, module_executor::NativeExecutor};
+        let mut file = fixture();
+        file[68..72].copy_from_slice(&7u32.to_le_bytes());
+        let mut modules = Modules::new(4096);
+        let handle = modules.load("semaphore.prx", &file, 0x10000, &[], entries()).unwrap();
+        let mut native = NativeExecutor::new(0x900000, 4096, 1000, 1000).unwrap();
+        let ticket = {
+            let image = modules.modules.get_mut(&handle).unwrap().image.as_mut().unwrap();
+            let segment = &mut image.segments[0];
+            let mut memory = Memory::default();
+            memory.add(segment.address, &mut segment.bytes, true, false).unwrap();
+            let plan = native.semaphores.init(&memory, 0x10180, 0, 0).unwrap();
+            native.semaphores.commit(&mut memory, plan).unwrap();
+            let plan = native.semaphores.wait(&memory, 0x10180, 1, 0,
+                || Err("Untimed wait must not read realtime".into())).unwrap();
+            let Outcome::Pending(ticket) = native.semaphores.commit(&mut memory, plan).unwrap() else {
+                panic!("Expected pending semaphore wait");
+            };
+            ticket
+        };
+        let bytes = modules.bytes();
+        assert!(modules.unload_native(handle, &mut native).is_err());
+        assert_eq!(modules.phase(handle), Some(Phase::Loaded));
+        assert_eq!(modules.bytes(), bytes);
+        modules.modules.get_mut(&handle).unwrap().phase = Phase::Started;
+        assert!(modules.stop(handle, &mut native, Arguments::default()).is_err());
+        assert_eq!(modules.phase(handle), Some(Phase::Started));
+        native.semaphores.abandon(&ticket, 1).unwrap();
+        modules.modules.get_mut(&handle).unwrap().phase = Phase::Stopped;
+        modules.unload_native(handle, &mut native).unwrap();
+        assert_eq!(modules.bytes(), 0);
     }
     #[test]
     fn failed_stop_and_aggregate_budget_preserve_ownership() {
