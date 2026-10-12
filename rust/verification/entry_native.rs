@@ -43,6 +43,7 @@ mod narrow_strings_native;
 mod integer_parse_native;
 mod x87_control_native;
 mod c_locale_native;
+mod float_parse_native;
 mod tiler_native;
 mod tiler_gpu_native;
 mod tls_native;
@@ -90,6 +91,7 @@ fn main() -> Result<(), String> {
     integer_parse_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     x87_control_native::verify(Path::new(&archive), Path::new(&directory))?;
     c_locale_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+    float_parse_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     tiler_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     tiler_gpu_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     user_service_native::verify(Path::new(&archive), Path::new(&directory))?;
@@ -383,6 +385,8 @@ fn main() -> Result<(), String> {
         ("toupper", Service::Ctype(Ctype::Toupper)),
         ("tolower", Service::Ctype(Ctype::Tolower)),
         ("isblank", Service::Ctype(Ctype::Isblank)),
+        ("atof", Service::Atof),
+        ("strtod", Service::Strtod),
     ]
     .into_iter()
     .enumerate()
@@ -1181,7 +1185,7 @@ fn main() -> Result<(), String> {
                 .iter()
                 .find(|s| {
                     locale_slot >= s.address
-                        && locale_slot + 192 <= s.address + s.bytes.len() as u64
+                        && locale_slot + 488 <= s.address + s.bytes.len() as u64
                 })
                 .ok_or("Missing locale import slot")?;
             let locale_offset = (locale_slot - locale_segment.address) as usize;
@@ -1241,6 +1245,13 @@ fn main() -> Result<(), String> {
                 (392, 0x7303c0),
                 (400, 0x7303d0),
                 (408, 0x7303e0),
+                (416, 0x730510),
+                (424, 0x7303f0),
+                (432, 0x730400),
+                (440, 0x730410),
+                (448, 0x730420),
+                (456, 0x730520),
+                (480, 0x730430),
             ] {
                 if locale_segment.bytes[locale_offset + delta..locale_offset + delta + 8]
                     != expected.to_le_bytes()
@@ -1267,14 +1278,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 86 libc exports: (86+1)*24=2088 symbol bytes (rounded2096)
-                // and 1+86*12=1033 NID bytes (rounded1040). Fourteen C-locale
-                // exports add336+160bytes to16976. Resolver still stops at atof
-                // before reaching their GOT slots; retain exact32KiB cap.
-                || native.bytes_allocated() != 17472
+                // 88 libc exports: (88+1)*24=2136 symbol bytes (rounded2144)
+                // and 1+88*12=1057 NID bytes (rounded1072). Two float exports
+                // add48+32bytes to17472; retain the exact32KiB cap.
+                || native.bytes_allocated() != 17552
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'atof'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'vsscanf'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1284,7 +1294,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; atoi import bound; unresolved atof causes a captured exit request before later integer bindings; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; integer/float conversions and strncasecmp imports bound; unresolved vsscanf causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1346,7 +1356,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved atof triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved vsscanf triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     Ok(())

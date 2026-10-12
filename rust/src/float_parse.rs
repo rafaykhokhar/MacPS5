@@ -1,6 +1,7 @@
 //! Bounded locale-independent binary64 parser. No host floating-point operation.
 //! Pure conversion engine; guest fenv/errno service integration remains separate.
 mod big;
+pub mod effects;
 use big::Big;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rounding {
