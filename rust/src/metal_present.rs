@@ -226,6 +226,10 @@ mod apple {
         faulted: bool,
         _thread: std::marker::PhantomData<std::rc::Rc<()>>,
     }
+    enum Attempt {
+        Presented(Evidence),
+        Skipped(String),
+    }
     impl Presenter {
         pub fn new(width: u32, height: u32) -> Result<Self> {
             main_thread()?;
@@ -304,25 +308,57 @@ mod apple {
             }
         }
         pub fn present(&mut self, rgba: &[u8]) -> Result<Evidence> {
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let started = Instant::now();
+            let deadline = started + Duration::from_secs(3);
+            let mut skipped = Vec::new();
             for attempts in 1..=3 {
                 if Instant::now() >= deadline {
                     break;
                 }
                 match self.present_once(rgba, deadline) {
-                    Ok(mut evidence) => {
+                    Ok(Attempt::Presented(mut evidence)) => {
                         evidence.attempts = attempts;
                         return Ok(evidence);
                     }
-                    Err(error) if error == "Drawable skipped by compositor" => {
+                    Ok(Attempt::Skipped(details)) => {
+                        skipped.push(format!("attempt {attempts}: {details}"));
                         self.pump(Duration::from_millis(100))?;
                     }
                     Err(error) => return Err(error),
                 }
             }
-            Err("Drawable retry count or presentation deadline exhausted".into())
+            Err(format!(
+                "Drawable retry count or presentation deadline exhausted after {:.3}s; {} skipped attempts; {}",
+                started.elapsed().as_secs_f64(),
+                skipped.len(),
+                skipped.join("; ")
+            ))
         }
-        fn present_once(&mut self, rgba: &[u8], deadline: Instant) -> Result<Evidence> {
+        /// Observations only: visibility and GPU completion do not prove presentation.
+        unsafe fn presentation_state(&self, window: Obj) -> String {
+            unsafe {
+                let bounds = msg!(self.layer.0,"bounds"=>Rect);
+                let size = msg!(self.layer.0,"drawableSize"=>Size);
+                format!(
+                    "device={:?}, appActive={}, appHidden={}, windowVisible={}, miniaturized={}, occlusion={:#x}, screenAttached={}, layerBounds={}x{}, drawableSize={}x{}, layerHidden={}, layerOpacity={}, superlayerAttached={}",
+                    self.name,
+                    msg!(self.app,"isActive"=>bool),
+                    msg!(self.app,"isHidden"=>bool),
+                    msg!(window,"isVisible"=>bool),
+                    msg!(window,"isMiniaturized"=>bool),
+                    msg!(window,"occlusionState"=>usize),
+                    !msg!(window,"screen"=>Obj).is_null(),
+                    bounds.size.width,
+                    bounds.size.height,
+                    size.width,
+                    size.height,
+                    msg!(self.layer.0,"isHidden"=>bool),
+                    msg!(self.layer.0,"opacity"=>f32),
+                    !msg!(self.layer.0,"superlayer"=>Obj).is_null(),
+                )
+            }
+        }
+        fn present_once(&mut self, rgba: &[u8], deadline: Instant) -> Result<Attempt> {
             main_thread()?;
             if self.window.is_none() || self.faulted {
                 return Err("Presenter closed or faulted".into());
@@ -341,7 +377,16 @@ mod apple {
                 if !msg!(window.0,"isVisible"=>bool) {
                     return Err("Presenter window is not visible".into());
                 }
-                let drawable = checked(msg!(self.layer.0,"nextDrawable"=>Obj))?;
+                let acquisition = Instant::now();
+                let drawable = msg!(self.layer.0,"nextDrawable"=>Obj);
+                if drawable.is_null() {
+                    return Err(format!(
+                        "Metal nextDrawable returned nil after {:.3}s; {}",
+                        acquisition.elapsed().as_secs_f64(),
+                        self.presentation_state(window.0)
+                    ));
+                }
+                let callbacks_before = PRESENT_CALLBACKS.load(std::sync::atomic::Ordering::Relaxed);
                 FINISHED_DRAWABLE.store(0, std::sync::atomic::Ordering::Release);
                 msg!(drawable,"addPresentedHandler:"=>(),*const PresentedBlock=>&PRESENTED_BLOCK);
                 let target = checked(msg!(drawable,"texture"=>Obj))?;
@@ -366,30 +411,39 @@ mod apple {
                     let status = msg!(command,"status"=>usize);
                     if status == 5 {
                         self.faulted = true;
-                        return Err("Metal presentation command failed".into());
+                        let error = msg!(command,"error"=>Obj);
+                        let description = msg!(error,"description"=>Obj);
+                        let bytes = msg!(description,"UTF8String"=>*const c_char);
+                        let reason = if bytes.is_null() {
+                            "no NSError description".into()
+                        } else {
+                            CStr::from_ptr(bytes).to_string_lossy().into_owned()
+                        };
+                        return Err(format!(
+                            "Metal presentation command failed: {reason}; {}",
+                            self.presentation_state(window.0)
+                        ));
                     }
                     let time = msg!(drawable,"presentedTime"=>f64);
                     if status == 4 && time.is_finite() && time > 0.0 {
-                        return Ok(Evidence {
+                        return Ok(Attempt::Presented(Evidence {
                             device_name: self.name.clone(),
                             presented_time: time,
                             drawable_id: msg!(drawable,"drawableID"=>usize),
                             attempts: 1,
-                        });
+                        }));
                     }
                     if Instant::now() >= deadline {
-                        eprintln!(
-                            "Presented callback count={}",
-                            PRESENT_CALLBACKS.load(std::sync::atomic::Ordering::Relaxed)
-                        );
                         self.faulted = true;
-                        let bounds = msg!(self.layer.0,"bounds"=>Rect);
                         return Err(format!(
-                            "Drawable was not confirmed presented before deadline: command={status}, presentedTime={time}, occlusion={}, layer={}x{}, super={:?}",
-                            msg!(window.0,"occlusionState"=>usize),
-                            bounds.size.width,
-                            bounds.size.height,
-                            msg!(self.layer.0,"superlayer"=>Obj)
+                            "Drawable was not confirmed presented before deadline: command={status}, presentedTime={time}, drawableID={}, callbackMatched={}, callbacksSinceAttempt={}, {}",
+                            msg!(drawable,"drawableID"=>usize),
+                            FINISHED_DRAWABLE.load(std::sync::atomic::Ordering::Acquire)
+                                == drawable as usize,
+                            PRESENT_CALLBACKS
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                .wrapping_sub(callbacks_before),
+                            self.presentation_state(window.0)
                         ));
                     }
                     if status == 4
@@ -397,7 +451,14 @@ mod apple {
                             == drawable as usize
                         && time == 0.0
                     {
-                        return Err("Drawable skipped by compositor".into());
+                        return Ok(Attempt::Skipped(format!(
+                            "command={status}, presentedTime={time}, drawableID={}, callbackMatched=true, callbacksSinceAttempt={}, {}",
+                            msg!(drawable,"drawableID"=>usize),
+                            PRESENT_CALLBACKS
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                .wrapping_sub(callbacks_before),
+                            self.presentation_state(window.0)
+                        )));
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 }
