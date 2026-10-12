@@ -16,7 +16,7 @@ pub const MXCSR_VALID: u32 = 0xffff;
 /// Not a claim that a complete guest exception delivery mechanism exists.
 pub const CONTROL_FAULT: u64 = 14;
 pub fn mxcsr(cpu: &Cpu) -> u32 {
-    cpu.padding as u32
+    cpu.mxcsr
 }
 pub fn load_mxcsr(cpu: &mut Cpu, value: u32) {
     if cpu.fault != 0 {
@@ -26,7 +26,7 @@ pub fn load_mxcsr(cpu: &mut Cpu, value: u32) {
         cpu.fault = CONTROL_FAULT;
         return;
     }
-    cpu.padding = value as u64;
+    cpu.mxcsr = value;
 }
 #[allow(unsafe_code)]
 mod abi {
@@ -53,11 +53,11 @@ mod tests {
             assert_eq!(mxcsr(&cpu.clone()), value);
             assert_eq!(cpu.fault, 0);
         }
-        let before = cpu.padding;
+        let before = cpu.mxcsr;
         load_mxcsr(&mut cpu, 0x10000);
         assert_eq!(cpu.fault, CONTROL_FAULT);
-        assert_eq!(cpu.padding, before);
+        assert_eq!(cpu.mxcsr, before);
         load_mxcsr(&mut cpu, 0);
-        assert_eq!(cpu.padding, before);
+        assert_eq!(cpu.mxcsr, before);
     }
 }

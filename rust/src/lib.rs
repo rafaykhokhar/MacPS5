@@ -53,6 +53,7 @@ pub mod libc_memory;
 pub mod guest_locale;
 pub mod guest_signal;
 pub mod guest_sched;
+pub mod x87_control;
 pub mod narrow_strings;
 pub mod captured_stdout;
 pub mod guest_stdio;

@@ -64,10 +64,10 @@ fn main() {
     let mut control=0x1f80|(rounding<<13)|daz|4;
     if unmask {control&=!(status<<7);}
     let mut data=bits.to_le_bytes();let mut memory=Memory::default();memory.add(0x300000,&mut data,false,false).unwrap();
-    let mut cpu=Cpu{rip:0xc3f2e,fuel:20,flags:0xad7,padding:control as u64,memory:(&mut memory as *mut Memory<'_>)as u64,..Cpu::default()};
+    let mut cpu=Cpu{rip:0xc3f2e,fuel:20,flags:0xad7,mxcsr:control,memory:(&mut memory as *mut Memory<'_>)as u64,..Cpu::default()};
     cpu.registers=[0xa5a5a5a5a5a5a5a5;16];cpu.registers[7]=0x300000;cpu.vectors=[[0x5a;32];16];cpu.vectors[src][..8].copy_from_slice(&bits.to_le_bytes());let before=cpu.clone();
-    unsafe{block(&mut cpu)};
-    assert_eq!(cpu.flags,before.flags);assert_eq!(cpu.vectors,before.vectors);assert_eq!(cpu.padding,(control|status)as u64);
+    cpu.x87_control=0x0b7f;cpu.x87_status=0x20;unsafe{block(&mut cpu)};assert_eq!((cpu.x87_control,cpu.x87_status),(0x0b7f,0x20));
+    assert_eq!(cpu.flags,before.flags);assert_eq!(cpu.vectors,before.vectors);assert_eq!(cpu.mxcsr,(control|status));
     let fault=unmask&&status!=0;assert_eq!(cpu.fault,if fault{15}else{0});
     assert_eq!(cpu.registers[dst],if fault{before.registers[dst]}else{expected});
     if fault{assert_eq!(cpu.rip,before.rip);}
@@ -77,7 +77,7 @@ fn main() {
   if from_memory {
    let mut data=[0u8;7];let mut memory=Memory::default();memory.add(0x300000,&mut data,false,false).unwrap();
    let mut cpu=Cpu{rip:0xc3f2e,fuel:20,flags:0xad7,memory:(&mut memory as *mut Memory<'_>)as u64,..Cpu::default()};cpu.registers[7]=0x300000;cpu.registers[dst]=u64::MAX;let before=cpu.clone();
-   unsafe{block(&mut cpu)};assert_eq!(cpu.fault,1);assert_eq!(cpu.registers,before.registers);assert_eq!(cpu.padding,before.padding);assert_eq!(cpu.rip,before.rip);
+   cpu.x87_control=0x0b7f;cpu.x87_status=0x20;unsafe{block(&mut cpu)};assert_eq!((cpu.x87_control,cpu.x87_status),(0x0b7f,0x20));assert_eq!(cpu.fault,1);assert_eq!(cpu.registers,before.registers);assert_eq!(cpu.mxcsr,before.mxcsr);assert_eq!(cpu.rip,before.rip);
   }
  }
  println!("PASS ARM64 signed32 VCVTTSD2SI register/high-register/guarded memory, integer bounds, DAZ, RC-independent truncation, NaN/infinity, sticky flags, unmasked destination/RIP preservation and GPR zero extension");

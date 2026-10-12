@@ -365,7 +365,7 @@ mod abi {
         }
         match multiply_binary64(a, b, super::super::mxcsr(cpu)) {
             Ok(result) => {
-                cpu.padding = result.mxcsr as u64;
+                cpu.mxcsr = result.mxcsr;
                 result.bits
             }
             Err(FpUnsupported::ReservedControl) => {
@@ -373,7 +373,7 @@ mod abi {
                 0
             }
             Err(FpUnsupported::Exception { mxcsr, .. }) => {
-                cpu.padding = mxcsr as u64;
+                cpu.mxcsr = mxcsr;
                 cpu.fault = 15;
                 0
             }

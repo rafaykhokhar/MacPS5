@@ -845,7 +845,11 @@ impl ThreadRequest {
             .as_ref()
             .ok_or("Thread request consumed")?
             .cpu
-            .padding as u32)
+            .mxcsr)
+    }
+    pub fn x87_environment(&self) -> Result<(u16, u16)> {
+        let cpu = &self.continuation.as_ref().ok_or("Thread request already consumed")?.cpu;
+        Ok((cpu.x87_control, cpu.x87_status))
     }
 }
 pub enum Execution {
@@ -1032,10 +1036,10 @@ impl NativeExecutor {
         &mut self,
         image: &Image,
         dependencies: &[&mut Image],
-        setup: (u64, u64, u64, u32, u64),
+        setup: (u64, u64, u64, u32, u64, (u16, u16)),
         data: &mut [DataRegion<'_>],
     ) -> Result<QuantumYield> {
-        let (thread, entry, argument, mxcsr, stack_size) = setup;
+        let (thread, entry, argument, mxcsr, stack_size, x87) = setup;
         if stack_size != self.stack_size as u64 {
             return Err("Requested thread stack size is unsupported by configured executor".into());
         }
@@ -1100,7 +1104,9 @@ impl NativeExecutor {
             bias: owner.bias,
             rip: entry - owner.bias,
             fuel: self.fuel,
-            padding: u64::from(mxcsr),
+            mxcsr,
+            x87_control: x87.0,
+            x87_status: x87.1,
             ..Cpu::default()
         };
         cpu.registers[4] = address + stack_size - 8;

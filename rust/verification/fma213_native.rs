@@ -79,14 +79,14 @@ fn main(){
    (0x3ff0000000000000,0x3ff0000000000000,0x3ca0000000000000,0x5f80,0x3ff0000000000001,32,false),
    (0x3ff0000000000000,0x3ff0000000000000,0x3ca0000000000000,0x0f80,0,32,true),
   ]{
-   let mut data=c.to_le_bytes();let mut memory=Memory::default();memory.add(0x300000,&mut data,false,false).unwrap();let mut cpu=Cpu{rip:0xc3f2e,fuel:20,flags:0xad7,padding:control as u64,memory:(&mut memory as *mut Memory<'_>)as u64,..Cpu::default()};cpu.registers[7]=0x300000;
-   for i in 0..16{cpu.vectors[i]=[i as u8+0x40;32];}cpu.vectors[dst][..8].copy_from_slice(&a.to_le_bytes());cpu.vectors[first][..8].copy_from_slice(&b.to_le_bytes());if !mem{cpu.vectors[second][..8].copy_from_slice(&c.to_le_bytes());}let before=cpu.clone();unsafe{block(&mut cpu)};
-   assert_eq!(cpu.fault,if fault{15}else{0});assert_eq!(cpu.padding,(control|status)as u64);assert_eq!(cpu.flags,before.flags);assert_eq!(cpu.registers,before.registers);
+   let mut data=c.to_le_bytes();let mut memory=Memory::default();memory.add(0x300000,&mut data,false,false).unwrap();let mut cpu=Cpu{rip:0xc3f2e,fuel:20,flags:0xad7,mxcsr:control,memory:(&mut memory as *mut Memory<'_>)as u64,..Cpu::default()};cpu.registers[7]=0x300000;
+   for i in 0..16{cpu.vectors[i]=[i as u8+0x40;32];}cpu.vectors[dst][..8].copy_from_slice(&a.to_le_bytes());cpu.vectors[first][..8].copy_from_slice(&b.to_le_bytes());if !mem{cpu.vectors[second][..8].copy_from_slice(&c.to_le_bytes());}let before=cpu.clone();cpu.x87_control=0x0b7f;cpu.x87_status=0x20;unsafe{block(&mut cpu)};assert_eq!((cpu.x87_control,cpu.x87_status),(0x0b7f,0x20));
+   assert_eq!(cpu.fault,if fault{15}else{0});assert_eq!(cpu.mxcsr,(control|status));assert_eq!(cpu.flags,before.flags);assert_eq!(cpu.registers,before.registers);
    if fault{assert_eq!(cpu.vectors,before.vectors);assert_eq!(cpu.rip,before.rip);}else{assert_eq!(cpu.vectors[dst][..8],result.to_le_bytes());assert_eq!(cpu.vectors[dst][8..16],before.vectors[dst][8..16]);assert_eq!(cpu.vectors[dst][16..],[0;16]);for i in 0..16{if i!=dst{assert_eq!(cpu.vectors[i],before.vectors[i]);}}}
   }
  }
  let mut cpu=Cpu{rip:0xc3f2e,fuel:20,..Cpu::default()};cpu.vectors=[[0xa5;32];16];cpu.vectors[4][..8].copy_from_slice(&0x4008000000000000u64.to_le_bytes());unsafe{fma_alias(&mut cpu)};assert_eq!(cpu.fault,0);assert_eq!(cpu.vectors[4][..8],0x4028000000000000u64.to_le_bytes());assert_eq!(cpu.vectors[4][8..16],[0xa5;8]);assert_eq!(cpu.vectors[4][16..],[0;16]);
- let mut data=[0u8;7];let mut memory=Memory::default();memory.add(0x300000,&mut data,false,false).unwrap();let mut cpu=Cpu{rip:0xc3f2e,fuel:20,memory:(&mut memory as *mut Memory<'_>)as u64,..Cpu::default()};cpu.registers[7]=0x300000;cpu.vectors=[[0x5a;32];16];let before=cpu.clone();unsafe{fma_memory(&mut cpu)};assert_eq!(cpu.fault,1);assert_eq!(cpu.vectors,before.vectors);assert_eq!(cpu.padding,before.padding);assert_eq!(cpu.rip,before.rip);
+ let mut data=[0u8;7];let mut memory=Memory::default();memory.add(0x300000,&mut data,false,false).unwrap();let mut cpu=Cpu{rip:0xc3f2e,fuel:20,memory:(&mut memory as *mut Memory<'_>)as u64,..Cpu::default()};cpu.registers[7]=0x300000;cpu.vectors=[[0x5a;32];16];let before=cpu.clone();unsafe{fma_memory(&mut cpu)};assert_eq!(cpu.fault,1);assert_eq!(cpu.vectors,before.vectors);assert_eq!(cpu.mxcsr,before.mxcsr);assert_eq!(cpu.rip,before.rip);
  println!("PASS ARM64 VFMADD213SD NaN priority/sNaN/invalid infinity, fused cancellation, rounding/precision, exactzero sign, aliases/high-register, old-destination upper-lane preservation, YMM upperzero and guarded memory");
 }
 "#;

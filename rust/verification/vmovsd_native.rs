@@ -68,12 +68,12 @@ fn main(){control_checks();conversion_checks();
   for payload in [0u64,0x8000000000000000,0x7ff0000000000001,0x7ff8123456789abc,u64::MAX]{
    let mut bytes=payload.to_le_bytes();let mut memory=Memory::default();memory.add(address,&mut bytes,false,false).unwrap();
    let mut cpu=Cpu{rip:0xc3f2e,fuel:20,flags:0xad7,memory:(&mut memory as *mut Memory<'_>)as u64,..Cpu::default()};cpu.registers[7]=address;cpu.vectors=[[0xa5;32];16];let before=cpu.vectors;
-   unsafe{block(&mut cpu)};assert_eq!(cpu.fault,0);assert_eq!(cpu.flags,0xad7);assert_eq!(cpu.vectors[dst][..8],payload.to_le_bytes());assert_eq!(cpu.vectors[dst][8..],[0;24]);
+   cpu.x87_control=0x0b7f;cpu.x87_status=0x20;unsafe{block(&mut cpu)};assert_eq!((cpu.x87_control,cpu.x87_status),(0x0b7f,0x20));assert_eq!(cpu.fault,0);assert_eq!(cpu.flags,0xad7);assert_eq!(cpu.vectors[dst][..8],payload.to_le_bytes());assert_eq!(cpu.vectors[dst][8..],[0;24]);
    for i in 0..16{if i!=dst{assert_eq!(cpu.vectors[i],before[i]);}}
   }
   let mut bytes=[0u8;7];let mut memory=Memory::default();memory.add(address,&mut bytes,false,false).unwrap();
   let mut cpu=Cpu{rip:0xc3f2e,fuel:20,flags:0xad7,memory:(&mut memory as *mut Memory<'_>)as u64,..Cpu::default()};cpu.registers[7]=address;cpu.vectors=[[0x5a;32];16];let before=cpu.vectors;
-  unsafe{block(&mut cpu)};assert_eq!(cpu.fault,1);assert_eq!(cpu.flags,0xad7);assert_eq!(cpu.vectors,before);
+  cpu.x87_control=0x0b7f;cpu.x87_status=0x20;unsafe{block(&mut cpu)};assert_eq!((cpu.x87_control,cpu.x87_status),(0x0b7f,0x20));assert_eq!(cpu.fault,1);assert_eq!(cpu.flags,0xad7);assert_eq!(cpu.vectors,before);
  }
  println!("PASS: ARM64 VMOVSD guarded8-byte bit-copy, RIP/high-register addressing, VEX upperzero, NaN/negativezero payloads and fault atomicity");
 }
@@ -84,19 +84,19 @@ fn conversion_checks(){
   for(value,bits)in [(i32::MIN,0xc1e0000000000000u64),(-1,0xbff0000000000000),(0,0),(1,0x3ff0000000000000),(i32::MAX,0x41dfffffffc00000)]{
    let mut bytes=value.to_le_bytes();let mut memory=Memory::default();memory.add(0x300000,&mut bytes,false,false).unwrap();
    let mut cpu=Cpu{rip:0xc3f2e,fuel:20,flags:0xad7,memory:(&mut memory as *mut Memory<'_>)as u64,..Cpu::default()};cpu.registers[7]=0x300000;cpu.registers[9]=0xdeadbeef00000000|value as u32 as u64;cpu.vectors=[[0xa5;32];16];cpu.vectors[15][8..16].copy_from_slice(&0x7ff0000000000001u64.to_le_bytes());let before=cpu.vectors;
-   unsafe{block(&mut cpu)};assert_eq!(cpu.fault,0);assert_eq!(cpu.flags,0xad7);assert_eq!(cpu.vectors[dst][..8],bits.to_le_bytes());assert_eq!(cpu.vectors[dst][8..16],before[15][8..16]);assert_eq!(cpu.vectors[dst][16..],[0;16]);for i in 0..16{if i!=dst{assert_eq!(cpu.vectors[i],before[i]);}}
+   cpu.x87_control=0x0b7f;cpu.x87_status=0x20;unsafe{block(&mut cpu)};assert_eq!((cpu.x87_control,cpu.x87_status),(0x0b7f,0x20));assert_eq!(cpu.fault,0);assert_eq!(cpu.flags,0xad7);assert_eq!(cpu.vectors[dst][..8],bits.to_le_bytes());assert_eq!(cpu.vectors[dst][8..16],before[15][8..16]);assert_eq!(cpu.vectors[dst][16..],[0;16]);for i in 0..16{if i!=dst{assert_eq!(cpu.vectors[i],before[i]);}}
   }
-  if from_memory{let mut bytes=[0u8;3];let mut memory=Memory::default();memory.add(0x300000,&mut bytes,false,false).unwrap();let mut cpu=Cpu{rip:0xc3f2e,fuel:20,memory:(&mut memory as *mut Memory<'_>)as u64,..Cpu::default()};cpu.registers[7]=0x300000;cpu.vectors=[[0x5a;32];16];let before=cpu.vectors;unsafe{block(&mut cpu)};assert_eq!(cpu.fault,1);assert_eq!(cpu.vectors,before);}
+  if from_memory{let mut bytes=[0u8;3];let mut memory=Memory::default();memory.add(0x300000,&mut bytes,false,false).unwrap();let mut cpu=Cpu{rip:0xc3f2e,fuel:20,memory:(&mut memory as *mut Memory<'_>)as u64,..Cpu::default()};cpu.registers[7]=0x300000;cpu.vectors=[[0x5a;32];16];let before=cpu.vectors;cpu.x87_control=0x0b7f;cpu.x87_status=0x20;unsafe{block(&mut cpu)};assert_eq!((cpu.x87_control,cpu.x87_status),(0x0b7f,0x20));assert_eq!(cpu.fault,1);assert_eq!(cpu.vectors,before);}
  }
  println!("PASS: ARM64 exact signed32 VCVTSI2SD conversion, aliased merge/high-register/upperzero and guarded memory atomicity");
 }
 fn control_checks(){
  for load in [control_load as unsafe extern "C" fn(*mut Cpu),control_vload]{
-  for value in [0u32,0xffff,0x1f80,0x10000]{let mut data=value.to_le_bytes();let mut memory=Memory::default();memory.add(0x300000,&mut data,false,false).unwrap();let mut cpu=Cpu{rip:0xc3f2e,fuel:20,flags:0xad7,memory:(&mut memory as *mut Memory<'_>)as u64,..Cpu::default()};cpu.registers[7]=0x300000;unsafe{load(&mut cpu)};assert_eq!(cpu.flags,0xad7);if value<=0xffff{assert_eq!(cpu.fault,0);assert_eq!(cpu.padding,value as u64);}else{assert_eq!(cpu.fault,14);assert_eq!(cpu.padding,0x1f80);}}
-  let mut data=[0u8;3];let mut memory=Memory::default();memory.add(0x300000,&mut data,false,false).unwrap();let mut cpu=Cpu{rip:0xc3f2e,fuel:20,memory:(&mut memory as *mut Memory<'_>)as u64,..Cpu::default()};cpu.registers[7]=0x300000;unsafe{load(&mut cpu)};assert_eq!(cpu.fault,1);assert_eq!(cpu.padding,0x1f80);
+  for value in [0u32,0xffff,0x1f80,0x10000]{let mut data=value.to_le_bytes();let mut memory=Memory::default();memory.add(0x300000,&mut data,false,false).unwrap();let mut cpu=Cpu{rip:0xc3f2e,fuel:20,flags:0xad7,memory:(&mut memory as *mut Memory<'_>)as u64,..Cpu::default()};cpu.registers[7]=0x300000;unsafe{load(&mut cpu)};assert_eq!(cpu.flags,0xad7);if value<=0xffff{assert_eq!(cpu.fault,0);assert_eq!(cpu.mxcsr,value);}else{assert_eq!(cpu.fault,14);assert_eq!(cpu.mxcsr,0x1f80);}}
+  let mut data=[0u8;3];let mut memory=Memory::default();memory.add(0x300000,&mut data,false,false).unwrap();let mut cpu=Cpu{rip:0xc3f2e,fuel:20,memory:(&mut memory as *mut Memory<'_>)as u64,..Cpu::default()};cpu.registers[7]=0x300000;unsafe{load(&mut cpu)};assert_eq!(cpu.fault,1);assert_eq!(cpu.mxcsr,0x1f80);
  }
  for store in [control_store as unsafe extern "C" fn(*mut Cpu),control_vstore]{
-  for writable in [true,false]{let mut data=[0x5au8;4];let mut memory=Memory::default();memory.add(0x300000,&mut data,writable,false).unwrap();let mut cpu=Cpu{rip:0xc3f2e,fuel:20,padding:0x8040,memory:(&mut memory as *mut Memory<'_>)as u64,..Cpu::default()};cpu.registers[7]=0x300000;unsafe{store(&mut cpu)};assert_eq!(cpu.padding,0x8040);assert_eq!(cpu.fault,if writable{0}else{2});assert_eq!(memory.read(0x300000,4).unwrap(),if writable{&[0x40,0x80,0,0]}else{&[0x5a;4]});}
+  for writable in [true,false]{let mut data=[0x5au8;4];let mut memory=Memory::default();memory.add(0x300000,&mut data,writable,false).unwrap();let mut cpu=Cpu{rip:0xc3f2e,fuel:20,mxcsr:0x8040,memory:(&mut memory as *mut Memory<'_>)as u64,..Cpu::default()};cpu.registers[7]=0x300000;unsafe{store(&mut cpu)};assert_eq!(cpu.mxcsr,0x8040);assert_eq!(cpu.fault,if writable{0}else{2});assert_eq!(memory.read(0x300000,4).unwrap(),if writable{&[0x40,0x80,0,0]}else{&[0x5a;4]});}
  }
  println!("PASS: ARM64 legacy/VEX MXCSR load-store, real zero/reset, reserved-bit fault14, guard atomicity, no host FP state dependency");
 }

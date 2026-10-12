@@ -385,9 +385,141 @@ fn nan_payload(s: &[u8], open: usize) -> (usize, u64) {
     (end, payload.max(1))
 }
 
+/// FreeBSD11.4 gdtoa policy is distinct from mathematical IEEE rounding.
+/// In particular, hexadecimal overflow returns infinity for every mode;
+/// decimal subnormals set ERANGE while ordinary hexadecimal subnormals do not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FreeBsdParsed {
+    pub bits: u64,
+    pub end: usize,
+    pub errno: Option<i32>,
+    pub mathematical_range: Option<Range>,
+    pub inexact: bool,
+}
+pub fn parse_freebsd(input: &[u8], rounding: Rounding) -> Result<FreeBsdParsed, Error> {
+    let result = parse(input, rounding)?;
+    let mut bits = result.bits;
+    let magnitude = bits & !SIGN;
+    let token = &input[..result.end];
+    let start = token
+        .iter()
+        .position(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c'))
+        .unwrap_or(token.len());
+    let mut token = &token[start..];
+    if matches!(token.first(), Some(b'+' | b'-')) {
+        token = &token[1..];
+    }
+    let hex = token.starts_with(b"0x") || token.starts_with(b"0X");
+    let finite = token
+        .first()
+        .is_some_and(|b| b.is_ascii_digit() || *b == b'.');
+    let nonzero = magnitude != 0 || result.inexact;
+    let range = if !finite || !nonzero {
+        false
+    } else if hex {
+        if result.range == Some(Range::Overflow) {
+            bits = (bits & SIGN) | INF;
+            true
+        } else {
+            // gethex n>=nbits: the exact magnitude is below the minimum
+            // subnormal. Other inexact hexadecimal subnormals preserve errno.
+            parse(input, Rounding::TowardZero)?.bits & !SIGN == 0
+        }
+    } else {
+        if magnitude < (1 << 52) && decimal_approximation_exponent(token) <= -512 {
+            // strtod.c e1>>4 >= 1<<n_bigtens reaches undfl before refinement.
+            bits &= SIGN;
+        } else if magnitude == 0 && rounding == Rounding::Down && bits & SIGN == 0 {
+            // The downward decimal refinement reaches negative zero through
+            // exact cancellation; the early undfl shortcut above does not.
+            bits = SIGN;
+        }
+        result.range == Some(Range::Overflow) || magnitude < (1 << 52)
+    };
+    Ok(FreeBsdParsed {
+        bits,
+        end: result.end,
+        errno: range.then_some(34),
+        mathematical_range: result.range,
+        inexact: result.inexact,
+    })
+}
+fn decimal_approximation_exponent(token: &[u8]) -> i32 {
+    let mut point = false;
+    let mut fractional = 0i32;
+    let mut digits = 0i32;
+    let mut nonzero = false;
+    let mut trailing = 0i32;
+    let mut at = 0;
+    while let Some(&b) = token.get(at) {
+        if b == b'.' {
+            point = true;
+            at += 1;
+            continue;
+        }
+        if !b.is_ascii_digit() {
+            break;
+        }
+        nonzero |= b != b'0';
+        if nonzero {
+            digits += 1;
+        }
+        if point {
+            fractional += 1;
+            trailing = if b == b'0' { trailing + 1 } else { 0 };
+        }
+        at += 1;
+    }
+    fractional -= trailing;
+    digits -= trailing.min(digits);
+    let mut exponent = 0i32;
+    if matches!(token.get(at), Some(b'e' | b'E')) {
+        at += 1;
+        let negative = token.get(at) == Some(&b'-');
+        if matches!(token.get(at), Some(b'+' | b'-')) {
+            at += 1;
+        }
+        while let Some(d) = token.get(at).and_then(|b| digit(*b, 10)) {
+            exponent = (exponent.saturating_mul(10) + d as i32).min(1_000_000);
+            at += 1;
+        }
+        if negative {
+            exponent = -exponent;
+        }
+    }
+    exponent - fractional + (digits - 16).max(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn freebsd_range_policy_is_separate_from_ieee_rounding() {
+        for (text, rounding, bits, errno) in [
+            ("0x1p-1074", Rounding::NearestEven, 1, None),
+            ("0x1.1p-1074", Rounding::NearestEven, 1, None),
+            ("0x1p-1075", Rounding::Up, 1, Some(34)),
+            ("5e-324", Rounding::NearestEven, 1, Some(34)),
+            (
+                "2.2250738585072012e-308",
+                Rounding::NearestEven,
+                1 << 52,
+                None,
+            ),
+            ("0x1p1024", Rounding::TowardZero, INF, Some(34)),
+            ("1e309", Rounding::TowardZero, INF - 1, Some(34)),
+            ("1e-400", Rounding::Down, SIGN, Some(34)),
+            ("1e-5000", Rounding::Up, 0, Some(34)),
+        ] {
+            let parsed = parse_freebsd(text.as_bytes(), rounding).unwrap();
+            assert_eq!((parsed.bits, parsed.errno), (bits, errno), "{text}");
+            assert_eq!(parsed.end, text.len());
+        }
+        assert_eq!(
+            parse(b"0x1p1024", Rounding::TowardZero).unwrap().bits,
+            INF - 1
+        );
+    }
     #[test]
     fn syntax_and_extremes() {
         for (s, bits, end) in [

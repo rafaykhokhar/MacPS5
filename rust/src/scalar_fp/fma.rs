@@ -165,7 +165,7 @@ mod abi {
         }
         match fma213_binary64(olddst, src1, src2, super::super::mxcsr(cpu)) {
             Ok(result) => {
-                cpu.padding = result.mxcsr as u64;
+                cpu.mxcsr = result.mxcsr;
                 result.bits
             }
             Err(FpUnsupported::ReservedControl) => {
@@ -173,7 +173,7 @@ mod abi {
                 0
             }
             Err(FpUnsupported::Exception { mxcsr, .. }) => {
-                cpu.padding = mxcsr as u64;
+                cpu.mxcsr = mxcsr;
                 cpu.fault = 15;
                 0
             }

@@ -240,6 +240,7 @@ impl Scheduler {
                         |memory| memory.validate_write(output, 8),
                     )?;
                     let mxcsr = request.mxcsr()?;
+                    let x87 = request.x87_environment()?;
                     let id = native.tls.next_thread_id()?.max(self.next_thread);
                     let next = id.checked_add(1).ok_or("Thread identity overflow")?;
                     let mut child_mappings: Vec<_> = mappings
@@ -256,7 +257,7 @@ impl Scheduler {
                     let prepared = native.prepare_worker(
                         image,
                         dependencies,
-                        (id, entry, argument, mxcsr, options.stack_size),
+                        (id, entry, argument, mxcsr, options.stack_size, x87),
                         &mut child_mappings,
                     );
                     native.fuel = old_fuel;

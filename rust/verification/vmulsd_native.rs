@@ -78,15 +78,15 @@ fn main(){control_vectors();
     // is tested separately by model; here unmask only the actual precondition.
     let control=if unmask {0x1f80 & !((status & 3)<<7)}else{0x1f80};
     let mut data=b.to_le_bytes();let mut memory=Memory::default();memory.add(0x300000,&mut data,false,false).unwrap();
-    let mut cpu=Cpu{rip:0xc3f2e,fuel:20,flags:0xad7,padding:control as u64,memory:(&mut memory as *mut Memory<'_>)as u64,..Cpu::default()};cpu.registers[7]=0x300000;cpu.vectors=[[0xa5;32];16];cpu.vectors[first][..8].copy_from_slice(&a.to_le_bytes());if !mem{cpu.vectors[second][..8].copy_from_slice(&b.to_le_bytes());}let before=cpu.clone();
-    unsafe{block(&mut cpu)};let fault=unmask && status&3!=0;
-    assert_eq!(cpu.fault,if fault{15}else{0});assert_eq!(cpu.padding,(control|status)as u64);assert_eq!(cpu.flags,before.flags);assert_eq!(cpu.registers,before.registers);
+    let mut cpu=Cpu{rip:0xc3f2e,fuel:20,flags:0xad7,mxcsr:control,memory:(&mut memory as *mut Memory<'_>)as u64,..Cpu::default()};cpu.registers[7]=0x300000;cpu.vectors=[[0xa5;32];16];cpu.vectors[first][..8].copy_from_slice(&a.to_le_bytes());if !mem{cpu.vectors[second][..8].copy_from_slice(&b.to_le_bytes());}let before=cpu.clone();
+    cpu.x87_control=0x0b7f;cpu.x87_status=0x20;unsafe{block(&mut cpu)};assert_eq!((cpu.x87_control,cpu.x87_status),(0x0b7f,0x20));let fault=unmask && status&3!=0;
+    assert_eq!(cpu.fault,if fault{15}else{0});assert_eq!(cpu.mxcsr,(control|status));assert_eq!(cpu.flags,before.flags);assert_eq!(cpu.registers,before.registers);
     if fault{assert_eq!(cpu.vectors,before.vectors);assert_eq!(cpu.rip,before.rip);}else{assert_eq!(cpu.vectors[dst][..8],result.to_le_bytes());assert_eq!(cpu.vectors[dst][8..16],before.vectors[first][8..16]);assert_eq!(cpu.vectors[dst][16..],[0;16]);for index in 0..16{if index!=dst{assert_eq!(cpu.vectors[index],before.vectors[index]);}}}
    }
   }
  }
  let mut cpu=Cpu{rip:0xc3f2e,fuel:20,..Cpu::default()};cpu.vectors=[[0x5a;32];16];cpu.vectors[4][..8].copy_from_slice(&0x4008000000000000u64.to_le_bytes());let high=cpu.vectors[4][8..16].to_vec();unsafe{multiply_allalias(&mut cpu)};assert_eq!(cpu.fault,0);assert_eq!(cpu.vectors[4][..8],0x4022000000000000u64.to_le_bytes());assert_eq!(cpu.vectors[4][8..16],high);assert_eq!(cpu.vectors[4][16..],[0;16]);
- let mut data=[0u8;7];let mut memory=Memory::default();memory.add(0x300000,&mut data,false,false).unwrap();let mut cpu=Cpu{rip:0xc3f2e,fuel:20,memory:(&mut memory as *mut Memory<'_>)as u64,..Cpu::default()};cpu.registers[7]=0x300000;cpu.vectors=[[0x5a;32];16];let before=cpu.clone();unsafe{multiply_memory(&mut cpu)};assert_eq!(cpu.fault,1);assert_eq!(cpu.vectors,before.vectors);assert_eq!(cpu.padding,before.padding);assert_eq!(cpu.rip,before.rip);
+ let mut data=[0u8;7];let mut memory=Memory::default();memory.add(0x300000,&mut data,false,false).unwrap();let mut cpu=Cpu{rip:0xc3f2e,fuel:20,memory:(&mut memory as *mut Memory<'_>)as u64,..Cpu::default()};cpu.registers[7]=0x300000;cpu.vectors=[[0x5a;32];16];let before=cpu.clone();unsafe{multiply_memory(&mut cpu)};assert_eq!(cpu.fault,1);assert_eq!(cpu.vectors,before.vectors);assert_eq!(cpu.mxcsr,before.mxcsr);assert_eq!(cpu.rip,before.rip);
  println!("PASS ARM64 VMULSD finite/nonfinite/denormal multiplication, masked flags, unmasked no-destination commit, high-register/alias/merge-upperzero and guarded memory");
 }
 
@@ -100,7 +100,7 @@ fn control_vectors(){
   (0x7ff8123456789abc,0xfff056789abcdef0,0x1f80,0x7ff8123456789abc,1,false),
   (0xfff056789abcdef0,0x7ff8123456789abc,0x1f80,0xfff856789abcdef0,1,false),
  ] {
-  let mut cpu=Cpu{rip:0xc3f2e,fuel:20,padding:control as u64,..Cpu::default()};cpu.vectors=[[0xa5;32];16];cpu.vectors[4][..8].copy_from_slice(&a.to_le_bytes());cpu.vectors[0][..8].copy_from_slice(&b.to_le_bytes());let before=cpu.clone();unsafe{multiply_alias(&mut cpu)};assert_eq!(cpu.padding,(control|status)as u64);assert_eq!(cpu.fault,if fault{15}else{0});if fault{assert_eq!(cpu.vectors,before.vectors);assert_eq!(cpu.rip,before.rip);}else{assert_eq!(cpu.vectors[4][..8],result.to_le_bytes());assert_eq!(cpu.vectors[4][8..16],before.vectors[4][8..16]);assert_eq!(cpu.vectors[4][16..],[0;16]);}
+  let mut cpu=Cpu{rip:0xc3f2e,fuel:20,mxcsr:control,..Cpu::default()};cpu.vectors=[[0xa5;32];16];cpu.vectors[4][..8].copy_from_slice(&a.to_le_bytes());cpu.vectors[0][..8].copy_from_slice(&b.to_le_bytes());let before=cpu.clone();unsafe{multiply_alias(&mut cpu)};assert_eq!(cpu.mxcsr,(control|status));assert_eq!(cpu.fault,if fault{15}else{0});if fault{assert_eq!(cpu.vectors,before.vectors);assert_eq!(cpu.rip,before.rip);}else{assert_eq!(cpu.vectors[4][..8],result.to_le_bytes());assert_eq!(cpu.vectors[4][8..16],before.vectors[4][8..16]);assert_eq!(cpu.vectors[4][16..],[0;16]);}
  }
 }
 "#;

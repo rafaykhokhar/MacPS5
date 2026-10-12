@@ -223,7 +223,9 @@ fn main() {
                         target: 0,
                         memory: 0,
                         next_rip: 0,
-                        padding: 0,
+                        mxcsr: 0,
+                        x87_control: 0x037f,
+                        x87_status: 0,
                         vectors: [[0; 32]; 16],
                     };
                     // Install operands before deriving expected results, so aliases and

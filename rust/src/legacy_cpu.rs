@@ -12,10 +12,10 @@ pub struct Cpu {
     pub target: u64,
     pub memory: u64,
     pub next_rip: u64,
-    /// Former ABI padding at offset200: low32 now guest MXCSR, high32 zero.
-    /// Retained name preserves existing fixture literals. Zero means actual
-    /// MXCSR=0 (unmasked), never an implicit request for the reset default.
-    pub padding: u64,
+    /// Independent guest SIMD and x87 environments, preserving the720-byte ABI.
+    pub mxcsr: u32,
+    pub x87_control: u16,
+    pub x87_status: u16,
     pub vectors: [[u8; 32]; 16],
 }
 impl Default for Cpu {
@@ -31,7 +31,9 @@ impl Default for Cpu {
             target: 0,
             memory: 0,
             next_rip: 0,
-            padding: crate::scalar_fp::MXCSR_RESET as u64,
+            mxcsr: crate::scalar_fp::MXCSR_RESET,
+            x87_control: 0x037f,
+            x87_status: 0,
             vectors: [[0; 32]; 16],
         }
     }
@@ -48,6 +50,8 @@ mod tests {
         assert_eq!(offset_of!(Cpu, fault), 152);
         assert_eq!(offset_of!(Cpu, memory), 184);
         assert_eq!(offset_of!(Cpu, vectors), 208);
-        assert_eq!(offset_of!(Cpu, padding), 200);
+        assert_eq!(offset_of!(Cpu, mxcsr), 200);
+        assert_eq!(offset_of!(Cpu, x87_control), 204);
+        assert_eq!(offset_of!(Cpu, x87_status), 206);
     }
 }

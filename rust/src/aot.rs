@@ -318,6 +318,21 @@ impl Emitter {
             return Ok(());
         }
         match m {
+            M::Fldcw => {
+                self.emit("mov x0, x19\nbl _native_ps5_x87_wait_v1");
+                self.fault();
+                self.read(i, 0, 16, 20)?;
+                self.emit("mov x0, x19\nmov x1, x20\nbl _native_ps5_x87_load_control_v1");
+                self.fault();
+            }
+            M::Fnstcw => {
+                self.emit("ldrh w20, [x19, #204]");
+                self.write(i, 0, 16, 20)?;
+            }
+            M::Wait => {
+                self.emit("mov x0, x19\nbl _native_ps5_x87_wait_v1");
+                self.fault();
+            }
             M::Ldmxcsr | M::Vldmxcsr => {
                 self.read(i, 0, 32, 20)?;
                 self.emit("mov x0, x19\nmov x1, x20\nbl _native_ps5_load_mxcsr_v1");

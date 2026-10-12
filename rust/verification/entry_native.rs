@@ -40,6 +40,7 @@ mod memory_compare_native;
 mod wide_strings_native;
 mod narrow_strings_native;
 mod integer_parse_native;
+mod x87_control_native;
 mod tiler_native;
 mod tiler_gpu_native;
 mod tls_native;
@@ -85,6 +86,7 @@ fn main() -> Result<(), String> {
     wide_strings_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     narrow_strings_native::verify(Path::new(&archive), Path::new(&directory))?;
     integer_parse_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+    x87_control_native::verify(Path::new(&archive), Path::new(&directory))?;
     tiler_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     tiler_gpu_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     user_service_native::verify(Path::new(&archive), Path::new(&directory))?;

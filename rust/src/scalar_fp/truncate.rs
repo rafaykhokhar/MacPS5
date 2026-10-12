@@ -193,7 +193,7 @@ mod abi {
         }
         match truncate_binary64_i32(bits, super::super::mxcsr(cpu)) {
             Ok(result) => {
-                cpu.padding = result.mxcsr as u64;
+                cpu.mxcsr = result.mxcsr;
                 result.bits as u64
             }
             Err(TruncateError::ReservedControl) => {
@@ -201,7 +201,7 @@ mod abi {
                 0
             }
             Err(TruncateError::UnmaskedException { mxcsr, .. }) => {
-                cpu.padding = mxcsr as u64;
+                cpu.mxcsr = mxcsr;
                 cpu.fault = TRUNCATE_SIMD_FAULT;
                 0
             }
