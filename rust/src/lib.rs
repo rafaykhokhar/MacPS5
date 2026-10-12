@@ -53,6 +53,7 @@ pub mod libc_memory;
 pub mod guest_locale;
 pub mod guest_signal;
 pub mod guest_sched;
+pub mod narrow_strings;
 pub mod captured_stdout;
 pub mod guest_stdio;
 pub mod guest_tls;
@@ -71,3 +72,4 @@ pub mod metal_present;
 pub mod scalar_fp;
 
 pub mod scheduler;
+pub mod wide_string;

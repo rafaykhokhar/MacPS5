@@ -37,6 +37,8 @@ mod scheduling_native;
 mod sdl_scheduling_native;
 mod environment_native;
 mod memory_compare_native;
+mod wide_strings_native;
+mod narrow_strings_native;
 mod tiler_native;
 mod tiler_gpu_native;
 mod tls_native;
@@ -79,6 +81,8 @@ fn main() -> Result<(), String> {
     sdl_scheduling_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     environment_native::verify(Path::new(&archive), Path::new(&directory))?;
     memory_compare_native::verify(Path::new(&archive), Path::new(&directory))?;
+    wide_strings_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+    narrow_strings_native::verify(Path::new(&archive), Path::new(&directory))?;
     tiler_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     tiler_gpu_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     user_service_native::verify(Path::new(&archive), Path::new(&directory))?;
@@ -344,6 +348,15 @@ fn main() -> Result<(), String> {
         ("setenv", Service::Setenv),
         ("memmove", Service::Memmove),
         ("memcmp", Service::Memcmp),
+        ("wcslen", Service::Wcslen),
+        ("wcsstr", Service::Wcsstr),
+        ("wcscmp", Service::Wcscmp),
+        ("wcsncmp", Service::Wcsncmp),
+        ("strlcpy", Service::Strlcpy),
+        ("strlcat", Service::Strlcat),
+        ("strchr", Service::Strchr),
+        ("strrchr", Service::Strrchr),
+        ("strstr", Service::Strstr),
     ]
     .into_iter()
     .enumerate()
@@ -1192,6 +1205,15 @@ fn main() -> Result<(), String> {
                 (296, 0x730320),
                 (312, 0x730330),
                 (320, 0x730340),
+                (336, 0x730350),
+                (344, 0x730360),
+                (352, 0x730370),
+                (360, 0x730380),
+                (368, 0x730390),
+                (376, 0x7303a0),
+                (384, 0x7303b0),
+                (392, 0x7303c0),
+                (400, 0x7303d0),
             ] {
                 if locale_segment.bytes[locale_offset + delta..locale_offset + delta + 8]
                     != expected.to_le_bytes()
@@ -1218,14 +1240,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 58 libc exports: (58+1)*24=1416 symbol bytes (rounded1424)
-                // and 1+58*12=697 NID bytes (rounded704). These three exports
-                // add80+32bytes to16352. Exact accounting now exceeds the old
-                // 16KiB metadata guard; keep a32KiB cap as well as exact equality.
-                || native.bytes_allocated() != 16464
+                // 67 libc exports: (67+1)*24=1632 symbol bytes
+                // and 1+67*12=805 NID bytes (rounded816). Nine string exports
+                // add208+112bytes to16464; retain exact accounting and32KiB cap.
+                || native.bytes_allocated() != 16784
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'wcslen'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'atoi'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1235,7 +1256,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; setenv, memmove and memcmp imports bound; unresolved wcslen causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; wide and narrow string imports bound; unresolved atoi causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1297,7 +1318,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved wcslen triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved atoi triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     Ok(())

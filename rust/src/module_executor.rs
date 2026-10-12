@@ -340,6 +340,15 @@ struct TranslationSource {
 pub enum Service {
     Getenv,
     Setenv,
+    Wcslen,
+    Wcsstr,
+    Wcscmp,
+    Wcsncmp,
+    Strlcpy,
+    Strlcat,
+    Strchr,
+    Strrchr,
+    Strstr,
     Malloc,
     Realloc,
     Calloc,
@@ -473,6 +482,15 @@ impl Service {
             | Self::Sigemptyset
             | Self::Sigaddset
             | Self::Setenv
+            | Self::Wcslen
+            | Self::Wcsstr
+            | Self::Wcscmp
+            | Self::Wcsncmp
+            | Self::Strlcpy
+            | Self::Strlcat
+            | Self::Strchr
+            | Self::Strrchr
+            | Self::Strstr
             | Self::ThreadSigmask
             | Self::ThreadSetCancelType
             | Self::ThreadGetschedparam
@@ -3048,6 +3066,47 @@ impl NativeExecutor {
                                 }
                             }
                         }
+                    } else if matches!(service, Service::Strlcpy | Service::Strlcat) {
+                        let plan = crate::narrow_strings::copy_plan(
+                            &memory,
+                            cpu.registers[7],
+                            cpu.registers[6],
+                            cpu.registers[2],
+                            matches!(service, Service::Strlcat),
+                        )?;
+                        if !plan.bytes.is_empty() {
+                            validate_net_output(
+                                &memory,
+                                plan.destination,
+                                plan.bytes.len(),
+                                sp,
+                                ret,
+                            )?;
+                        }
+                        plan.commit(&mut memory)?
+                    } else if matches!(service, Service::Strchr | Service::Strrchr) {
+                        crate::narrow_strings::strchr(
+                            &memory,
+                            cpu.registers[7],
+                            cpu.registers[6],
+                            matches!(service, Service::Strrchr),
+                        )?
+                    } else if matches!(service, Service::Strstr) {
+                        crate::narrow_strings::strstr(&memory, cpu.registers[7], cpu.registers[6])?
+                    } else if matches!(service, Service::Wcslen) {
+                        crate::wide_string::wcslen(&memory, cpu.registers[7])?
+                    } else if matches!(service, Service::Wcsstr) {
+                        crate::wide_string::wcsstr(&memory, cpu.registers[7], cpu.registers[6])?
+                    } else if matches!(service, Service::Wcscmp) {
+                        crate::wide_string::wcscmp(&memory, cpu.registers[7], cpu.registers[6])?
+                            as u32 as u64
+                    } else if matches!(service, Service::Wcsncmp) {
+                        crate::wide_string::wcsncmp(
+                            &memory,
+                            cpu.registers[7],
+                            cpu.registers[6],
+                            cpu.registers[2],
+                        )? as u32 as u64
                     } else if matches!(service, Service::Getenv) {
                         crate::environment::getenv(&memory, self.environment, cpu.registers[7])
                             .map_err(|fault| format!("Guest getenv fault {fault:?}"))?
