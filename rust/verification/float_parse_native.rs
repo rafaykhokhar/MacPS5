@@ -3,7 +3,7 @@ use native_ps5::{
     guest_memory::DataRegion,
     kernel::Kernel,
     loader::Image,
-    module_executor::{Execution, NativeExecutor, Service, memory_fixture},
+    module_executor::{memory_fixture, Execution, NativeExecutor, Service},
 };
 use std::{collections::BTreeSet, path::Path};
 const BIAS: u64 = 0x10000000;
@@ -133,7 +133,7 @@ pub fn verify(file: &[u8], archive: &Path, directory: &Path) -> Result<(), Strin
     // hex construction can be inexact without raising an SSE arithmetic flag.
     for target in [0x1a6d0, 0x1a720] {
         for rc in 0..4u32 {
-            let cases: [(&[u8], u64, u64, u32, u32); 6] = [
+            let cases: [(&[u8], u64, u64, u32, u32); 11] = [
                 (b"1.5!", 0x3ff8000000000000, 3, 0, 77),
                 (
                     b"0.1!",
@@ -150,6 +150,53 @@ pub fn verify(file: &[u8], archive: &Path, directory: &Path) -> Result<(), Strin
                 (b"inf!", 0x7ff0000000000000, 3, 0, 77),
                 (b"no", 0, 0, 0, 77),
                 (b"0x1p-1075!", if rc == 2 { 1 } else { 0 }, 9, 0, 34),
+                (
+                    b"1e-400",
+                    if rc == 1 {
+                        1 << 63
+                    } else if rc == 2 {
+                        1
+                    } else {
+                        0
+                    },
+                    6,
+                    0x30,
+                    34,
+                ),
+                (
+                    b"1e400",
+                    if rc == 1 || rc == 3 {
+                        0x7fefffffffffffff
+                    } else {
+                        0x7ff0000000000000
+                    },
+                    5,
+                    0,
+                    34,
+                ),
+                (
+                    b"2.2250738585072012e-308",
+                    if rc == 1 || rc == 3 {
+                        0xfffffffffffff
+                    } else {
+                        0x10000000000000
+                    },
+                    23,
+                    0x20,
+                    if rc == 1 || rc == 3 { 34 } else { 77 },
+                ),
+                (b"1234567890123456", 0x43118b54f22aeb00, 16, 0, 77),
+                (
+                    b"1.00000000000000011102230246251565404236316680908203125",
+                    if rc == 2 {
+                        0x3ff0000000000001
+                    } else {
+                        0x3ff0000000000000
+                    },
+                    55,
+                    0,
+                    77,
+                ),
             ];
             for (text, bits, end, flags, err) in cases {
                 let mut data = [0xa5; 128];
@@ -253,40 +300,36 @@ pub fn verify(file: &[u8], archive: &Path, directory: &Path) -> Result<(), Strin
         let before = data;
         errno = 77u32.to_le_bytes();
         let mut state = controls(0);
-        assert!(
-            invoke(
-                &mut n,
-                &mut adapter,
-                &mut real,
-                [DATA, out, 0, BIAS + 0x1a720],
-                &mut data,
-                &mut errno,
-                &mut state,
-                writable,
-                entry
-            )
-            .is_err()
-        );
+        assert!(invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            [DATA, out, 0, BIAS + 0x1a720],
+            &mut data,
+            &mut errno,
+            &mut state,
+            writable,
+            entry
+        )
+        .is_err());
         assert_eq!(data, before);
         assert_eq!(errno, 77u32.to_le_bytes());
         assert_eq!(&state[96..], &[0xa5; 96]);
     }
     let before = data;
     errno = 77u32.to_le_bytes();
-    assert!(
-        invoke(
-            &mut n,
-            &mut adapter,
-            &mut real,
-            [DATA, DATA, 0, BIAS + 0x1a720],
-            &mut data,
-            &mut errno[..3],
-            &mut controls(0),
-            true,
-            0x100100
-        )
-        .is_err()
-    );
+    assert!(invoke(
+        &mut n,
+        &mut adapter,
+        &mut real,
+        [DATA, DATA, 0, BIAS + 0x1a720],
+        &mut data,
+        &mut errno[..3],
+        &mut controls(0),
+        true,
+        0x100100
+    )
+    .is_err());
     assert_eq!(data, before);
     let mut shared = [0xa5; 8];
     invoke(
@@ -301,30 +344,22 @@ pub fn verify(file: &[u8], archive: &Path, directory: &Path) -> Result<(), Strin
         0x100100,
     )?;
     assert_eq!(shared, (DATA + 9).to_le_bytes());
-    for text in [
-        b"1e-400\0".as_slice(),
-        b"1234567890123456\0",
-        b"1e37\0",
-        b"1e-23\0",
-        b"1",
-    ] {
+    for text in [b"1".as_slice()] {
         let mut data = text.to_vec();
         let before = data.clone();
         errno = 77u32.to_le_bytes();
-        assert!(
-            invoke(
-                &mut n,
-                &mut adapter,
-                &mut real,
-                [DATA, DATA, 0, BIAS + 0x1a720],
-                &mut data,
-                &mut errno,
-                &mut controls(0),
-                true,
-                0x100100
-            )
-            .is_err()
-        );
+        assert!(invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            [DATA, DATA, 0, BIAS + 0x1a720],
+            &mut data,
+            &mut errno,
+            &mut controls(0),
+            true,
+            0x100100
+        )
+        .is_err());
         assert_eq!(data, before);
         assert_eq!(errno, 77u32.to_le_bytes());
     }
@@ -342,25 +377,23 @@ pub fn verify(file: &[u8], archive: &Path, directory: &Path) -> Result<(), Strin
         state[..2].copy_from_slice(&cw.to_le_bytes());
         state[4..8].copy_from_slice(&mxcsr.to_le_bytes());
         errno = 77u32.to_le_bytes();
-        assert!(
-            invoke(
-                &mut n,
-                &mut adapter,
-                &mut real,
-                [DATA, DATA, 0, BIAS + 0x1a720],
-                &mut data,
-                &mut errno,
-                &mut state,
-                true,
-                0x100100
-            )
-            .is_err()
-        );
+        assert!(invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            [DATA, DATA, 0, BIAS + 0x1a720],
+            &mut data,
+            &mut errno,
+            &mut state,
+            true,
+            0x100100
+        )
+        .is_err());
         assert_eq!(data, before);
         assert_eq!(errno, 77u32.to_le_bytes());
     }
     println!(
-        "PASS: actual SDL atof/strtod binary64 XMM0 return, upperYMM/otherlane/RAX/R8 preservation;4 rounding modes, audited decimalPE vs integerhex flags, stickyMXCSR/CW, endptr/errno aliases and guards; unsupported controls/refinement reject. Existing x87SW is not guest-seeded by this fixture."
+        "PASS: actual SDL atof/strtod binary64 XMM0 return, upperYMM/otherlane/RAX/R8 preservation;4 rounding modes, source-ordered general decimal refinement flags/errno including tiny/overflow/halfway, stickyMXCSR/CW, endptr/errno aliases and guards; unsupported controls reject. Existing x87SW is not guest-seeded by this fixture."
     );
     Ok(())
 }

@@ -1,6 +1,10 @@
 //! Bounded locale-independent binary64 parser. No host floating-point operation.
 //! Pure conversion engine; guest fenv/errno service integration remains separate.
 mod big;
+mod decimal_arithmetic;
+mod decimal_big;
+mod decimal_effects;
+mod decimal_refinement;
 pub mod effects;
 use big::Big;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1,5 +1,4 @@
-//! Source-ordered effect coverage for FreeBSD 11.4 gdtoa strtod fast paths.
-//! General decimal approximation/refinement is an explicit pending boundary.
+//! Source-ordered effects for FreeBSD 11.4 gdtoa strtod.
 use super::{parse_freebsd, Error, FreeBsdParsed, Rounding};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11,7 +10,8 @@ pub struct Effects {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EffectsError {
     Parse(Error),
-    DecimalRefinementUnsupported,
+    ArithmeticModel,
+    IterationBudget,
 }
 
 /// Execute the covered gdtoa paths without using host floating point.
@@ -29,6 +29,7 @@ pub fn parse_effects(input: &[u8], rounding: Rounding) -> Result<Effects, Effect
     while text.first().is_some_and(|b| matches!(*b, 9..=13 | 32)) {
         text = &text[1..];
     }
+    let negative = text.first() == Some(&b'-');
     if matches!(text.first(), Some(b'+' | b'-')) {
         text = &text[1..];
     }
@@ -51,7 +52,19 @@ pub fn parse_effects(input: &[u8], rounding: Rounding) -> Result<Effects, Effect
         });
     }
     if nd > 15 || exponent < -22 || exponent > 22 + (15 - nd) as i32 {
-        return Err(EffectsError::DecimalRefinementUnsupported);
+        let (parsed, mxcsr_flags) =
+            super::decimal_effects::refine(text, parsed, negative, rounding).map_err(|error| {
+                match error {
+                    super::decimal_refinement::RefinementError::IterationBudget => {
+                        EffectsError::IterationBudget
+                    }
+                    _ => EffectsError::ArithmeticModel,
+                }
+            })?;
+        return Ok(Effects {
+            parsed,
+            mxcsr_flags,
+        });
     }
     Ok(Effects {
         parsed,
@@ -112,7 +125,7 @@ fn decimal_shape(text: &[u8]) -> (usize, i32) {
 mod tests {
     use super::*;
     #[test]
-    fn covered_paths_and_pending_refinement() {
+    fn fast_paths_and_general_refinement() {
         for s in [
             "0.1",
             "123456789012345e22",
@@ -136,9 +149,8 @@ mod tests {
             "1e-400",
             "0.00000000000000000000001",
         ] {
-            assert_eq!(
-                parse_effects(s.as_bytes(), Rounding::NearestEven),
-                Err(EffectsError::DecimalRefinementUnsupported),
+            assert!(
+                parse_effects(s.as_bytes(), Rounding::NearestEven).is_ok(),
                 "{s}"
             );
         }
@@ -167,5 +179,97 @@ mod tests {
         assert_eq!(decimal_shape(b"000.00100"), (1, -3));
         assert_eq!(decimal_shape(b"12.000"), (2, 0));
         assert_eq!(decimal_shape(b"0.000e999"), (0, 999));
+    }
+    #[test]
+    fn general_flags_are_intermediate_effects_not_result_inexactness() {
+        // Refinement can re-enter with a zero approximation on this input.
+        let tiny = parse_effects(b"5961995109394176e-374", Rounding::NearestEven).unwrap();
+        assert_eq!(
+            (tiny.parsed.bits, tiny.parsed.errno, tiny.mxcsr_flags),
+            (0, Some(34), 0x30)
+        );
+        let half = b"1.00000000000000011102230246251565404236316680908203125";
+        let p = parse_effects(half, Rounding::NearestEven).unwrap();
+        assert!(p.parsed.inexact);
+        assert_eq!(p.mxcsr_flags, 0);
+        assert_eq!(
+            parse_effects(b"1e-400", Rounding::Down)
+                .unwrap()
+                .parsed
+                .bits,
+            1 << 63
+        );
+        assert_eq!(
+            parse_effects(b"1e-400", Rounding::NearestEven)
+                .unwrap()
+                .mxcsr_flags,
+            0x30
+        );
+        assert_eq!(
+            parse_effects(b"1e400", Rounding::NearestEven)
+                .unwrap()
+                .mxcsr_flags,
+            0
+        );
+        for (rounding, bits, errno) in [
+            (Rounding::NearestEven, 1 << 52, None),
+            (Rounding::Up, 1 << 52, None),
+            (Rounding::Down, (1 << 52) - 1, Some(34)),
+            (Rounding::TowardZero, (1 << 52) - 1, Some(34)),
+        ] {
+            let p = parse_effects(b"2.2250738585072012e-308", rounding).unwrap();
+            assert_eq!(
+                (p.parsed.bits, p.parsed.errno, p.mxcsr_flags),
+                (bits, errno, 0x20)
+            );
+        }
+    }
+    #[test]
+    fn exact_decimal_subnormal_and_bounded_long_coefficient() {
+        let mut digits = vec![1u8];
+        for _ in 0..1074 {
+            let mut carry = 0u32;
+            for digit in &mut digits {
+                let v = u32::from(*digit) * 5 + carry;
+                *digit = (v % 10) as u8;
+                carry = v / 10;
+            }
+            while carry != 0 {
+                digits.push((carry % 10) as u8);
+                carry /= 10;
+            }
+        }
+        let text = format!(
+            "{}e-1074",
+            digits
+                .iter()
+                .rev()
+                .map(|d| char::from(b'0' + d))
+                .collect::<String>()
+        );
+        for rounding in [
+            Rounding::NearestEven,
+            Rounding::Up,
+            Rounding::Down,
+            Rounding::TowardZero,
+        ] {
+            let p = parse_effects(text.as_bytes(), rounding).unwrap();
+            assert_eq!(
+                (
+                    p.parsed.bits,
+                    p.parsed.errno,
+                    p.mxcsr_flags,
+                    p.parsed.inexact
+                ),
+                (1, Some(34), 0x20, false)
+            );
+        }
+        let text = format!("1{}e-4095", "0".repeat(4095));
+        let p = parse_effects(text.as_bytes(), Rounding::NearestEven).unwrap();
+        assert_eq!((p.parsed.bits, p.mxcsr_flags), (0x3ff0000000000000, 0));
+        assert_eq!(
+            parse_effects("1".repeat(4097).as_bytes(), Rounding::NearestEven),
+            Err(EffectsError::Parse(Error::SignificandLimit))
+        );
     }
 }
