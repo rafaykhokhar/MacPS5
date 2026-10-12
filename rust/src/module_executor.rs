@@ -420,6 +420,7 @@ pub enum Service {
     Sigemptyset,
     Sigaddset,
     ThreadSigmask,
+    ThreadSetCancelType,
     ThreadJoin,
     ThreadDetach,
     MutexAttrInit,
@@ -463,6 +464,7 @@ impl Service {
             | Self::Sigemptyset
             | Self::Sigaddset
             | Self::ThreadSigmask
+            | Self::ThreadSetCancelType
             | Self::ThreadJoin
             | Self::ThreadDetach
             | Self::MutexAttrInit
@@ -2390,6 +2392,17 @@ impl NativeExecutor {
                     }
                     let value = if matches!(service, Service::ThreadSelf) {
                         guest_thread
+                    } else if matches!(service, Service::ThreadSetCancelType) {
+                        let kind = cpu.registers[7] as u32 as i32;
+                        let previous = cpu.registers[6];
+                        // FreeBSD validates the kind before touching oldtype.
+                        // No request API can introduce pending cancellation yet.
+                        if matches!(kind, 0 | 2) && previous != 0 {
+                            validate_net_output(&memory, previous, 4, sp, ret)?;
+                        }
+                        self.tls
+                            .set_cancel_type(guest_thread, kind, previous, &mut memory)?
+                            as u32 as u64
                     } else if matches!(service, Service::ThreadSigmask) {
                         let how = cpu.registers[7] as u32 as i32;
                         let input = cpu.registers[6];

@@ -32,6 +32,7 @@ mod thread_name_native;
 mod thread_pins_native;
 mod signal_set_native;
 mod signal_mask_native;
+mod cancel_type_native;
 mod tiler_native;
 mod tiler_gpu_native;
 mod tls_native;
@@ -69,6 +70,7 @@ fn main() -> Result<(), String> {
     thread_pins_native::verify(Path::new(&archive), Path::new(&directory))?;
     signal_set_native::verify(Path::new(&archive), Path::new(&directory))?;
     signal_mask_native::verify(Path::new(&archive), Path::new(&directory))?;
+    cancel_type_native::verify(Path::new(&archive), Path::new(&directory))?;
     tiler_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     tiler_gpu_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     user_service_native::verify(Path::new(&archive), Path::new(&directory))?;
@@ -326,6 +328,7 @@ fn main() -> Result<(), String> {
         ("sigemptyset", Service::Sigemptyset),
         ("sigaddset", Service::Sigaddset),
         ("pthread_sigmask", Service::ThreadSigmask),
+        ("pthread_setcanceltype", Service::ThreadSetCancelType),
     ]
     .into_iter()
     .enumerate()
@@ -1166,6 +1169,7 @@ fn main() -> Result<(), String> {
                 (216, 0x7302a0),
                 (224, 0x7302b0),
                 (232, 0x7302c0),
+                (240, 0x7302d0),
             ] {
                 if locale_segment.bytes[locale_offset + delta..locale_offset + delta + 8]
                     != expected.to_le_bytes()
@@ -1192,13 +1196,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 50 libc exports: (50+1)*24=1224 symbol bytes (rounded1232)
-                // and 1+50*12=601 NID bytes (rounded608). The mask export
-                // grows these allocations by32+16 from16128 bytes.
-                || native.bytes_allocated() != 16176
+                // 51 libc exports: (51+1)*24=1248 symbol bytes
+                // and 1+51*12=613 NID bytes (rounded624). The cancellation
+                // mode export grows allocations by16+16 from16176 bytes.
+                || native.bytes_allocated() != 16208
                 || native.bytes_allocated() > 16 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'pthread_setcanceltype'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'pthread_getschedparam'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1208,7 +1212,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; thread imports, signal sets and pthread_sigmask bound; unresolved pthread_setcanceltype causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; signal and cancellation-mode imports bound; unresolved pthread_getschedparam causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1270,7 +1274,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved pthread_setcanceltype triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved pthread_getschedparam triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     Ok(())

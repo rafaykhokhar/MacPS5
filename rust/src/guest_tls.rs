@@ -21,6 +21,8 @@ struct Thread {
     name: Vec<u8>,
     values: [(u64, u64); KEY_LIMIT],
     signal_mask: [u8; crate::guest_signal::SIZE],
+    cancel_type: i32,
+    cancel_enabled: bool,
 }
 #[derive(Debug)]
 pub struct GuestTls {
@@ -57,6 +59,8 @@ impl GuestTls {
             name: Vec::new(),
             values: [(0, 0); KEY_LIMIT],
             signal_mask: [0; crate::guest_signal::SIZE],
+            cancel_type: 0,
+            cancel_enabled: true,
         });
         self.last_thread_id = id;
         Ok(())
@@ -79,6 +83,49 @@ impl GuestTls {
             .find(|t| t.id == id)
             .map(|t| t.signal_mask)
             .ok_or_else(|| "Unregistered guest signal-mask thread".into())
+    }
+    /// Cancellation configuration only: requests, state changes and delivery
+    /// remain unsupported. Every thread starts enabled and deferred (0), even
+    /// when its creator has selected asynchronous mode (2).
+    pub fn cancel_type(&self, id: u64) -> Result<i32> {
+        self.threads
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.cancel_type)
+            .ok_or_else(|| "Unregistered guest cancellation thread".into())
+    }
+    pub fn cancel_enabled(&self, id: u64) -> Result<bool> {
+        self.threads
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.cancel_enabled)
+            .ok_or_else(|| "Unregistered guest cancellation thread".into())
+    }
+    /// SDK pthread.h: DEFERRED=0, ASYNCHRONOUS=2. FreeBSD11.4 thr_cancel.c
+    /// returns EINVAL without touching errno/output for invalid types. There is
+    /// no accepted cancellation source, so no pending delivery can intervene.
+    /// Caller validates return-frame aliases before committing this operation.
+    pub fn set_cancel_type(
+        &mut self,
+        id: u64,
+        kind: i32,
+        previous: u64,
+        memory: &mut Memory<'_>,
+    ) -> Result<i32> {
+        if !matches!(kind, 0 | 2) {
+            return Ok(EINVAL);
+        }
+        let thread = self
+            .threads
+            .iter_mut()
+            .find(|t| t.id == id)
+            .ok_or("Unregistered guest cancellation thread")?;
+        if previous != 0 {
+            memory.validate_write(previous, 4)?;
+            memory.write(previous, &thread.cancel_type.to_le_bytes())?;
+        }
+        thread.cancel_type = kind;
+        Ok(0)
     }
     pub(crate) fn replace_signal_mask(
         &mut self,
@@ -222,6 +269,35 @@ impl GuestTls {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancellation_configuration_atomic_and_not_inherited() {
+        let mut tls = GuestTls::default();
+        tls.register_thread(1).unwrap();
+        let mut bytes = [0x55; 8];
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut bytes, true, false).unwrap();
+        assert!(tls.cancel_enabled(1).unwrap());
+        assert_eq!(tls.set_cancel_type(1, 2, 0x1000, &mut memory).unwrap(), 0);
+        assert_eq!(
+            memory.read(0x1000, 8).unwrap(),
+            &[0, 0, 0, 0, 0x55, 0x55, 0x55, 0x55]
+        );
+        assert_eq!(
+            tls.set_cancel_type(1, 1, u64::MAX, &mut memory).unwrap(),
+            EINVAL
+        );
+        assert!(tls.set_cancel_type(1, 0, 0x1005, &mut memory).is_err());
+        assert_eq!(tls.cancel_type(1).unwrap(), 2);
+        tls.register_thread_inheriting(2, 1).unwrap();
+        assert_eq!(tls.cancel_type(2).unwrap(), 0);
+        assert!(tls.cancel_enabled(2).unwrap());
+        assert_eq!(tls.set_cancel_type(2, 2, 0, &mut memory).unwrap(), 0);
+        assert_eq!(tls.set_cancel_type(1, 0, 0x1000, &mut memory).unwrap(), 0);
+        assert_eq!(memory.read(0x1000, 4).unwrap(), &[2, 0, 0, 0]);
+        assert_eq!(tls.cancel_type(2).unwrap(), 2);
+        tls.retire_thread(2).unwrap();
+        assert!(tls.set_cancel_type(2, 0, 0, &mut memory).is_err());
+    }
     #[test]
     fn repeated_worker_retirement_reclaims_capacity_without_reusing_identity() {
         let mut slot = [0u8; 4];
