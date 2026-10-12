@@ -88,3 +88,5 @@ pub mod guest_sleep;
 pub mod guest_semaphore;
 pub mod stdio_file;
 pub mod stdio_write;
+
+pub mod guest_system;

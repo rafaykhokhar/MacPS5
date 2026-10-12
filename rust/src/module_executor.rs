@@ -628,6 +628,7 @@ pub enum Service {
     File(crate::stdio_file::Operation),
     Fstat,
     Stat,
+    Sysconf,
     Nanosleep,
     SemInit,
     SemDestroy,
@@ -794,6 +795,7 @@ impl Service {
             | Self::File(_)
             | Self::Fstat
             | Self::Stat
+            | Self::Sysconf
             | Self::Nanosleep
             | Self::SemInit
             | Self::SemDestroy
@@ -1259,6 +1261,8 @@ enum Flow {
 }
 type EnvironmentCompletion = Option<(u64, Option<i32>, bool)>;
 pub struct NativeExecutor {
+    system_profile: Option<crate::guest_system::GuestSystemProfile>,
+    system_profile_locked: bool,
     consumed_instruction_fuel: u128,
     worker_quantum: Option<u64>,
     mutex_wait_owner: Rc<()>,
@@ -2070,6 +2074,21 @@ impl NativeExecutor {
         self.services = services;
         Ok(handle)
     }
+    /// Configure reported hardware before the first guest execution attempt.
+    /// This does not change domain allocation limits or enforce a host RAM budget.
+    pub fn configure_system_profile(
+        &mut self,
+        profile: crate::guest_system::GuestSystemProfile,
+    ) -> Result<()> {
+        if self.system_profile_locked {
+            return Err("Guest system profile is frozen after execution starts".into());
+        }
+        self.system_profile = Some(profile);
+        Ok(())
+    }
+    pub fn system_profile(&self) -> Option<&crate::guest_system::GuestSystemProfile> {
+        self.system_profile.as_ref()
+    }
     pub fn new(stack_address: u64, stack_size: usize, fuel: u64, transitions: u64) -> Result<Self> {
         if !(4096..=16 * 1024 * 1024).contains(&stack_size)
             || stack_size % 16 != 0
@@ -2081,6 +2100,8 @@ impl NativeExecutor {
         let mut tls = crate::guest_tls::GuestTls::default();
         tls.register_thread(MAIN_GUEST_THREAD)?;
         Ok(Self {
+            system_profile: None,
+            system_profile_locked: false,
             consumed_instruction_fuel: 0,
             worker_quantum: None,
             mutex_wait_owner: Rc::new(()),
@@ -2483,6 +2504,7 @@ impl NativeExecutor {
         mut continuation: Option<Continuation>,
         data: &mut [DataRegion<'_>],
     ) -> Result<Execution> {
+        self.system_profile_locked = true;
         let mut retained = continuation.as_mut().map(|saved| {
             self.protect_stack(
                 saved.stack_address,
@@ -3914,6 +3936,29 @@ impl NativeExecutor {
                         } else {
                             0
                         }
+                    } else if matches!(service, Service::Sysconf) {
+                        let selector = cpu.registers[7] as u32 as i32;
+                        let query = match self.system_profile.as_ref() {
+                            Some(profile) => profile.query(selector),
+                            None => crate::guest_system::classify_unimplemented(selector),
+                        };
+                        match query {
+                            crate::guest_system::Query::Value(value) => value as u64,
+                            crate::guest_system::Query::Invalid => {
+                                let errno = self
+                                    .kernel
+                                    .as_ref()
+                                    .ok_or("Missing sysconf errno context")?
+                                    .errno_address();
+                                validate_net_output(&memory, errno, 4, sp, ret)?;
+                                memory.validate_write(errno, 4)?;
+                                memory.store(errno, 22, 4)?;
+                                u64::MAX
+                            }
+                            crate::guest_system::Query::Unsupported => {
+                                return Err(format!("Unsupported sysconf selector {selector} or missing explicit guest system profile"));
+                            }
+                        }
                     } else if matches!(service, Service::Stat) {
                         let kernel = self.kernel.as_mut().ok_or("Missing stat kernel context")?;
                         validate_net_output(&memory, kernel.errno_address(), 4, sp, ret)?;
@@ -4757,6 +4802,26 @@ impl Executor for NativeExecutor {
 #[cfg(test)]
 mod service_registration_tests {
     use super::*;
+    #[test]
+    fn system_profile_is_explicit_and_frozen_on_first_execution_attempt() {
+        use crate::guest_system::GuestSystemProfile;
+        let mut native = NativeExecutor::new(0x900000, 4096, 100, 100).unwrap();
+        assert!(native.system_profile().is_none());
+        let original = GuestSystemProfile::new(16 << 30, 1, 1).unwrap();
+        native.configure_system_profile(original.clone()).unwrap();
+        let mut image = Image::load(&crate::modules::fixture(), 0x100000, 65536).unwrap();
+        // Even a rejected entry attempt freezes configuration: no host retry can
+        // mutate reported hardware after any execution path has been entered.
+        let _ = native.run(&mut image, 0xffff_ffff, Arguments::default(), &mut []);
+        assert!(native
+            .configure_system_profile(GuestSystemProfile::new(8 << 30, 1, 1).unwrap())
+            .is_err());
+        assert_eq!(native.system_profile(), Some(&original));
+        let mut unconfigured = NativeExecutor::new(0x900000, 4096, 100, 100).unwrap();
+        let _ = unconfigured.run(&mut image, 0xffff_ffff, Arguments::default(), &mut []);
+        assert!(unconfigured.configure_system_profile(original).is_err());
+        assert!(unconfigured.system_profile().is_none());
+    }
     #[test]
     fn loader_export_publication_is_atomic_and_resolves_name_and_nid() {
         let mut modules = crate::modules::Modules::new(65536);

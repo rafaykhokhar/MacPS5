@@ -33,6 +33,7 @@ mod stat_service_native;
 mod semaphore_native;
 mod atomic_xadd_native;
 mod adc_native;
+mod sysconf_native;
 mod system_service_native;
 mod threadattr_native;
 mod thread_services_native;
@@ -82,6 +83,7 @@ fn main() -> Result<(), String> {
     stat_service_native::verify(Path::new(&archive), Path::new(&directory))?;
     atomic_xadd_native::verify(Path::new(&archive), Path::new(&directory))?;
     adc_native::verify(Path::new(&archive), Path::new(&directory))?;
+    sysconf_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     semaphore_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     stdio_file_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     system_service_native::verify(Path::new(&archive), Path::new(&directory))?;
@@ -146,6 +148,12 @@ fn main() -> Result<(), String> {
         30_000_000,
         30_000_000,
     )?;
+    // Reported virtual hardware; aggregate host/unified-memory fit is unverified.
+    native.configure_system_profile(native_ps5::guest_system::GuestSystemProfile::new(
+        16 * 1024 * 1024 * 1024,
+        1,
+        1,
+    )?)?;
     native.register_service(0x700020, Service::Dlsym)?;
     native.register_service(0x710000, Service::Getpid)?;
     native.register_service(0x71000a, Service::Syscall)?;
@@ -435,6 +443,7 @@ fn main() -> Result<(), String> {
         ("sem_getvalue", Service::SemGetValue),
         ("sem_post", Service::SemPost),
         ("stat", Service::Stat),
+        ("sysconf", Service::Sysconf),
     ]
     .into_iter()
     .enumerate()
@@ -1337,6 +1346,7 @@ fn main() -> Result<(), String> {
                 (784, 0x7306a0),
                 (792, 0x7306b0),
                 (800, 0x730050),
+                (808, 0x7306c0),
             ] {
                 if locale_segment.bytes[locale_offset + delta..locale_offset + delta + 8]
                     != expected.to_le_bytes()
@@ -1363,13 +1373,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 113 libc exports: (113+1)*24=2736 aligned symbol bytes
-                // and 1+113*12=1357 NID bytes (rounded1360). Semaphore/stat
-                // exports add192+96bytes to18144; retain the exact32KiB cap.
-                || native.bytes_allocated() != 18432
+                // 114 libc exports: (114+1)*24=2760 (rounded2768) symbol bytes
+                // and 1+114*12=1369 NID bytes (rounded1376). The sysconf
+                // export adds32+16bytes to18432; retain the exact32KiB cap.
+                || native.bytes_allocated() != 18480
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'sysconf'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'sysctlbyname'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1379,7 +1389,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; semaphore and stat imports bound; unresolved sysconf causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; sysconf import bound; unresolved sysctlbyname causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1441,7 +1451,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved sysconf triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved sysctlbyname triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     Ok(())
