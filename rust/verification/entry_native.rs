@@ -45,6 +45,7 @@ mod mkdir_native;
 mod cond_native;
 mod multibyte_native;
 mod abort_native;
+mod movdqu_native;
 mod system_service_native;
 mod threadattr_native;
 mod thread_services_native;
@@ -106,6 +107,7 @@ fn main() -> Result<(), String> {
     cond_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("condition"))?;
     multibyte_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("multibyte"))?;
     abort_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("abort"))?;
+    movdqu_native::verify(Path::new(&archive), &Path::new(&directory).join("movdqu"))?;
     semaphore_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     stdio_file_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     system_service_native::verify(Path::new(&archive), Path::new(&directory))?;

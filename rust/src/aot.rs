@@ -1,5 +1,5 @@
 //! Native ARM64 emission. Guest accesses continue through the guarded runtime ABI.
-use crate::{decode, Result};
+use crate::{Result, decode};
 use iced_x86::{Instruction, Mnemonic as M, OpKind, Register as R};
 use std::collections::BTreeSet;
 
@@ -452,6 +452,50 @@ impl Emitter {
                     "str x20, [x19, #{}]\nstr xzr, [x19, #{}]\nstr xzr, [x19, #{}]\nstr xzr, [x19, #{}]",
                     208 + dst * 32, 216 + dst * 32, 224 + dst * 32, 232 + dst * 32
                 ));
+            }
+            M::Movdqu => {
+                if !matches!(
+                    i.code(),
+                    iced_x86::Code::Movdqu_xmm_xmmm128 | iced_x86::Code::Movdqu_xmmm128_xmm
+                ) {
+                    return Err("Only legacy128 MOVDQU forms are implemented".into());
+                }
+                if i.op_kind(0) == OpKind::Register && i.op_kind(1) == OpKind::Register {
+                    let dst = vector(i.op_register(0))?;
+                    let src = vector(i.op_register(1))?;
+                    self.emit(format!(
+                        "ldr q0, [x19, #{}]\nstr q0, [x19, #{}]",
+                        208 + src * 32,
+                        208 + dst * 32
+                    ));
+                } else {
+                    let load = i.op_kind(1) == OpKind::Memory;
+                    let reg = vector(i.op_register(if load { 0 } else { 1 }))?;
+                    self.address(i)?;
+                    // The shared guarded load has VEX zero-upper semantics.
+                    // Preserve legacy YMM[255:128] in callee-saved GPRs and
+                    // restore it on both success and fault. The helper checks
+                    // the entire unaligned operand before changing any lane.
+                    if load {
+                        self.emit(format!(
+                            "ldr x21, [x19, #{}]\nldr x22, [x19, #{}]",
+                            224 + reg * 32,
+                            232 + reg * 32
+                        ));
+                    }
+                    self.emit(format!(
+                        "mov x0, x19\nmov x2, #{reg}\nmov x3, #16\nmov x4, #0\nbl _guest_vector_{}",
+                        if load { "load" } else { "store" }
+                    ));
+                    if load {
+                        self.emit(format!(
+                            "str x21, [x19, #{}]\nstr x22, [x19, #{}]",
+                            224 + reg * 32,
+                            232 + reg * 32
+                        ));
+                    }
+                    self.fault();
+                }
             }
             M::Vmovaps | M::Vmovups | M::Vmovdqa | M::Vmovdqu | M::Vxorps | M::Vxorpd => {
                 if !matches!(i.encoding(), iced_x86::EncodingKind::VEX)

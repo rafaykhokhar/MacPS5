@@ -55,3 +55,13 @@ The native semaphore verifier exercises the pinned homebrew's actual SDL allocat
 Evidence for this checkpoint: `allocator-cpu-native.log` (ADC), `atomic-xadd-native.log` (corrected standalone XADD verifier), and `semaphore-native.log` (actual SDL paths), against the matching release build. The ADC comparison uses an independently written widened-integer oracle, not an x86 hardware differential run.
 
 Unsupported instruction forms, such as misaligned locked accesses, remain explicit gaps. These allocator and semaphore checks do not establish full atomics, memory-ordering or CPU coverage.
+
+## Legacy MOVDQU discovered by signal verification
+
+The expanded abort verifier stopped at synthetic handler offset `0x357` on `f3 0f 6f 83 d0 00 00 00` (`MOVDQU xmm0,[rbx+208]`). This was a verifier instruction, not a discovered retail-game or pinned-homebrew address. Existing VEX VMOVDQU support did not cover the legacy instruction.
+
+Legacy 128-bit MOVDQU register copies and memory loads/stores are now lowered. Unlike VEX128 loads, legacy loads preserve the destination YMM upper half. Unaligned memory operands use the existing guarded 16-byte helpers; unsuccessful loads preserve every vector lane, and unsuccessful stores leave memory unchanged.
+
+[Focused native verifier](../../rust/verification/movdqu_native.rs) passed on ARM64 against an isolated HEAD-plus-AOT debug build (`work/movdqu-review/native.log`, terminal session43488). Its independent byte-copy expectations cover both register encodings, self-copy, xmm15 loads, unaligned addresses, the exact abort displacement form, legacy upper-half preservation versus VEX128 zeroing, and short/unmapped/readonly memory guards with unchanged GPRs, flags and FP controls. The initial verifier incorrectly expected load-fault code1 for stores; it was corrected to the existing store-fault code2 before the passing run. No release archive was overwritten. This closes one concrete instruction gap, not the CPU inventory or full signal execution requirements.
+
+The integrated tree subsequently passes 375 library tests, three integration tests, strict all-target Clippy and release compilation (88301). The same independent native checks also pass against that matching release (35321, `work/movdqu-review/release-native.log`). The verifier is registered in the full entry runner; that full runner has not been rerun for this CPU-only increment.
