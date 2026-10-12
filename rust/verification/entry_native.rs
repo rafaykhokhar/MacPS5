@@ -29,6 +29,8 @@ mod threadattr_native;
 mod thread_services_native;
 mod thread_module_native;
 mod thread_name_native;
+mod thread_pins_native;
+mod signal_set_native;
 mod tiler_native;
 mod tiler_gpu_native;
 mod tls_native;
@@ -63,6 +65,8 @@ fn main() -> Result<(), String> {
     thread_services_native::verify(Path::new(&archive), Path::new(&directory))?;
     thread_module_native::verify(Path::new(&archive), Path::new(&directory))?;
     thread_name_native::verify(Path::new(&archive), Path::new(&directory))?;
+    thread_pins_native::verify(Path::new(&archive), Path::new(&directory))?;
+    signal_set_native::verify(Path::new(&archive), Path::new(&directory))?;
     tiler_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     tiler_gpu_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     user_service_native::verify(Path::new(&archive), Path::new(&directory))?;
@@ -317,6 +321,8 @@ fn main() -> Result<(), String> {
         ("pthread_join", Service::ThreadJoin),
         ("pthread_detach", Service::ThreadDetach),
         ("pthread_set_name_np", Service::ThreadSetName),
+        ("sigemptyset", Service::Sigemptyset),
+        ("sigaddset", Service::Sigaddset),
     ]
     .into_iter()
     .enumerate()
@@ -1154,6 +1160,8 @@ fn main() -> Result<(), String> {
                 (192, 0x730250),
                 (200, 0x730260),
                 (208, 0x730290),
+                (216, 0x7302a0),
+                (224, 0x7302b0),
             ] {
                 if locale_segment.bytes[locale_offset + delta..locale_offset + delta + 8]
                     != expected.to_le_bytes()
@@ -1180,13 +1188,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 47 libc exports: (47+1)*24=1152 symbol bytes and
-                // 1+47*12=565 NID bytes (rounded576). Adding set_name_np
-                // grows these allocations by16+16 from16032 bytes.
-                || native.bytes_allocated() != 16064
+                // 49 libc exports: (49+1)*24=1200 symbol bytes and
+                // 1+49*12=589 NID bytes (rounded592). The two signal-set
+                // exports grow these allocations by48+16 from16064 bytes.
+                || native.bytes_allocated() != 16128
                 || native.bytes_allocated() > 16 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'sigemptyset'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'pthread_sigmask'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1196,7 +1204,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; mutex, thread attributes, pthread_create, pthread_self and pthread_set_name_np bound; unresolved sigemptyset causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; thread imports and sigemptyset/sigaddset bound; unresolved pthread_sigmask causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1258,7 +1266,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved sigemptyset triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved pthread_sigmask triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     Ok(())

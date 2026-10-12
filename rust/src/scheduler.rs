@@ -7,7 +7,13 @@ use crate::{
     module_executor::{Execution, ExitRequest, NativeExecutor, ThreadOperation},
 };
 type Result<T> = std::result::Result<T, String>;
+use std::collections::BTreeSet;
 use std::rc::Rc;
+#[derive(Clone)]
+pub(crate) struct ImageLease {
+    pub bias: u64,
+    pub handles: BTreeSet<u64>,
+}
 const WORKER_LIMIT: usize = 63;
 enum State {
     Ready { entry: u64, argument: u64 },
@@ -18,6 +24,7 @@ enum State {
     Dispatching,
 }
 struct Worker {
+    lease: Option<ImageLease>,
     external: bool,
     detached: bool,
     joiner: Option<u64>,
@@ -49,25 +56,35 @@ pub struct Scheduler {
     remaining_instructions: u64,
 }
 impl Scheduler {
-    pub(crate) fn exit_request(&self) -> Option<ExitRequest> {
-        self.exit_request
-    }
-    pub(crate) fn parent_boundary_has_live_workers(&self, thread: u64) -> bool {
+    pub(crate) fn live_image_pins(&self) -> BTreeSet<u64> {
         self.workers
             .iter()
-            .any(|w| w.thread == thread && matches!(w.state, State::ExternalBoundary(_)))
-            && self.workers.iter().any(|w| {
-                w.thread != thread
-                    && !matches!(
-                        w.state,
-                        State::Completed(_) | State::Reaped | State::ExternalBoundary(_)
-                    )
-            })
+            .filter(|w| !matches!(w.state, State::Completed(_) | State::Reaped))
+            .filter_map(|w| w.lease.as_ref())
+            .flat_map(|lease| lease.handles.iter().copied())
+            .collect()
+    }
+    pub(crate) fn retained_stacks(&mut self) -> Result<Vec<DataRegion<'_>>> {
+        let mut regions = Vec::new();
+        for worker in &mut self.workers {
+            if let State::Suspended(execution) | State::ExternalBoundary(execution) =
+                &mut worker.state
+            {
+                if let Some(region) = execution.stack_region()? {
+                    regions.push(region);
+                }
+            }
+        }
+        Ok(regions)
+    }
+    pub(crate) fn exit_request(&self) -> Option<ExitRequest> {
+        self.exit_request
     }
     pub(crate) fn adopt_parent(
         &mut self,
         native: &NativeExecutor,
         request: &mut Option<Box<crate::module_executor::ThreadRequest>>,
+        lease: ImageLease,
     ) -> Result<u64> {
         self.require_owner(native)?;
         let pending = request.as_ref().ok_or("Missing parent thread request")?;
@@ -90,6 +107,7 @@ impl Scheduler {
             .max(thread.checked_add(1).ok_or("Thread identity overflow")?);
         request.as_mut().unwrap().set_quantum(self.quantum)?;
         self.insert_worker(Worker {
+            lease: Some(lease),
             external: true,
             thread,
             detached: false,
@@ -98,27 +116,8 @@ impl Scheduler {
         });
         Ok(thread)
     }
-    /// Hand the initializer back only after its children finish; until then its
-    /// images/lifecycle stay pinned by Modules and its stack stays owned here.
+    /// Hand the parent back while independent worker leases remain owned here.
     pub(crate) fn take_parent_boundary(&mut self, thread: u64) -> Option<Execution> {
-        let exiting = self.workers.iter().any(|w| {
-            w.thread == thread
-                && matches!(
-                    w.state,
-                    State::ExternalBoundary(Execution::ExitRequested(_))
-                )
-        });
-        if !exiting
-            && self.workers.iter().any(|w| {
-                w.thread != thread
-                    && !matches!(
-                        w.state,
-                        State::Completed(_) | State::Reaped | State::ExternalBoundary(_)
-                    )
-            })
-        {
-            return None;
-        }
         let worker = self.workers.iter_mut().find(|w| {
             w.thread == thread && w.external && matches!(w.state, State::ExternalBoundary(_))
         })?;
@@ -151,6 +150,7 @@ impl Scheduler {
         parent_data: &mut [DataRegion<'_>],
     ) -> Result<Step> {
         let parent = self.workers[index].thread;
+        let lease = self.workers[index].lease.clone();
         self.workers
             .try_reserve(1)
             .map_err(|_| "Cannot reserve thread record")?;
@@ -275,6 +275,7 @@ impl Scheduler {
                     }
                     self.next_thread = next;
                     child = Some(Worker {
+                        lease: lease.clone(),
                         external: false,
                         thread: id,
                         detached: options.detached,
@@ -415,6 +416,7 @@ impl Scheduler {
         native.tls.register_thread(thread)?;
         self.next_thread = self.next_thread.max(next);
         self.insert_worker(Worker {
+            lease: None,
             external: false,
             detached: false,
             joiner: None,
@@ -457,6 +459,41 @@ impl Scheduler {
     /// Select the parent identity explicitly before resuming parent code; the
     /// executor retains the dispatched identity, including after its retirement.
     pub fn step(
+        &mut self,
+        native: &mut NativeExecutor,
+        image: &mut Image,
+        dependencies: &mut [&mut Image],
+        parent_data: &mut [DataRegion<'_>],
+    ) -> Result<Step> {
+        let len = self.workers.len();
+        let bias = (0..len)
+            .map(|n| (self.cursor + n) % len)
+            .find(|&i| {
+                !matches!(
+                    self.workers[i].state,
+                    State::Completed(_) | State::Reaped | State::ExternalBoundary(_)
+                )
+            })
+            .and_then(|i| self.workers[i].lease.as_ref().map(|lease| lease.bias));
+        if let Some(bias) = bias.filter(|bias| *bias != image.bias) {
+            let index = dependencies
+                .iter()
+                .position(|mapped| mapped.bias == bias)
+                .ok_or("Live worker primary image is not mapped")?;
+            let (before, tail) = dependencies.split_at_mut(index);
+            let (selected, after) = tail.split_first_mut().unwrap();
+            let mut others: Vec<&mut Image> = before
+                .iter_mut()
+                .chain(after.iter_mut())
+                .map(|mapped| &mut **mapped)
+                .collect();
+            others.push(image);
+            self.step_mapped(native, selected, &mut others, parent_data)
+        } else {
+            self.step_mapped(native, image, dependencies, parent_data)
+        }
+    }
+    fn step_mapped(
         &mut self,
         native: &mut NativeExecutor,
         image: &mut Image,
@@ -628,6 +665,7 @@ mod tests {
     fn stale_reaped_external_record_does_not_shadow_live_boundary() {
         let mut scheduler = Scheduler::new(1, 10, 10).unwrap();
         scheduler.workers.push(Worker {
+            lease: None,
             external: true,
             thread: 1,
             detached: false,
@@ -635,6 +673,7 @@ mod tests {
             state: State::Reaped,
         });
         scheduler.workers.push(Worker {
+            lease: None,
             external: true,
             thread: 1,
             detached: false,
@@ -665,6 +704,7 @@ mod tests {
         let mut scheduler = Scheduler::new(1, 20000, 20000).unwrap();
         for thread in 2..10002 {
             scheduler.insert_worker(Worker {
+                lease: None,
                 external: false,
                 thread,
                 detached: false,

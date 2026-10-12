@@ -104,6 +104,14 @@ pub fn verify(archive: &Path, directory: &Path) -> Result<(), String> {
                 Ok(StartEvent::ThreadRequest { thread: 1 }) => {
                     assert_eq!(modules.phase(handle), Some(Phase::Faulted));
                     assert!(modules.resume_native(handle, &mut native, 0).is_err());
+                    if steps == 1 {
+                        assert!(
+                            modules
+                                .abandon_native_start(handle)
+                                .unwrap_err()
+                                .contains("worker pins")
+                        );
+                    }
                 }
                 Ok(StartEvent::Started) => {
                     assert!(!exiting);

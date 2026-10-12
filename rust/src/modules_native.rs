@@ -70,12 +70,85 @@ pub(super) struct StartState {
     stopping: Option<u64>,
 }
 impl Modules {
+    /// Validate first, then revoke native code and remove the image without any
+    /// remaining fallible operation. Failed preflight leaves both registrations.
+    pub fn unload_native(&mut self, handle: u64, executor: &mut NativeExecutor) -> Result<()> {
+        self.validate_unload(handle)?;
+        let bias = self
+            .modules
+            .get(&handle)
+            .and_then(|module| module.image.as_ref())
+            .map(|image| image.bias);
+        if let Some(bias) = bias {
+            executor.remove_image_translations(bias);
+        }
+        self.commit_unload(handle);
+        Ok(())
+    }
+    /// Run one background scheduling action while preserving the caller's thread
+    /// identity. Worker leases choose and pin each original module mapping.
+    pub fn step_native_workers(
+        &mut self,
+        handle: u64,
+        executor: &mut NativeExecutor,
+    ) -> Result<crate::scheduler::Step> {
+        self.require_native_running(executor)?;
+        let caller = executor.guest_thread_id();
+        let mut scheduler = self
+            .thread_scheduler
+            .take()
+            .ok_or("No process thread scheduler")?;
+        self.thread_image_pins = scheduler.live_image_pins();
+        let result = self.with_native_images(handle, |image, dependencies, data| {
+            scheduler.step(executor, image, dependencies, data)
+        });
+        self.thread_image_pins = scheduler.live_image_pins();
+        let exit = scheduler.exit_request();
+        self.thread_scheduler = Some(scheduler);
+        if let Some(request) = exit {
+            self.exit_request = Some(request);
+            return Ok(crate::scheduler::Step::ExitRequested(request));
+        }
+        executor.select_guest_thread(caller)?;
+        result
+    }
+    pub(super) fn check_thread_pin(&self, handle: u64) -> Result<()> {
+        if self.thread_image_pins.contains(&handle) {
+            return Err("Live guest worker pins module image".into());
+        }
+        Ok(())
+    }
+    fn thread_image_lease(&self, handle: u64) -> Result<crate::scheduler::ImageLease> {
+        let bias = self
+            .modules
+            .get(&handle)
+            .and_then(|module| module.image.as_ref())
+            .ok_or("Missing thread owner image")?
+            .bias;
+        let mut handles = BTreeSet::new();
+        let mut pending = vec![handle];
+        while let Some(id) = pending.pop() {
+            if handles.insert(id) {
+                let module = self
+                    .modules
+                    .get(&id)
+                    .ok_or("Missing worker image provider")?;
+                pending.extend(module.dependencies.iter().copied());
+                for (&parent, state) in &self.pending_starts {
+                    if state.loaded.is_some_and(|(child, _)| child == id)
+                        || state.stopping == Some(id)
+                    {
+                        pending.push(parent);
+                    }
+                }
+            }
+        }
+        Ok(crate::scheduler::ImageLease { bias, handles })
+    }
     /// Advance a retained initializer through real worker scheduling. The
     /// process-wide (quantum, dispatch, instruction) budgets are installed only
     /// on first use and never reset by another module or another call. This
-    /// bridge requires children quiescent before returning to module loading;
-    /// outstanding background workers retain the fault-pinned initializer and
-    /// report an explicit unsupported boundary until process image pinning exists.
+    /// Background workers retain their image/provider leases after parent handback.
     pub fn resume_native_threads(
         &mut self,
         handle: u64,
@@ -88,6 +161,7 @@ impl Modules {
         }
         self.require_native_running(executor)?;
         self.require_pending_thread(handle, executor)?;
+        let lease = self.thread_image_lease(handle)?;
         let mut state = self
             .pending_starts
             .remove(&handle)
@@ -114,13 +188,11 @@ impl Modules {
         };
         let result = (|| -> Result<Option<Execution>> {
             if state.scheduled_thread.is_none() {
-                scheduler.adopt_parent(executor, &mut state.thread_request)?;
+                scheduler.adopt_parent(executor, &mut state.thread_request, lease)?;
                 state.scheduled_thread = Some(thread);
             }
             for _ in 0..max_steps {
-                if scheduler.parent_boundary_has_live_workers(thread) {
-                    return Err("Module parent boundary with live workers requires process-wide image pinning".into());
-                }
+                self.thread_image_pins = scheduler.live_image_pins();
                 self.with_native_images(handle, |image, dependencies, data| {
                     scheduler.step(executor, image, dependencies, data)
                 })?;
@@ -130,12 +202,10 @@ impl Modules {
                 if let Some(outcome) = scheduler.take_parent_boundary(thread) {
                     return Ok(Some(outcome));
                 }
-                if scheduler.parent_boundary_has_live_workers(thread) {
-                    return Err("Module parent boundary with live workers requires process-wide image pinning".into());
-                }
             }
             Ok(None)
         })();
+        self.thread_image_pins = scheduler.live_image_pins();
         self.thread_scheduler = Some(scheduler);
         // Parent TLS is externally owned; scheduling must never retire it.
         let selected = executor.select_guest_thread(thread);
@@ -437,6 +507,7 @@ impl Modules {
     ) -> Result<()> {
         self.require_native_running(executor)?;
         self.require_pending_thread(caller, executor)?;
+        self.check_thread_pin(child)?;
         self.check_sysmodule_pin(child)?;
         if !self.dynamic_loads.contains(&(caller, child)) {
             return Err("Caller does not own this dynamic module load".into());
@@ -467,7 +538,6 @@ impl Modules {
         {
             return Err("Another module pins dynamic load".into());
         }
-        let bias = module.image.as_ref().unwrap().bias;
         if let Some(state) = self.pending_starts.get_mut(&caller) {
             state.stopping = Some(child);
             let outcome = self.stop_native_shared(child, executor, arguments);
@@ -484,7 +554,7 @@ impl Modules {
             .ok_or("Missing dynamic caller")?
             .dependencies
             .remove(&child);
-        if let Err(error) = self.unload(child) {
+        if let Err(error) = self.unload_native(child, executor) {
             self.modules
                 .get_mut(&caller)
                 .unwrap()
@@ -492,7 +562,6 @@ impl Modules {
                 .insert(child);
             return Err(error);
         }
-        executor.remove_image_translations(bias);
         Ok(())
     }
     fn stop_native_shared(
@@ -501,6 +570,7 @@ impl Modules {
         executor: &mut NativeExecutor,
         arguments: Arguments,
     ) -> Result<()> {
+        self.check_thread_pin(child)?;
         let module = self.modules.get_mut(&child).ok_or("Missing stop image")?;
         let calls: Vec<_> = module
             .entries
@@ -878,6 +948,12 @@ impl Modules {
             }
         }
         required.extend(ancestors.iter().copied());
+        required.extend(
+            self.thread_image_pins
+                .iter()
+                .copied()
+                .filter(|id| *id != handle),
+        );
         let mut selected = None;
         let mut dependencies = Vec::new();
         for (&id, module) in &mut self.modules {
@@ -890,6 +966,9 @@ impl Modules {
             }
         }
         let mut data = Vec::new();
+        if let Some(scheduler) = self.thread_scheduler.as_mut() {
+            data.extend(scheduler.retained_stacks()?);
+        }
         for region in &mut self.process_data {
             data.push(crate::guest_memory::DataRegion {
                 address: region.address,
@@ -897,15 +976,13 @@ impl Modules {
                 writable: region.writable,
             });
         }
-        for (&id, state) in &mut self.pending_starts {
-            if ancestors.contains(&id) {
-                data.push(
-                    state
-                        .continuation
-                        .as_mut()
-                        .ok_or("Missing caller continuation")?
-                        .stack_region(),
-                );
+        for state in self.pending_starts.values_mut() {
+            if let Some(continuation) = state.continuation.as_mut() {
+                data.push(continuation.stack_region());
+            } else if let Some(request) = state.thread_request.as_mut() {
+                data.push(request.stack_region()?);
+            } else if let Some(wait) = state.mutex_wait.as_mut() {
+                data.push(wait.stack_region()?);
             }
         }
         operation(
@@ -1065,6 +1142,7 @@ impl Modules {
     /// Discard suspended execution without making the partially initialized image
     /// unloadable or retryable. It remains fault-pinned until process teardown.
     pub fn abandon_native_start(&mut self, handle: u64) -> Result<()> {
+        self.check_thread_pin(handle)?;
         self.pending_starts
             .remove(&handle)
             .ok_or("No pending module start")?;

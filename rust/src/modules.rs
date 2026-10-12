@@ -82,6 +82,7 @@ struct Module {
     bytes: usize,
 }
 pub struct Modules {
+    thread_image_pins: BTreeSet<u64>,
     thread_scheduler: Option<crate::scheduler::Scheduler>,
     exit_request: Option<crate::module_executor::ExitRequest>,
     native_paths: BTreeMap<String, u64>,
@@ -130,6 +131,7 @@ impl Modules {
     }
     pub fn new(budget: usize) -> Self {
         Self {
+            thread_image_pins: BTreeSet::new(),
             thread_scheduler: None,
             exit_request: None,
             native_paths: BTreeMap::new(),
@@ -366,6 +368,7 @@ impl Modules {
         executor: &mut impl Executor,
         arguments: Arguments,
     ) -> Result<()> {
+        self.check_thread_pin(handle)?;
         self.check_sysmodule_pin(handle)?;
         let module = self.modules.get(&handle).ok_or("Unknown module handle")?;
         if module.phase != Phase::Started || module.image.is_none() {
@@ -497,7 +500,14 @@ impl Modules {
     }
     /// No guest code may still be executing or retaining untracked pointers.
     /// Faulted modules stay pinned until process teardown; arbitrary retry is unsafe.
+    /// Native callers must use unload_native to revoke executor translations too.
     pub fn unload(&mut self, handle: u64) -> Result<()> {
+        self.validate_unload(handle)?;
+        self.commit_unload(handle);
+        Ok(())
+    }
+    fn validate_unload(&self, handle: u64) -> Result<()> {
+        self.check_thread_pin(handle)?;
         self.check_sysmodule_pin(handle)?;
         if self.bootstrap == Some(handle) {
             return Err("Bootstrap root remains owned until process teardown".into());
@@ -513,10 +523,14 @@ impl Modules {
         {
             return Err("Dependent module pins image".into());
         }
+        Ok(())
+    }
+    /// All fallible checks precede this mutation; the manager is exclusively borrowed.
+    fn commit_unload(&mut self, handle: u64) {
         let module = self
             .modules
             .remove(&handle)
-            .ok_or("Unknown module handle")?;
+            .expect("Preflighted unload handle");
         self.bytes -= module.bytes;
         self.sysmodules.retain(|_, (owner, _)| *owner != handle);
         self.native_paths.retain(|_, owner| *owner != handle);
@@ -524,7 +538,6 @@ impl Modules {
         self.registry.remove_module(&module.name);
         self.dynamic_loads
             .retain(|&(caller, child)| caller != handle && child != handle);
-        Ok(())
     }
 }
 /// Minimal synthetic module used for lifecycle execution tests; not a game image.

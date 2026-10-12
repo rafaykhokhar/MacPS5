@@ -51,6 +51,7 @@ pub mod net_resolver;
 pub mod net_dns;
 pub mod libc_memory;
 pub mod guest_locale;
+pub mod guest_signal;
 pub mod captured_stdout;
 pub mod guest_stdio;
 pub mod guest_tls;

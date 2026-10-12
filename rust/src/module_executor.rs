@@ -417,6 +417,8 @@ pub enum Service {
     ThreadCreate,
     ThreadSelf,
     ThreadSetName,
+    Sigemptyset,
+    Sigaddset,
     ThreadJoin,
     ThreadDetach,
     MutexAttrInit,
@@ -457,6 +459,8 @@ impl Service {
             | Self::ThreadCreate
             | Self::ThreadSelf
             | Self::ThreadSetName
+            | Self::Sigemptyset
+            | Self::Sigaddset
             | Self::ThreadJoin
             | Self::ThreadDetach
             | Self::MutexAttrInit
@@ -703,6 +707,13 @@ pub struct MutexWait {
     terminal: bool,
 }
 impl MutexWait {
+    pub(crate) fn stack_region(&mut self) -> Result<DataRegion<'_>> {
+        Ok(self
+            .continuation
+            .as_mut()
+            .ok_or("Mutex wait already consumed")?
+            .stack_region())
+    }
     pub fn guest_thread_id(&self) -> u64 {
         self.ticket.thread_id()
     }
@@ -2377,8 +2388,39 @@ impl NativeExecutor {
                     }
                     let value = if matches!(service, Service::ThreadSelf) {
                         guest_thread
+                    } else if matches!(service, Service::Sigemptyset | Service::Sigaddset) {
+                        let output = cpu.registers[7];
+                        let signum = cpu.registers[6] as u32 as i32;
+                        if matches!(service, Service::Sigaddset)
+                            && !crate::guest_signal::valid(signum)
+                        {
+                            let errno = self
+                                .kernel
+                                .as_ref()
+                                .ok_or("Missing signal-set errno context")?
+                                .errno_address();
+                            validate_net_output(&memory, errno, 4, sp, ret)?;
+                            memory.store(errno, crate::guest_signal::EINVAL.into(), 4)?;
+                            u32::MAX as u64
+                        } else {
+                            validate_net_output(
+                                &memory,
+                                output,
+                                crate::guest_signal::SIZE,
+                                sp,
+                                ret,
+                            )?;
+                            if matches!(service, Service::Sigemptyset) {
+                                crate::guest_signal::empty(&mut memory, output)?;
+                            } else {
+                                crate::guest_signal::add(&mut memory, output, signum)?
+                                    .map_err(|_| "Validated signal became invalid")?;
+                            }
+                            0
+                        }
                     } else if matches!(service, Service::ThreadSetName) {
-                        self.tls.set_name(&memory, cpu.registers[7], cpu.registers[6])?;
+                        self.tls
+                            .set_name(&memory, cpu.registers[7], cpu.registers[6])?;
                         // SDK pthread_set_name_np is void, not a pthread errno
                         // result. Preserve the caller's RAX rather than invent one.
                         cpu.registers[0]
