@@ -419,6 +419,7 @@ pub enum Service {
     ThreadSetName,
     Sigemptyset,
     Sigaddset,
+    ThreadSigmask,
     ThreadJoin,
     ThreadDetach,
     MutexAttrInit,
@@ -461,6 +462,7 @@ impl Service {
             | Self::ThreadSetName
             | Self::Sigemptyset
             | Self::Sigaddset
+            | Self::ThreadSigmask
             | Self::ThreadJoin
             | Self::ThreadDetach
             | Self::MutexAttrInit
@@ -2388,6 +2390,52 @@ impl NativeExecutor {
                     }
                     let value = if matches!(service, Service::ThreadSelf) {
                         guest_thread
+                    } else if matches!(service, Service::ThreadSigmask) {
+                        let how = cpu.registers[7] as u32 as i32;
+                        let input = cpu.registers[6];
+                        let output = cpu.registers[2];
+                        // libthr copies nonNULL input even for invalid how;
+                        // snapshot also preserves exact/partial set-output aliasing.
+                        let input = if input == 0 {
+                            None
+                        } else {
+                            Some(
+                                memory
+                                    .read(input, crate::guest_signal::SIZE)?
+                                    .try_into()
+                                    .unwrap(),
+                            )
+                        };
+                        let old = self.tls.signal_mask(guest_thread)?;
+                        match crate::guest_signal::transition(old, how, input) {
+                            Err(errno_value) => {
+                                // FreeBSD _pthread_sigmask returns errno without restoring it.
+                                let errno = self
+                                    .kernel
+                                    .as_ref()
+                                    .ok_or("Missing signal-mask errno context")?
+                                    .errno_address();
+                                validate_net_output(&memory, errno, 4, sp, ret)?;
+                                memory.store(errno, errno_value.into(), 4)?;
+                                errno_value as u64
+                            }
+                            Ok(mask) => {
+                                // Prototype memory faults stop before mutation. This is not
+                                // kernel copyout/EFAULT emulation (which may change the mask).
+                                if output != 0 {
+                                    validate_net_output(
+                                        &memory,
+                                        output,
+                                        crate::guest_signal::SIZE,
+                                        sp,
+                                        ret,
+                                    )?;
+                                    memory.write(output, &old)?;
+                                }
+                                self.tls.replace_signal_mask(guest_thread, mask)?;
+                                0
+                            }
+                        }
                     } else if matches!(service, Service::Sigemptyset | Service::Sigaddset) {
                         let output = cpu.registers[7];
                         let signum = cpu.registers[6] as u32 as i32;

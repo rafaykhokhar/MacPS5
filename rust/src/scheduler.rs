@@ -262,7 +262,7 @@ impl Scheduler {
                     native.fuel = old_fuel;
                     drop(child_mappings);
                     let prepared = prepared?;
-                    native.tls.register_thread(id)?;
+                    native.tls.register_thread_inheriting(id, parent)?;
                     if let Err(error) = native.with_thread_request_memory(
                         &mut request,
                         image,

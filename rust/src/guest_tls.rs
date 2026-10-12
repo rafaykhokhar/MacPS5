@@ -20,6 +20,7 @@ struct Thread {
     id: u64,
     name: Vec<u8>,
     values: [(u64, u64); KEY_LIMIT],
+    signal_mask: [u8; crate::guest_signal::SIZE],
 }
 #[derive(Debug)]
 pub struct GuestTls {
@@ -55,8 +56,40 @@ impl GuestTls {
             id,
             name: Vec::new(),
             values: [(0, 0); KEY_LIMIT],
+            signal_mask: [0; crate::guest_signal::SIZE],
         });
         self.last_thread_id = id;
+        Ok(())
+    }
+    /// pthread_create copies the creating thread's mask, not its TLS values.
+    /// Primary: FreeBSD11.4 share/man/man3/pthread_create.3; kern_thr.c copies
+    /// td_startcopy..td_endcopy, containing td_sigmask in sys/sys/proc.h.
+    pub fn register_thread_inheriting(&mut self, id: u64, parent: u64) -> Result<()> {
+        let mask = self.signal_mask(parent)?;
+        self.register_thread(id)?;
+        self.threads
+            .last_mut()
+            .expect("Just registered")
+            .signal_mask = mask;
+        Ok(())
+    }
+    pub fn signal_mask(&self, id: u64) -> Result<[u8; crate::guest_signal::SIZE]> {
+        self.threads
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.signal_mask)
+            .ok_or_else(|| "Unregistered guest signal-mask thread".into())
+    }
+    pub(crate) fn replace_signal_mask(
+        &mut self,
+        id: u64,
+        mask: [u8; crate::guest_signal::SIZE],
+    ) -> Result<()> {
+        self.threads
+            .iter_mut()
+            .find(|t| t.id == id)
+            .ok_or("Unregistered guest signal-mask thread")?
+            .signal_mask = mask;
         Ok(())
     }
     /// Scheduler-only lifecycle operation: caller must establish that the
