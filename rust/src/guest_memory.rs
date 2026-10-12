@@ -66,6 +66,22 @@ impl Drop for Memory<'_> {
     }
 }
 impl<'a> Memory<'a> {
+    /// Validate an owned arena's complete reservation before publishing it.
+    pub fn validate_unmapped(&self, address: u64, length: usize) -> crate::Result<()> {
+        let end = address
+            .checked_add(length as u64)
+            .ok_or("Mapping reservation overflow")?;
+        if length == 0
+            || self
+                .regions
+                .iter()
+                .any(|r| address < r.address + r.bytes.len() as u64 && r.address < end)
+            || self.reserved.iter().any(|&p| address <= p && p < end)
+        {
+            return Err("Owned arena reservation overlaps guest mapping or service".into());
+        }
+        Ok(())
+    }
     pub fn reserve_service(&mut self, address: u64) {
         self.reserved.push(address);
     }

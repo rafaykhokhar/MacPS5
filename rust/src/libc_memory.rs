@@ -2,6 +2,42 @@
 use crate::{Result, guest_memory::Memory};
 pub const STRING_LIMIT: usize = 65_536;
 pub const FILL_LIMIT: u64 = 16 * 1024 * 1024;
+/// Bounded temporary-copy semantics support both directions of overlap.
+pub fn memmove(memory: &mut Memory<'_>, destination: u64, source: u64, count: u64) -> Result<u64> {
+    if count > FILL_LIMIT {
+        return Err("Guest memmove exceeds16MiB limit".into());
+    }
+    if count == 0 {
+        return Ok(destination);
+    }
+    let count = count as usize;
+    memory.validate_write(destination, count)?;
+    let input = memory.read(source, count)?;
+    let mut snapshot = Vec::new();
+    snapshot
+        .try_reserve_exact(count)
+        .map_err(|_| "Cannot allocate bounded memmove snapshot")?;
+    snapshot.extend_from_slice(input);
+    memory.write(destination, &snapshot)?;
+    Ok(destination)
+}
+/// Compares unsigned bytes, including embedded zero bytes; only the sign is ABI
+/// significant. Validate complete ranges before comparing, no host pointers.
+pub fn memcmp(memory: &Memory<'_>, left: u64, right: u64, count: u64) -> Result<i32> {
+    if count > FILL_LIMIT {
+        return Err("Guest memcmp exceeds16MiB limit".into());
+    }
+    if count == 0 {
+        return Ok(0);
+    }
+    let left = memory.read(left, count as usize)?;
+    let right = memory.read(right, count as usize)?;
+    Ok(left
+        .iter()
+        .zip(right)
+        .find_map(|(&a, &b)| (a != b).then_some(i32::from(a) - i32::from(b)))
+        .unwrap_or(0))
+}
 /// Outer failures diagnose invalid guest memory or unsupported resource bounds.
 /// Inner errno preserves the existing allocator's failure semantics (NULL/errno).
 pub fn strdup(memory: &mut Memory<'_>, source: u64) -> Result<std::result::Result<u64, u32>> {
@@ -229,5 +265,41 @@ mod realloc_tests {
             assert_eq!(memory.heap_allocation_size(old).unwrap(), 16);
         }
         assert_eq!(owner.bytes_allocated(), 16);
+    }
+}
+#[cfg(test)]
+mod move_compare_tests {
+    use super::*;
+    #[test]
+    fn overlap_zero_unsigned_and_atomic_ranges() {
+        let mut bytes = *b"0123456789abcdef";
+        let mut readonly = [0x80, 0, 0xff, 1];
+        let mut m = Memory::default();
+        m.add(0x1000, &mut bytes, true, false).unwrap();
+        m.add(0x2000, &mut readonly, false, false).unwrap();
+        memmove(&mut m, 0x1002, 0x1000, 8).unwrap();
+        assert_eq!(m.read(0x1000, 16).unwrap(), b"0101234567abcdef");
+        memmove(&mut m, 0x1000, 0x1002, 8).unwrap();
+        assert_eq!(m.read(0x1000, 8).unwrap(), b"01234567");
+        memmove(&mut m, 0x1000, 0x1000, 8).unwrap();
+        let before = m.read(0x1000, 16).unwrap().to_vec();
+        for (dst, src, n) in [
+            (0x2000, 0x1000, 1),
+            (0x1000, 0x2003, 2),
+            (0x100f, 0x1000, 2),
+            (0x1000, 0x1000, 1u64 << 32),
+            (u64::MAX, 0x1000, 1),
+        ] {
+            assert!(memmove(&mut m, dst, src, n).is_err());
+            assert_eq!(m.read(0x1000, 16).unwrap(), before);
+        }
+        assert_eq!(memmove(&mut m, u64::MAX, 0, 0).unwrap(), u64::MAX);
+        assert_eq!(memcmp(&m, 0, u64::MAX, 0).unwrap(), 0);
+        assert!(memcmp(&m, 0x2000, 0x1000, 1).unwrap() > 0);
+        assert!(memcmp(&m, 0x2001, 0x2002, 2).unwrap() < 0);
+        assert_eq!(memcmp(&m, 0x2000, 0x2000, 4).unwrap(), 0);
+        for n in [5, 1u64 << 32] {
+            assert!(memcmp(&m, 0x2000, 0x2000, n).is_err());
+        }
     }
 }

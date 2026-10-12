@@ -35,6 +35,8 @@ mod signal_mask_native;
 mod cancel_type_native;
 mod scheduling_native;
 mod sdl_scheduling_native;
+mod environment_native;
+mod memory_compare_native;
 mod tiler_native;
 mod tiler_gpu_native;
 mod tls_native;
@@ -75,6 +77,8 @@ fn main() -> Result<(), String> {
     cancel_type_native::verify(Path::new(&archive), Path::new(&directory))?;
     scheduling_native::verify(Path::new(&archive), Path::new(&directory))?;
     sdl_scheduling_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+    environment_native::verify(Path::new(&archive), Path::new(&directory))?;
+    memory_compare_native::verify(Path::new(&archive), Path::new(&directory))?;
     tiler_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     tiler_gpu_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     user_service_native::verify(Path::new(&archive), Path::new(&directory))?;
@@ -337,6 +341,9 @@ fn main() -> Result<(), String> {
         ("sched_get_priority_max", Service::SchedPriorityMax),
         ("sched_get_priority_min", Service::SchedPriorityMin),
         ("pthread_setschedparam", Service::ThreadSetschedparam),
+        ("setenv", Service::Setenv),
+        ("memmove", Service::Memmove),
+        ("memcmp", Service::Memcmp),
     ]
     .into_iter()
     .enumerate()
@@ -1182,6 +1189,9 @@ fn main() -> Result<(), String> {
                 (256, 0x7302f0),
                 (264, 0x730300),
                 (272, 0x730310),
+                (296, 0x730320),
+                (312, 0x730330),
+                (320, 0x730340),
             ] {
                 if locale_segment.bytes[locale_offset + delta..locale_offset + delta + 8]
                     != expected.to_le_bytes()
@@ -1208,13 +1218,14 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 55 libc exports: (55+1)*24=1344 symbol bytes
-                // and 1+55*12=661 NID bytes (rounded672). Four scheduling
-                // exports grow allocations by96+48 from16208 bytes.
-                || native.bytes_allocated() != 16352
-                || native.bytes_allocated() > 16 * 1024
+                // 58 libc exports: (58+1)*24=1416 symbol bytes (rounded1424)
+                // and 1+58*12=697 NID bytes (rounded704). These three exports
+                // add80+32bytes to16352. Exact accounting now exceeds the old
+                // 16KiB metadata guard; keep a32KiB cap as well as exact equality.
+                || native.bytes_allocated() != 16464
+                || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'setenv'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'wcslen'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1224,7 +1235,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; thread scheduling imports bound; unresolved setenv causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; setenv, memmove and memcmp imports bound; unresolved wcslen causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1286,7 +1297,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved setenv triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved wcslen triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     Ok(())

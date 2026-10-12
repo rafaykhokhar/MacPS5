@@ -339,6 +339,7 @@ struct TranslationSource {
 #[derive(Clone, Copy)]
 pub enum Service {
     Getenv,
+    Setenv,
     Malloc,
     Realloc,
     Calloc,
@@ -404,6 +405,8 @@ pub enum Service {
     StopUnloadModule,
     SysmoduleLoadInternal,
     Memcpy,
+    Memmove,
+    Memcmp,
     Strdup,
     Memset,
     Setlocale,
@@ -452,6 +455,8 @@ impl Service {
         match self {
             Self::Getenv
             | Self::Memcpy
+            | Self::Memmove
+            | Self::Memcmp
             | Self::Strdup
             | Self::Memset
             | Self::Setlocale
@@ -467,6 +472,7 @@ impl Service {
             | Self::ThreadSetName
             | Self::Sigemptyset
             | Self::Sigaddset
+            | Self::Setenv
             | Self::ThreadSigmask
             | Self::ThreadSetCancelType
             | Self::ThreadGetschedparam
@@ -886,12 +892,22 @@ impl Execution {
 }
 enum Flow {
     Finished(Execution),
+    EnvironmentSet {
+        continuation: Box<Continuation>,
+        imported: Option<crate::environment::Environment>,
+        name: Vec<u8>,
+        value: Vec<u8>,
+        overwrite: i32,
+        errno: u64,
+        terminal: bool,
+    },
     TranslationMiss {
         bias: u64,
         target: u64,
         continuation: Box<Continuation>,
     },
 }
+type EnvironmentCompletion = Option<(u64, Option<i32>, bool)>;
 pub struct NativeExecutor {
     consumed_instruction_fuel: u128,
     worker_quantum: Option<u64>,
@@ -925,6 +941,8 @@ pub struct NativeExecutor {
     pub process_arguments: Option<(u32, u64)>,
     /// Guest NULL-terminated environment table; zero explicitly means empty.
     pub environment: u64,
+    owned_environment: Option<crate::environment::Environment>,
+    pub environment_budget: usize,
     error_text: [u8; 128],
     allocations: crate::guest_memory::OwnedMappings,
     pub kernel: Option<crate::kernel::Kernel>,
@@ -1546,6 +1564,8 @@ impl NativeExecutor {
             direct_memory: crate::direct_memory::DirectMemory::default(),
             system_service: crate::system_service::SystemService::default(),
             environment: 0,
+            owned_environment: None,
+            environment_budget: 1024 * 1024,
             error_text: [0; 128],
             process_arguments: None,
             allocations: crate::guest_memory::OwnedMappings::default(),
@@ -1915,9 +1935,49 @@ impl NativeExecutor {
             }
         });
         let mut slice = (quantum, quantum.unwrap_or(u64::MAX));
+        let mut environment_completion = None;
         loop {
-            match self.execute_step(image, entry, dependencies, continuation, data, &mut slice)? {
+            match self.execute_step(
+                image,
+                entry,
+                dependencies,
+                (continuation, environment_completion.take()),
+                data,
+                &mut slice,
+            )? {
                 Flow::Finished(execution) => return Ok(execution),
+                Flow::EnvironmentSet {
+                    continuation: mut saved,
+                    imported,
+                    name,
+                    value,
+                    overwrite,
+                    errno,
+                    terminal,
+                } => {
+                    // All borrowed mappings are gone. Guest addresses stay fixed;
+                    // no host reference survives the owned arena mutation.
+                    let result = if let Some(mut environment) = imported {
+                        let result = environment.set(&name, &value, overwrite);
+                        if result.is_ok() {
+                            self.environment = environment.table_address();
+                            self.owned_environment = Some(environment);
+                        }
+                        result
+                    } else {
+                        self.owned_environment
+                            .as_mut()
+                            .ok_or("Environment owner disappeared")?
+                            .set(&name, &value, overwrite)
+                    };
+                    if matches!(result, Err(crate::environment::EnvError::Corrupt)) {
+                        return Err("Unsupported malformed direct environment mutation".into());
+                    }
+                    saved.cpu.registers[0] = if result.is_ok() { 0 } else { u32::MAX as u64 };
+                    environment_completion =
+                        Some((errno, result.err().map(|e| e.errno()), terminal));
+                    continuation = Some(*saved);
+                }
                 Flow::TranslationMiss {
                     bias,
                     target,
@@ -1959,10 +2019,11 @@ impl NativeExecutor {
         image: &mut Image,
         entry: (u64, Arguments, ReturnConvention),
         dependencies: &mut [&mut Image],
-        continuation: Option<Continuation>,
+        resume: (Option<Continuation>, EnvironmentCompletion),
         data: &mut [DataRegion<'_>],
         slice: &mut (Option<u64>, u64),
     ) -> Result<Flow> {
+        let (continuation, environment_completion) = resume;
         let (address, arguments, initial_convention) = entry;
         let caller_bias = image.bias;
         let (saved_cpu, mut stack, remaining, stack_address, guest_thread, return_convention) =
@@ -2034,6 +2095,17 @@ impl NativeExecutor {
                 .get(&(bias, offset))
                 .or_else(|| self.blocks.get(&offset))
         };
+        let has_owned_environment = self.owned_environment.is_some();
+        if let Some(environment) = self.owned_environment.as_ref() {
+            if self.environment != environment.table_address() {
+                return Err(
+                    "Direct replacement of the owned environment table is unsupported".into(),
+                );
+            }
+            environment
+                .validate_contents()
+                .map_err(|e| format!("Corrupt guest environment: {e:?}"))?;
+        }
         let mut memory = Memory::default();
         for mapped in std::iter::once(&mut *image).chain(dependencies.iter_mut().map(|i| &mut **i))
         {
@@ -2051,6 +2123,13 @@ impl NativeExecutor {
             memory.add(region.address, region.bytes, region.writable, false)?;
         }
         memory.attach_owned(&mut self.allocations)?;
+        if let Some(environment) = self.owned_environment.as_mut() {
+            for (index, (address, bytes)) in environment.mappings().into_iter().enumerate() {
+                if !bytes.is_empty() {
+                    memory.add(address, bytes, index != 0, false)?;
+                }
+            }
+        }
         if self
             .services
             .values()
@@ -2115,6 +2194,16 @@ impl NativeExecutor {
             cpu.registers[6] = arguments.pointer;
             cpu
         };
+        if let Some((errno, error, terminal)) = environment_completion {
+            if let Some(error) = error {
+                memory.store(errno, error as u64, 4)?;
+            }
+            if terminal {
+                return Ok(Flow::Finished(
+                    return_convention.completed(cpu.registers[0]),
+                ));
+            }
+        }
         for transition in 0..remaining {
             if slice.0.is_some() && slice.1 == 0 {
                 if cpu.fault != 0 {
@@ -2780,6 +2869,30 @@ impl NativeExecutor {
                         } else {
                             0
                         }
+                    } else if matches!(service, Service::Memmove) {
+                        if cpu.registers[2] != 0 {
+                            validate_net_output(
+                                &memory,
+                                cpu.registers[7],
+                                usize::try_from(cpu.registers[2])
+                                    .map_err(|_| "Memmove size overflow")?,
+                                sp,
+                                ret,
+                            )?;
+                        }
+                        crate::libc_memory::memmove(
+                            &mut memory,
+                            cpu.registers[7],
+                            cpu.registers[6],
+                            cpu.registers[2],
+                        )?
+                    } else if matches!(service, Service::Memcmp) {
+                        crate::libc_memory::memcmp(
+                            &memory,
+                            cpu.registers[7],
+                            cpu.registers[6],
+                            cpu.registers[2],
+                        )? as u32 as u64
                     } else if matches!(service, Service::Memcpy) {
                         memory.memcpy(cpu.registers[7], cpu.registers[6], cpu.registers[2])?
                     } else if matches!(service, Service::Memset) {
@@ -2852,6 +2965,87 @@ impl NativeExecutor {
                                 };
                                 memory.store(errno, error, 4)?;
                                 u32::MAX.into()
+                            }
+                        }
+                    } else if matches!(service, Service::Setenv) {
+                        'setenv: {
+                            let errno = self
+                                .kernel
+                                .as_ref()
+                                .ok_or("Missing setenv errno context")?
+                                .errno_address();
+                            let inputs = crate::environment::setenv_inputs(
+                                &memory,
+                                cpu.registers[7],
+                                cpu.registers[6],
+                            )
+                            .map_err(|e| format!("Guest setenv input fault {e:?}"))?;
+                            validate_net_output(&memory, errno, 4, sp, ret)?;
+                            memory.validate_write(errno, 4)?;
+                            match inputs {
+                                Err(error) => {
+                                    memory.store(errno, error.errno() as u64, 4)?;
+                                    u32::MAX as u64
+                                }
+                                Ok((name, value)) => {
+                                    let mut imported = if has_owned_environment {
+                                        None
+                                    } else {
+                                        match crate::environment::Environment::import(
+                                            &memory,
+                                            self.environment,
+                                            0x7ffe00000000,
+                                            self.environment_budget,
+                                        ) {
+                                            Ok(environment) => Some(environment),
+                                            Err(crate::strings::Fault::Allocation) => {
+                                                memory.store(errno, 12, 4)?;
+                                                break 'setenv u32::MAX as u64;
+                                            }
+                                            Err(error) => {
+                                                return Err(format!(
+                                                    "Guest environment import fault {error:?}"
+                                                ));
+                                            }
+                                        }
+                                    };
+                                    if let Some(environment) = imported.as_mut() {
+                                        // Reserve the entire future arena now, before publishing
+                                        // storage or changing metadata, including service collisions.
+                                        for (address, bytes) in environment.mappings() {
+                                            if !bytes.is_empty() {
+                                                memory.validate_unmapped(address, bytes.len())?;
+                                            }
+                                        }
+                                    }
+                                    // Complete the call exactly once before remapping: no repeat
+                                    // stack push, service charge, or input pointer dereference.
+                                    cpu.registers[4] =
+                                        sp.checked_add(8).ok_or("Setenv stack overflow")?;
+                                    cpu.rip = cpu.next_rip;
+                                    cpu.stop = 0;
+                                    cpu.memory = 0;
+                                    let overwrite = cpu.registers[2] as u32 as i32;
+                                    drop(memory);
+                                    return Ok(Flow::EnvironmentSet {
+                                        continuation: Box::new(Continuation {
+                                            quantum: slice.0,
+                                            return_convention,
+                                            guest_thread,
+                                            cpu,
+                                            stack,
+                                            stack_address,
+                                            remaining: remaining - transition - 1,
+                                            caller_bias,
+                                        }),
+                                        imported,
+                                        name,
+                                        value,
+                                        overwrite,
+                                        errno,
+                                        terminal,
+                                    });
+                                }
                             }
                         }
                     } else if matches!(service, Service::Getenv) {
