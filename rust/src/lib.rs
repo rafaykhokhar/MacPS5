@@ -90,3 +90,5 @@ pub mod stdio_file;
 pub mod stdio_write;
 
 pub mod guest_system;
+
+pub mod guest_sysctl;

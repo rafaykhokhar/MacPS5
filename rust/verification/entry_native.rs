@@ -34,6 +34,7 @@ mod semaphore_native;
 mod atomic_xadd_native;
 mod adc_native;
 mod sysconf_native;
+mod sysctl_native;
 mod system_service_native;
 mod threadattr_native;
 mod thread_services_native;
@@ -84,6 +85,7 @@ fn main() -> Result<(), String> {
     atomic_xadd_native::verify(Path::new(&archive), Path::new(&directory))?;
     adc_native::verify(Path::new(&archive), Path::new(&directory))?;
     sysconf_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+    sysctl_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     semaphore_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     stdio_file_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     system_service_native::verify(Path::new(&archive), Path::new(&directory))?;
@@ -444,6 +446,8 @@ fn main() -> Result<(), String> {
         ("sem_post", Service::SemPost),
         ("stat", Service::Stat),
         ("sysconf", Service::Sysconf),
+        ("sysctlbyname", Service::SysctlByName),
+        ("sysctl", Service::Sysctl),
     ]
     .into_iter()
     .enumerate()
@@ -1347,6 +1351,8 @@ fn main() -> Result<(), String> {
                 (792, 0x7306b0),
                 (800, 0x730050),
                 (808, 0x7306c0),
+                (816, 0x7306d0),
+                (824, 0x7306e0),
             ] {
                 if locale_segment.bytes[locale_offset + delta..locale_offset + delta + 8]
                     != expected.to_le_bytes()
@@ -1373,13 +1379,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 114 libc exports: (114+1)*24=2760 (rounded2768) symbol bytes
-                // and 1+114*12=1369 NID bytes (rounded1376). The sysconf
-                // export adds32+16bytes to18432; retain the exact32KiB cap.
-                || native.bytes_allocated() != 18480
+                // 116 libc exports: (116+1)*24=2808 (rounded2816) symbol bytes
+                // and 1+116*12=1393 NID bytes (rounded1408). The sysctl
+                // exports add48+32bytes to18480; retain the exact32KiB cap.
+                || native.bytes_allocated() != 18560
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'sysctlbyname'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'sigaction'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1389,7 +1395,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; sysconf import bound; unresolved sysctlbyname causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; sysctl imports bound; unresolved sigaction causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1451,7 +1457,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved sysctlbyname triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved sigaction triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     Ok(())

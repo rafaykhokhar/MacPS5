@@ -629,6 +629,8 @@ pub enum Service {
     Fstat,
     Stat,
     Sysconf,
+    Sysctl,
+    SysctlByName,
     Nanosleep,
     SemInit,
     SemDestroy,
@@ -796,6 +798,8 @@ impl Service {
             | Self::Fstat
             | Self::Stat
             | Self::Sysconf
+            | Self::Sysctl
+            | Self::SysctlByName
             | Self::Nanosleep
             | Self::SemInit
             | Self::SemDestroy
@@ -3936,6 +3940,60 @@ impl NativeExecutor {
                         } else {
                             0
                         }
+                    } else if matches!(service, Service::Sysctl | Service::SysctlByName) {
+                        let plan = if matches!(service, Service::Sysctl) {
+                            crate::guest_sysctl::plan_numeric(
+                                &memory,
+                                self.system_profile.as_ref(),
+                                [
+                                    cpu.registers[7],
+                                    cpu.registers[6],
+                                    cpu.registers[2],
+                                    cpu.registers[1],
+                                    cpu.registers[8],
+                                    cpu.registers[9],
+                                ],
+                            )?
+                        } else {
+                            crate::guest_sysctl::plan_named(
+                                &memory,
+                                self.system_profile.as_ref(),
+                                [
+                                    cpu.registers[7],
+                                    cpu.registers[6],
+                                    cpu.registers[2],
+                                    cpu.registers[1],
+                                    cpu.registers[8],
+                                ],
+                            )?
+                        };
+                        for write in &plan.writes {
+                            validate_net_output(
+                                &memory,
+                                write.address,
+                                write.bytes.len(),
+                                sp,
+                                ret,
+                            )?;
+                            memory.validate_write(write.address, write.bytes.len())?;
+                        }
+                        let errno = if plan.errno.is_some() {
+                            let address = self
+                                .kernel
+                                .as_ref()
+                                .ok_or("Missing sysctl errno context")?
+                                .errno_address();
+                            validate_net_output(&memory, address, 4, sp, ret)?;
+                            memory.validate_write(address, 4)?;
+                            Some(address)
+                        } else {
+                            None
+                        };
+                        plan.commit(&mut memory)?;
+                        if let (Some(address), Some(error)) = (errno, plan.errno) {
+                            memory.store(address, error as u64, 4)?;
+                        }
+                        plan.return_value()
                     } else if matches!(service, Service::Sysconf) {
                         let selector = cpu.registers[7] as u32 as i32;
                         let query = match self.system_profile.as_ref() {
