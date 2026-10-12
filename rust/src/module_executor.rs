@@ -357,6 +357,7 @@ pub enum Service {
     Atof,
     Strtod,
     Vsscanf,
+    Gettimeofday,
     Malloc,
     Realloc,
     Calloc,
@@ -511,6 +512,7 @@ impl Service {
             | Self::Atof
             | Self::Strtod
             | Self::Vsscanf
+            | Self::Gettimeofday
             | Self::ThreadSigmask
             | Self::ThreadSetCancelType
             | Self::ThreadGetschedparam
@@ -969,6 +971,7 @@ pub struct NativeExecutor {
     pub network: crate::net_resolver::Resolver<crate::net_dns::DnsBackend>,
     network_errno: [u8; 4],
     pub locale: crate::guest_locale::GuestLocale,
+    pub guest_time: crate::guest_time::GuestTime,
     pub stdout: crate::captured_stdout::CapturedStdout,
     pub stdio: crate::guest_stdio::GuestStdio,
     stderr_file: [u8; 312],
@@ -1600,6 +1603,7 @@ impl NativeExecutor {
             network: crate::net_resolver::Resolver::new(crate::net_dns::DnsBackend::default()),
             network_errno: [0; 4],
             locale: crate::guest_locale::GuestLocale::default(),
+            guest_time: crate::guest_time::GuestTime::default(),
             stdout: crate::captured_stdout::CapturedStdout::default(),
             stdio: crate::guest_stdio::GuestStdio::default(),
             stderr_file: crate::guest_stdio::stderr_file_bytes(),
@@ -3153,6 +3157,16 @@ impl NativeExecutor {
                         } else {
                             parsed.bits
                         }
+                    } else if matches!(service, Service::Gettimeofday) {
+                        let plan = self.guest_time.plan(cpu.registers[7], cpu.registers[6])?;
+                        for write in &plan.writes {
+                            validate_net_output(&memory, write.address, write.bytes.len(), sp, ret)?;
+                            memory.validate_write(write.address, write.bytes.len())?;
+                        }
+                        // Valid aliases observe FreeBSD's timeval-then-timezone
+                        // ordering. Invalid mappings stop before any output write.
+                        for write in &plan.writes { memory.write(write.address, &write.bytes)?; }
+                        0
                     } else if matches!(service, Service::Vsscanf) {
                         let plan = crate::scan::guest_plan(&memory, cpu.registers[7], cpu.registers[6], cpu.registers[2])?;
                         for write in &plan.writes {

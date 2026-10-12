@@ -45,6 +45,8 @@ mod x87_control_native;
 mod c_locale_native;
 mod float_parse_native;
 mod scan_native;
+mod guest_time_native;
+mod imul_implicit_native;
 mod tiler_native;
 mod tiler_gpu_native;
 mod tls_native;
@@ -94,6 +96,8 @@ fn main() -> Result<(), String> {
     c_locale_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     float_parse_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     scan_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+    imul_implicit_native::verify(Path::new(&archive), Path::new(&directory))?;
+    guest_time_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     tiler_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     tiler_gpu_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     user_service_native::verify(Path::new(&archive), Path::new(&directory))?;
@@ -390,6 +394,7 @@ fn main() -> Result<(), String> {
         ("atof", Service::Atof),
         ("strtod", Service::Strtod),
         ("vsscanf", Service::Vsscanf),
+        ("gettimeofday", Service::Gettimeofday),
     ]
     .into_iter()
     .enumerate()
@@ -1188,7 +1193,7 @@ fn main() -> Result<(), String> {
                 .iter()
                 .find(|s| {
                     locale_slot >= s.address
-                        && locale_slot + 616 <= s.address + s.bytes.len() as u64
+                        && locale_slot + 624 <= s.address + s.bytes.len() as u64
                 })
                 .ok_or("Missing locale import slot")?;
             let locale_offset = (locale_slot - locale_segment.address) as usize;
@@ -1269,6 +1274,7 @@ fn main() -> Result<(), String> {
                 (584, 0x7304e0),
                 (592, 0x7304f0),
                 (608, 0x730500),
+                (616, 0x730540),
             ] {
                 if locale_segment.bytes[locale_offset + delta..locale_offset + delta + 8]
                     != expected.to_le_bytes()
@@ -1295,13 +1301,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 89 libc exports: (89+1)*24=2160 symbol bytes (aligned2160)
-                // and 1+89*12=1069 NID bytes (rounded1072). The scanner
-                // adds16+0bytes to17552; retain the exact32KiB cap.
-                || native.bytes_allocated() != 17568
+                // 90 libc exports: (90+1)*24=2184 symbol bytes (rounded2192)
+                // and 1+90*12=1081 NID bytes (rounded1088). Time service
+                // adds32+16bytes to17568; retain the exact32KiB cap.
+                || native.bytes_allocated() != 17616
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'gettimeofday'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'nanosleep'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1311,7 +1317,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; scanner and C-locale imports bound; unresolved gettimeofday causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; gettimeofday import bound; unresolved nanosleep causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1373,7 +1379,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved gettimeofday triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved nanosleep triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     Ok(())

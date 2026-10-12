@@ -684,6 +684,30 @@ impl Emitter {
                 self.emit(format!("mov x0, x19\nmov x1, x20\nmov x2, #{width}\nmov x3, #{}\nbl _native_ps5_divide_v1", u8::from(m == M::Idiv)));
                 self.fault();
             }
+            M::Imul if i.op_count() == 1 => {
+                // Intel SDM IMUL: signed full-width product goes to AX or
+                // DX:AX/EDX:EAX/RDX:RAX. Only CF/OF are defined.
+                if ![8, 16, 32, 64].contains(&width) {
+                    return Err("Invalid one-operand IMUL width".into());
+                }
+                self.read(i, 0, width, 20)?;
+                self.emit("ldr x21, [x19, #0]");
+                if width < 64 {
+                    self.emit(format!("sbfx x20, x20, #0, #{width}\nsbfx x21, x21, #0, #{width}"));
+                }
+                self.emit("mul x22, x21, x20");
+                if width == 64 {
+                    self.emit("smulh x9, x21, x20\nstr x22, [x19, #0]\nstr x9, [x19, #16]");
+                } else if width == 32 {
+                    self.emit("lsr x9, x22, #32\nmov w22, w22\nstr x22, [x19, #0]\nstr x9, [x19, #16]");
+                } else if width == 16 {
+                    self.emit("lsr x9, x22, #16\nstrh w22, [x19, #0]\nstrh w9, [x19, #16]");
+                } else {
+                    self.emit("strh w22, [x19, #0]");
+                }
+                self.emit(format!("ldr x0, [x19, #136]\nmov x1, x21\nmov x2, x20\nmov x3, x22\nmov x4, #{width}\nmov x5, #6\nbl _native_ps5_arithmetic_flags_v1\nstr x0, [x19, #136]\nstr x1, [x19, #152]"));
+                self.fault();
+            }
             M::Imul => {
                 if ![16, 32, 64].contains(&width)
                     || ![2, 3].contains(&i.op_count())
@@ -880,7 +904,6 @@ mod tests {
     fn reject_unsupported_instead_of_silently_skipping() {
         for bytes in [
             &[0xf7, 0xe0, 0xc3][..],
-            &[0xf7, 0xe8, 0xc3],
             &[0xf6, 0xf0, 0xc3],
             &[0xf0, 0x01, 0x00, 0xc3],
             &[0x64, 0x48, 0x8b, 0x00, 0xc3],
