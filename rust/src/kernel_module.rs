@@ -1,6 +1,9 @@
 //! Kernel module bytes observed by this homebrew's own dynamic resolver.
 //! Function and data exports; the caller validates function addresses against live code.
 use crate::Result;
+/// Prototype metadata budget, not an architectural limit. Includes room for
+/// substantial libc/system catalogs while bounding record allocation below 150 KiB.
+pub const MAX_EXPORTS: usize = 4096;
 #[derive(Clone, Copy)]
 pub enum Kind {
     Function,
@@ -61,7 +64,7 @@ impl ModuleRecord {
         exports: &[(&str, u64)],
         callable: impl FnMut(u64) -> bool,
     ) -> Result<Self> {
-        if exports.is_empty() || exports.len() > 128 {
+        if exports.is_empty() || exports.len() > MAX_EXPORTS {
             return Err("Invalid kernel export count".into());
         }
         let entries: Vec<_> = exports
@@ -95,7 +98,7 @@ impl ModuleRecord {
             || address % 16 != 0
             || handle == 0
             || exports.is_empty()
-            || exports.len() > 128
+            || exports.len() > MAX_EXPORTS
         {
             return Err("Invalid kernel module record".into());
         }
@@ -179,6 +182,26 @@ impl ModuleRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn expanded_catalog_serializes_all_entries_and_stays_bounded() {
+        let names: Vec<_> = (0..=MAX_EXPORTS).map(|i| format!("{i:011}")).collect();
+        let exports: Vec<_> = names.iter().enumerate()
+            .map(|(i, name)| (name.as_str(), 0x1000 + i as u64 * 16)).collect();
+        for count in [131, MAX_EXPORTS] {
+            let record = ModuleRecord::functions(0x8000, 0, 2, 0,
+                &exports[..count], |_| true).unwrap();
+            let symbols = (count + 1) * 24;
+            assert_eq!(record.bytes.len(), 0x2a0 + symbols + 1 + count * 12);
+            assert_eq!(u64::from_le_bytes(record.bytes[0x1b0..0x1b8].try_into().unwrap()), symbols as u64);
+            let last = 0x2a0 + count * 24;
+            assert_eq!(u64::from_le_bytes(record.bytes[last + 8..last + 16].try_into().unwrap()), exports[count - 1].1);
+            assert_eq!(&record.bytes[record.bytes.len() - 12..record.bytes.len() - 1], names[count - 1].as_bytes());
+        }
+        assert!(ModuleRecord::functions(0x8000, 0, 2, 0, &exports, |_| true).is_err());
+        let entries: Vec<_> = exports.iter().map(|&(nid, address)| Export { nid, address, kind: Kind::Function }).collect();
+        assert!(ModuleRecord::build(0x8000, 0, 2, 0, &entries,
+            &crate::guest_memory::Memory::default(), |_| true).is_err());
+    }
     #[test]
     fn native_service_entries_have_exact_virtual_extents_and_relative_values() {
         let make = |base, target, callable| {

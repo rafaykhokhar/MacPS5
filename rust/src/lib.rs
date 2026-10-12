@@ -60,6 +60,7 @@ pub mod captured_stdout;
 pub mod guest_stdio;
 pub mod guest_tls;
 pub mod guest_mutex;
+pub mod guest_cond;
 pub mod pad_data;
 pub mod pad_input;
 pub mod game_controller;

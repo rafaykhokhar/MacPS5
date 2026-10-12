@@ -42,6 +42,7 @@ mod fgets_native;
 mod getcwd_native;
 mod strdup_native;
 mod mkdir_native;
+mod cond_native;
 mod system_service_native;
 mod threadattr_native;
 mod thread_services_native;
@@ -100,6 +101,7 @@ fn main() -> Result<(), String> {
     getcwd_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("getcwd"))?;
     strdup_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strdup"))?;
     mkdir_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("mkdir"))?;
+    cond_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("condition"))?;
     semaphore_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     stdio_file_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     system_service_native::verify(Path::new(&archive), Path::new(&directory))?;
@@ -477,6 +479,12 @@ fn main() -> Result<(), String> {
         ("fgets", Service::Fgets),
         ("getcwd", Service::Getcwd),
         ("mkdir", Service::Mkdir),
+        ("pthread_cond_init", Service::CondInit),
+        ("pthread_cond_destroy", Service::CondDestroy),
+        ("pthread_cond_signal", Service::CondSignal),
+        ("pthread_cond_broadcast", Service::CondBroadcast),
+        ("pthread_cond_timedwait", Service::CondTimedWait),
+        ("pthread_cond_wait", Service::CondWait),
     ]
     .into_iter()
     .enumerate()
@@ -1408,6 +1416,12 @@ fn main() -> Result<(), String> {
                 (960, 0x7300c0),
                 (968, 0x730010),
                 (976, 0x730760),
+                (984, 0x730770),
+                (992, 0x730780),
+                (1000, 0x730790),
+                (1008, 0x7307a0),
+                (1016, 0x7307b0),
+                (1024, 0x7307c0),
             ] {
                 if locale_segment.bytes[locale_offset + delta..locale_offset + delta + 8]
                     != expected.to_le_bytes()
@@ -1434,13 +1448,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 125 libc exports: (125+1)*24=3024 symbol bytes
-                // and 1+125*12=1501 NID bytes (rounded1504). Mkdir
-                // adds16bytes to18848; retain the exact32KiB cap.
-                || native.bytes_allocated() != 18864
+                // 131 libc exports: (131+1)*24=3168 symbol bytes
+                // and 1+131*12=1573 NID bytes (rounded1584).
+                // Six condition exports add224bytes to18864.
+                || native.bytes_allocated() != 19088
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'pthread_cond_init'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'mbrtowc'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1450,7 +1464,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; mkdir import bound; unresolved pthread_cond_init causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; condition imports bound; unresolved mbrtowc causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1512,7 +1526,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved pthread_cond_init triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved mbrtowc triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     presentation_result?;

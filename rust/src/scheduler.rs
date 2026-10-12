@@ -40,6 +40,7 @@ pub enum Step {
     MutexPending(u64),
     JoinPending(u64),
     SemaphorePending(u64),
+    ConditionPending(u64),
     ThreadService(u64),
     /// No runnable worker; host driver may wait until this monotonic deadline.
     /// Observing this state consumes neither dispatch nor instruction fuel.
@@ -183,6 +184,7 @@ impl Scheduler {
         };
         let operation = request.operation();
         let semaphore = matches!(operation, ThreadOperation::SemaphoreWait { .. });
+        let condition = matches!(operation, ThreadOperation::ConditionWait { .. });
         let target_id = match operation {
             ThreadOperation::Join { thread, .. } | ThreadOperation::Detach { thread } => {
                 Some(thread)
@@ -235,6 +237,16 @@ impl Scheduler {
         let mut joiner = None;
         let result = (|| -> Result<Option<u64>> {
             match operation {
+                ThreadOperation::ConditionWait { .. } => native.resume_condition_at(
+                    &mut request,
+                    image,
+                    dependencies,
+                    &mut mappings,
+                    Some(crate::guest_cond::Realtime {
+                        seconds: realtime.seconds,
+                        nanoseconds: realtime.nanoseconds,
+                    }),
+                ),
                 ThreadOperation::SemaphoreWait { .. } => native.resume_semaphore_at(
                     &mut request,
                     image,
@@ -377,6 +389,8 @@ impl Scheduler {
                     Step::ThreadService(parent)
                 } else if semaphore {
                     Step::SemaphorePending(parent)
+                } else if condition {
+                    Step::ConditionPending(parent)
                 } else {
                     Step::JoinPending(parent)
                 })
@@ -488,6 +502,13 @@ impl Scheduler {
             State::Completed(_) | State::Reaped | State::ExternalBoundary(_) => false,
             State::Suspended(Execution::ThreadRequest(request)) => match request.operation() {
                 ThreadOperation::Sleep { deadline } => deadline.ready(now),
+                ThreadOperation::ConditionWait { .. } => native.condition_ready(
+                    request,
+                    crate::guest_cond::Realtime {
+                        seconds: realtime.seconds,
+                        nanoseconds: realtime.nanoseconds,
+                    },
+                )?,
                 ThreadOperation::SemaphoreWait { ticket, .. } => {
                     native
                         .semaphores
@@ -516,6 +537,25 @@ impl Scheduler {
         let mut deadline = self.next_sleep_deadline();
         for worker in &self.workers {
             if let State::Suspended(Execution::ThreadRequest(request)) = &worker.state {
+                if let ThreadOperation::ConditionWait { ticket, .. } = request.operation() {
+                    if native.conditions.phase(&ticket, worker.thread)?
+                        == crate::guest_cond::Phase::Waiting
+                    {
+                        if let Some(delay) = native.conditions.delay_ns(
+                            &ticket,
+                            worker.thread,
+                            crate::guest_cond::Realtime {
+                                seconds: realtime.seconds,
+                                nanoseconds: realtime.nanoseconds,
+                            },
+                        )? {
+                            let target = now
+                                .checked_add(u128::from(delay.min(100_000_000)))
+                                .ok_or("Condition polling deadline overflow")?;
+                            deadline = Some(deadline.map_or(target, |old| old.min(target)));
+                        }
+                    }
+                }
                 if let ThreadOperation::SemaphoreWait { ticket, .. } = request.operation() {
                     if let Some(delay) =
                         native
@@ -567,14 +607,15 @@ impl Scheduler {
         parent_data: &mut [DataRegion<'_>],
     ) -> Result<Step> {
         let now = native.sleep_clock_now();
-        let realtime = if native.semaphores.has_realtime_waits() {
-            native.semaphore_realtime()?
-        } else {
-            crate::guest_semaphore::Realtime {
-                seconds: 0,
-                nanoseconds: 0,
-            }
-        };
+        let realtime =
+            if native.semaphores.has_realtime_waits() || native.conditions.has_realtime_waits() {
+                native.semaphore_realtime()?
+            } else {
+                crate::guest_semaphore::Realtime {
+                    seconds: 0,
+                    nanoseconds: 0,
+                }
+            };
         let len = self.workers.len();
         let mut selected_index = None;
         for n in 0..len {
@@ -835,9 +876,11 @@ mod tests {
     fn overflowing_enqueue_identity_does_not_register_tls() {
         let mut scheduler = Scheduler::new(1, 10, 10).unwrap();
         let mut native = NativeExecutor::new(0x900000, 4096, 10, 10).unwrap();
-        assert!(scheduler
-            .enqueue(&mut native, u64::MAX, 0x100100, 0)
-            .is_err());
+        assert!(
+            scheduler
+                .enqueue(&mut native, u64::MAX, 0x100100, 0)
+                .is_err()
+        );
         assert_eq!(native.tls.live_threads(), 1);
         assert_eq!(native.tls.next_thread_id().unwrap(), 2);
         assert!(scheduler.workers.is_empty());

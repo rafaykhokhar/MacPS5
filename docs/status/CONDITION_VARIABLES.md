@@ -1,6 +1,8 @@
-# Condition variable implementation plan
+# Condition variable implementation and verification
 
-Not implemented or verified. Source-derived FreeBSD policy is not console-measured behavior.
+Rust model, executor and scheduler integration is implemented locally. The transfer-guard build passes 356 unit tests and three integration tests, with strict all-target Clippy also passing. Focused native verification passes actual SDL wrappers, two translated workers with quantum 3, nonbanked signals, one-waiter signal, broadcast, recursive depth restoration, timeout blocked on mutex reacquisition, allocation retention and transactional alias failures (`condition-transfer-native.log`, matching release 30869). Callback waits and full startup integration remain unverified; these checks do not prove game compatibility. Source-derived FreeBSD policy is not console-measured behavior.
+
+Completed-wait continuation transfer validates image/stack/mappings before consuming ownership. Subsequent consuming errors pin stack storage and block further executor execution. Regression tests cover wrong image, malformed mappings, budget failure after transfer and successful completion without a false fault latch.
 
 Use an owned state machine: Waiting → Reacquiring(result) → Returned. Signal or timeout selects a result; the call returns only after mutex reacquisition. Signals are not banked for future waiters.
 
@@ -17,6 +19,8 @@ The pinned SDK represents condition and attribute slots as eight-byte opaque poi
 
 ## Required verification
 
+Startup binding of all six condition imports is verified by `condition-entry-transfer.log`, reaching missing `mbrtowc` with 19,088 owned dependency bytes. The integrated process exits unsuccessfully because presentation failed; this is a startup-only checkpoint, not a full integration pass. Callback waits remain unverified.
+
 Signal-before-wait, one-waiter signal, broadcast, signal while mutex remains locked, timeout with blocked reacquisition, recursive-depth restoration, transactional invalid-input failures, foreign/replayed identities, backing reuse, two native translated workers, quantum slicing, callback waits and full startup binding.
 
 ## Sources
@@ -26,3 +30,7 @@ Signal-before-wait, one-waiter signal, broadcast, signal while mutex remains loc
 - [FreeBSD condition implementation](https://raw.githubusercontent.com/freebsd/freebsd-src/releng/11.4/lib/libthr/thread/thr_cond.c)
 - [FreeBSD mutex implementation](https://raw.githubusercontent.com/freebsd/freebsd-src/releng/11.4/lib/libthr/thread/thr_mutex.c)
 - [FreeBSD condition attributes](https://raw.githubusercontent.com/freebsd/freebsd-src/releng/11.4/lib/libthr/thread/thr_condattr.c)
+
+## Stack storage lifetime boundary
+
+Blocking condition waits currently accept condition and mutex slots in the waiting thread's own retained stack, process-owned allocations, or retained images. Slots backed by another worker's stack are rejected before queue publication or mutex release, even when that worker is presently suspended. Stack identity leases do not own the stack bytes; supporting this valid guest usage requires a shared stack-backing ownership design across continuations and the scheduler. This restriction is an unfinished compatibility requirement, not completed condition-variable support.

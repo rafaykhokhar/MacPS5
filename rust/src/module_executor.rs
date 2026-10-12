@@ -25,6 +25,7 @@ struct StackIdentity {
 /// A failed dispatch cannot release backing still owned by a semaphore waiter.
 /// Successful suspension transfers the bytes out, leaving this guard empty.
 struct ExecutionStack {
+    condition_transfer: bool,
     lease: Rc<()>,
     bytes: Vec<u8>,
     address: u64,
@@ -49,7 +50,7 @@ impl ExecutionStack {
 }
 impl Drop for ExecutionStack {
     fn drop(&mut self) {
-        if self.pending.get() && !self.bytes.is_empty() {
+        if (self.pending.get() || self.condition_transfer) && !self.bytes.is_empty() {
             let bytes = self.take();
             self.fault
                 .borrow_mut()
@@ -168,6 +169,23 @@ fn callback_storage(
         return Ok((stack.address, stack.length));
     }
     Err("Comparator requires owned allocation, retained stack or retained image backing".into())
+}
+/// Conditions may suspend with slots in their own retained continuation stack,
+/// process-owned allocations, or host-retained images. A foreign stack identity
+/// lease does not own its Vec backing, so accepting it would allow another host
+/// context to drop the bytes while this wait remains live. Shared stack backing
+/// ownership is required before foreign-stack condition/mutex slots are supported.
+fn condition_storage(
+    memory: &Memory<'_>,
+    address: u64,
+    images: &[(u64, usize)],
+    stacks: &[StackIdentity],
+    current_stack: &Rc<()>,
+) -> Result<(u64, usize)> {
+    let identity = Rc::downgrade(current_stack);
+    let own_stack = stacks.iter().find(|s| Weak::ptr_eq(&s.lease, &identity));
+    callback_storage(memory, address, 8, images, own_stack.map(std::slice::from_ref).unwrap_or_default())
+        .map_err(|error| format!("Condition storage requires owned allocation, retained image or the waiting thread's own stack; foreign-stack storage unsupported: {error}"))
 }
 fn guard_semaphore_plan(
     memory: &Memory<'_>,
@@ -408,6 +426,7 @@ mod equeue_return_tests {
         let pending = Rc::new(Cell::new(false));
         {
             let mut stack = ExecutionStack {
+                condition_transfer: false,
                 lease: Rc::new(()),
                 bytes: vec![0; 64],
                 address: 0x9000,
@@ -421,6 +440,7 @@ mod equeue_return_tests {
         assert_eq!(address, 0x9000);
         assert_eq!(bytes[17], 0xab);
         let mut stack = ExecutionStack {
+            condition_transfer: false,
             lease,
             bytes,
             address,
@@ -819,6 +839,12 @@ pub enum Service {
     SchedPriorityMax,
     ThreadJoin,
     ThreadDetach,
+    CondInit,
+    CondDestroy,
+    CondSignal,
+    CondBroadcast,
+    CondWait,
+    CondTimedWait,
     MutexAttrInit,
     MutexAttrSetType,
     MutexAttrDestroy,
@@ -914,6 +940,12 @@ impl Service {
             | Self::SchedPriorityMax
             | Self::ThreadJoin
             | Self::ThreadDetach
+            | Self::CondInit
+            | Self::CondDestroy
+            | Self::CondSignal
+            | Self::CondBroadcast
+            | Self::CondWait
+            | Self::CondTimedWait
             | Self::MutexAttrInit
             | Self::MutexAttrSetType
             | Self::MutexAttrDestroy
@@ -1205,6 +1237,12 @@ impl QuantumYield {
 }
 #[derive(Clone, Debug)]
 pub enum ThreadOperation {
+    ConditionWait {
+        ticket: crate::guest_cond::WaitTicket,
+        mutex_ticket: Rc<Option<crate::guest_mutex::CondMutexTicket>>,
+        return_sp: u64,
+        return_address: u64,
+    },
     SemaphoreWait {
         ticket: crate::guest_semaphore::WaitTicket,
         return_sp: u64,
@@ -1233,6 +1271,16 @@ pub struct ThreadRequest {
     owner: Rc<()>,
     continuation: Option<Continuation>,
     operation: ThreadOperation,
+    condition_faults: Option<Rc<RefCell<Vec<Continuation>>>>,
+}
+impl Drop for ThreadRequest {
+    fn drop(&mut self) {
+        if let Some(faults) = &self.condition_faults {
+            if let Some(continuation) = self.continuation.take() {
+                faults.borrow_mut().push(continuation);
+            }
+        }
+    }
 }
 impl ThreadRequest {
     pub(crate) fn set_quantum(&mut self, quantum: u64) -> Result<()> {
@@ -1377,6 +1425,10 @@ pub struct NativeExecutor {
     mutex_wait_owner: Rc<()>,
     pub thread_attributes: crate::guest_thread_attr::GuestThreadAttributes,
     pub mutex: crate::guest_mutex::GuestMutex,
+    pub conditions: crate::guest_cond::GuestCond,
+    condition_leases: Vec<(u64, Rc<()>)>,
+    condition_transfer_active: bool,
+    condition_faults: Rc<RefCell<Vec<Continuation>>>,
     pub tls: crate::guest_tls::GuestTls,
     selected_guest_thread: u64,
     exit_request: Option<ExitRequest>,
@@ -1468,6 +1520,7 @@ impl NativeExecutor {
             bytes.len(),
         )));
         ExecutionStack {
+            condition_transfer: self.condition_transfer_active,
             lease,
             bytes,
             address,
@@ -1596,6 +1649,186 @@ impl NativeExecutor {
         }
         result
     }
+    pub(crate) fn condition_ready(
+        &self,
+        request: &ThreadRequest,
+        now: crate::guest_cond::Realtime,
+    ) -> Result<bool> {
+        if !request.belongs_to(self) {
+            return Err("Foreign condition request".into());
+        }
+        let ThreadOperation::ConditionWait {
+            ticket,
+            mutex_ticket,
+            ..
+        } = &request.operation
+        else {
+            return Err("Not a condition wait".into());
+        };
+        let thread = request
+            .guest_thread_id()
+            .ok_or("Consumed condition request")?;
+        match self.conditions.phase(ticket, thread)? {
+            crate::guest_cond::Phase::Waiting => {
+                Ok(self.conditions.delay_ns(ticket, thread, now)? == Some(0))
+            }
+            crate::guest_cond::Phase::Reacquiring(_) => Ok(self
+                .mutex
+                .cond_owner_hint(
+                    mutex_ticket
+                        .as_ref()
+                        .as_ref()
+                        .ok_or("Unpublished condition mutex token")?,
+                )?
+                .is_none()),
+        }
+    }
+    pub(crate) fn resume_condition_at(
+        &mut self,
+        request: &mut ThreadRequest,
+        image: &mut Image,
+        dependencies: &mut [&mut Image],
+        data: &mut [DataRegion<'_>],
+        sampled: Option<crate::guest_cond::Realtime>,
+    ) -> Result<Option<u64>> {
+        self.require_running()?;
+        let thread = request
+            .guest_thread_id()
+            .ok_or("Consumed condition request")?;
+        if !request.belongs_to(self)
+            || thread != self.selected_guest_thread
+            || !self.tls.contains_thread(thread)
+        {
+            return Err("Foreign or retired condition request".into());
+        }
+        let ThreadOperation::ConditionWait {
+            ticket,
+            return_sp,
+            return_address,
+            mutex_ticket,
+        } = request.operation()
+        else {
+            return Err("Not a pending condition request".into());
+        };
+        let needs_realtime = matches!(
+            self.conditions.phase(&ticket, thread)?,
+            crate::guest_cond::Phase::Waiting
+        ) && self
+            .conditions
+            .delay_ns(
+                &ticket,
+                thread,
+                crate::guest_cond::Realtime {
+                    seconds: 0,
+                    nanoseconds: 0,
+                },
+            )?
+            .is_some();
+        let now = if needs_realtime {
+            Some(match sampled {
+                Some(now) => now,
+                None => {
+                    let (seconds, nanoseconds) = self.guest_time.realtime_parts()?;
+                    crate::guest_cond::Realtime {
+                        seconds,
+                        nanoseconds,
+                    }
+                }
+            })
+        } else {
+            None
+        };
+        let saved = request
+            .continuation
+            .as_ref()
+            .ok_or("Consumed condition request")?;
+        if saved.caller_bias != image.bias {
+            return Err("Condition request belongs to different image".into());
+        }
+        let terminal = saved.cpu.stop == 3;
+        let target = if terminal {
+            if return_address != u64::MAX
+                || !(saved
+                    .callbacks
+                    .as_ref()
+                    .is_some_and(|context| context.authentic_return(return_sp, return_address))
+                    || (return_sp == saved.stack_address + saved.stack.len() as u64 - 8
+                        && saved
+                            .callbacks
+                            .as_ref()
+                            .is_none_or(|context| context.frames.is_empty())))
+                || saved.cpu.registers[4] != return_sp
+            {
+                return Err("Condition terminal return changed".into());
+            }
+            None
+        } else {
+            if saved.cpu.bias.checked_add(saved.cpu.next_rip) != Some(return_address)
+                || return_sp.checked_add(8) != Some(saved.cpu.registers[4])
+            {
+                return Err("Condition return target changed".into());
+            }
+            let block = self
+                .image_blocks
+                .get(&(saved.cpu.bias, saved.cpu.next_rip))
+                .or_else(|| self.blocks.get(&saved.cpu.next_rip))
+                .ok_or("Condition return target no longer registered")?;
+            Some((
+                saved
+                    .cpu
+                    .bias
+                    .checked_add(block.start)
+                    .ok_or("Condition return code overflow")?,
+                block.bytes.clone(),
+            ))
+        };
+        let mut conditions = std::mem::take(&mut self.conditions);
+        let result = self.with_suspended_runtime(
+            request
+                .continuation
+                .as_mut()
+                .ok_or("Consumed condition request")?,
+            image,
+            dependencies,
+            data,
+            |memory, mutex| {
+                if memory.load(return_sp, 8)? != return_address {
+                    return Err("Condition return frame changed before reacquisition".into());
+                }
+                if let Some((source, bytes)) = &target {
+                    if !memory.executable(return_address)
+                        || memory.read(*source, bytes.len())? != &**bytes
+                    {
+                        return Err("Condition return code changed before reacquisition".into());
+                    }
+                }
+                let select = conditions.select(memory, &ticket, thread, now)?;
+                if let crate::guest_cond::Outcome::Pending(_) = conditions.commit(memory, select)? {
+                    return Ok(None);
+                }
+                let finish = conditions.finish(memory, &ticket, thread)?;
+                let mutex_ticket = mutex_ticket
+                    .as_ref()
+                    .as_ref()
+                    .ok_or("Unpublished condition mutex token")?;
+                let Some(reacquire) = mutex.prepare_cond_reacquire(memory, mutex_ticket)? else {
+                    return Ok(None);
+                };
+                let outcome = conditions.commit(memory, finish)?;
+                reacquire.commit();
+                match outcome {
+                    crate::guest_cond::Outcome::Status(status) => Ok(Some(status as u32 as u64)),
+                    _ => unreachable!("Condition finish returns its selected status"),
+                }
+            },
+        );
+        self.conditions = conditions;
+        if let Ok(Some(value)) = result {
+            request.complete(value);
+            self.condition_leases.retain(|(owner, _)| *owner != thread);
+        }
+        result
+    }
     pub fn configure_manual_sleep_clock(&mut self, now: u128) -> Result<()> {
         self.sleep_clock.configure_manual(now)
     }
@@ -1639,11 +1872,46 @@ impl NativeExecutor {
         {
             return Err("Foreign or retired thread request".into());
         }
+        let saved = request
+            .continuation
+            .as_ref()
+            .ok_or("Thread request consumed")?;
+        self.validate_resume_mapping(saved, image, saved.stack.len())?;
+        let condition_completion = request.condition_faults.is_some();
+        if condition_completion {
+            if !matches!(request.operation, ThreadOperation::Completed(_)) {
+                return Err("Condition wait has not reacquired its mutex".into());
+            }
+            // Validate every supplied mapping while ownership stays in request.
+            self.with_thread_request_memory(request, image, dependencies, data, |_| Ok(()))?;
+            self.fault_stack
+                .borrow_mut()
+                .try_reserve(1)
+                .map_err(|_| "Cannot reserve condition transfer fault backing")?;
+        }
         let continuation = request
             .continuation
             .take()
             .ok_or("Thread request consumed")?;
-        self.resume_with_data(image, dependencies, continuation, result, data)
+        self.condition_transfer_active = condition_completion;
+        let outcome = self.resume_with_data(image, dependencies, continuation, result, data);
+        self.condition_transfer_active = false;
+        outcome
+    }
+    fn validate_resume_mapping(
+        &self,
+        continuation: &Continuation,
+        image: &Image,
+        stack_length: usize,
+    ) -> Result<()> {
+        if continuation.caller_bias != image.bias
+            || continuation.stack_address < self.stack_address
+            || stack_length != self.stack_size
+            || (continuation.stack_address - self.stack_address) % self.stack_size as u64 != 0
+        {
+            return Err("Continuation belongs to different mappings".into());
+        }
+        Ok(())
     }
     /// Reserve and validate a child before publishing its guest handle. No child
     /// instruction executes here. The scheduler registers TLS after preparation.
@@ -1818,7 +2086,10 @@ impl NativeExecutor {
         self.exit_context.as_ref().map(|context| context.cpu.fuel)
     }
     pub(crate) fn require_running(&self) -> Result<()> {
-        if !self.fault_stack.borrow().is_empty() || !self.callback_faults.borrow().is_empty() {
+        if !self.fault_stack.borrow().is_empty()
+            || !self.callback_faults.borrow().is_empty()
+            || !self.condition_faults.borrow().is_empty()
+        {
             return Err("Guest stack or callback retirement fault pinned".into());
         }
         if let Some(request) = self.exit_request {
@@ -2268,6 +2539,10 @@ impl NativeExecutor {
             mutex_wait_owner: Rc::new(()),
             thread_attributes: crate::guest_thread_attr::GuestThreadAttributes::default(),
             mutex: crate::guest_mutex::GuestMutex::default(),
+            conditions: crate::guest_cond::GuestCond::default(),
+            condition_leases: Vec::new(),
+            condition_transfer_active: false,
+            condition_faults: Rc::new(RefCell::new(Vec::new())),
             tls,
             selected_guest_thread: MAIN_GUEST_THREAD,
             exit_request: None,
@@ -2489,13 +2764,7 @@ impl NativeExecutor {
             continuation.stack_lease.clone(),
         );
         self.require_running()?;
-        if continuation.caller_bias != image.bias
-            || continuation.stack_address < self.stack_address
-            || retained.len() != self.stack_size
-            || (continuation.stack_address - self.stack_address) % self.stack_size as u64 != 0
-        {
-            return Err("Continuation belongs to different mappings".into());
-        }
+        self.validate_resume_mapping(&continuation, image, retained.len())?;
         continuation.cpu.registers[0] = result;
         if continuation.cpu.stop != 3 {
             continuation.cpu.rip = continuation.cpu.next_rip;
@@ -2876,6 +3145,7 @@ impl NativeExecutor {
             stack_length,
         )));
         let mut stack = ExecutionStack {
+            condition_transfer: self.condition_transfer_active,
             lease: stack_lease.clone(),
             bytes: stack,
             address: stack_address,
@@ -3042,6 +3312,7 @@ impl NativeExecutor {
                     pending_stack.set(true);
                     return Err("Guest returned while its stack contains a pending semaphore; process fault pinned".into());
                 }
+                stack.condition_transfer = false;
                 return Ok(Flow::Finished(return_convention.completed(value)));
             }};
         }
@@ -3323,6 +3594,147 @@ impl NativeExecutor {
                     cpu.registers[4] = sp;
                     cpu.fuel -= 1;
                     self.consumed_instruction_fuel += 1;
+                    let mut condition_value = None;
+                    if matches!(
+                        service,
+                        Service::CondInit
+                            | Service::CondDestroy
+                            | Service::CondSignal
+                            | Service::CondBroadcast
+                            | Service::CondWait
+                            | Service::CondTimedWait
+                    ) {
+                        use crate::guest_cond::{Outcome, Realtime};
+                        let slot = cpu.registers[7];
+                        let mutex_slot = cpu.registers[6];
+                        let plan = match service {
+                            Service::CondInit => self.conditions.init(&memory, slot, mutex_slot)?,
+                            Service::CondDestroy => self.conditions.destroy(&memory, slot)?,
+                            Service::CondSignal | Service::CondBroadcast => self
+                                .conditions
+                                .signal(&memory, slot, matches!(service, Service::CondBroadcast))?,
+                            _ => {
+                                let deadline = if matches!(service, Service::CondTimedWait) {
+                                    let bytes = memory.read(cpu.registers[2], 16)?;
+                                    Some(Realtime {
+                                        seconds: i64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                                        nanoseconds: i64::from_le_bytes(
+                                            bytes[8..].try_into().unwrap(),
+                                        ),
+                                    })
+                                } else {
+                                    None
+                                };
+                                self.conditions.wait(
+                                    &memory,
+                                    slot,
+                                    guest_thread,
+                                    mutex_slot,
+                                    deadline,
+                                )?
+                            }
+                        };
+                        if memory.load(sp, 8)? != ret {
+                            return Err("Condition return frame changed".into());
+                        }
+                        if let Some((address, length)) = plan.write_range() {
+                            validate_net_output(&memory, address, length, sp, ret)?;
+                        }
+                        if let Outcome::Pending(ticket) = plan.outcome() {
+                            // Reject aliases even when the condition is already initialized:
+                            // a retained mutex/condition object must not be a return slot.
+                            validate_net_output(&memory, slot, 8, sp, ret)?;
+                            validate_net_output(&memory, mutex_slot, 8, sp, ret)?;
+                            let mut ranges = Vec::new();
+                            ranges
+                                .try_reserve(4)
+                                .map_err(|_| "Cannot reserve condition backing ranges")?;
+                            for address in [slot, mutex_slot, sp] {
+                                ranges.push(condition_storage(
+                                    &memory,
+                                    address,
+                                    &image_storage,
+                                    &self.stack_identities,
+                                    &stack_lease,
+                                )?);
+                            }
+                            if !terminal {
+                                ranges.push(callback_storage(
+                                    &memory,
+                                    ret,
+                                    1,
+                                    &image_storage,
+                                    &self.stack_identities,
+                                )?);
+                            }
+                            self.condition_leases
+                                .try_reserve(1)
+                                .map_err(|_| "Cannot reserve condition lifetime lease")?;
+                            self.condition_faults
+                                .borrow_mut()
+                                .try_reserve(self.condition_leases.len() + 1)
+                                .map_err(|_| "Cannot reserve abandoned condition continuations")?;
+                            let lease = self.callback_ranges.acquire(ranges, [sp, sp])?;
+                            // Allocate request/token storage before either model mutates.
+                            let mut pending = Box::new(ThreadRequest {
+                                owner: self.mutex_wait_owner.clone(),
+                                continuation: None,
+                                operation: ThreadOperation::Completed(0),
+                                condition_faults: Some(self.condition_faults.clone()),
+                            });
+                            let ticket = ticket.clone();
+                            let mut token_storage = Rc::new(None);
+                            match self
+                                .mutex
+                                .prepare_cond_wait(&memory, mutex_slot, guest_thread)?
+                            {
+                                Err(status) => {
+                                    condition_value = Some(status as u32 as u64);
+                                }
+                                Ok(detach) => {
+                                    self.conditions.commit(&mut memory, plan)?;
+                                    let mutex_ticket = detach.commit();
+                                    *Rc::get_mut(&mut token_storage)
+                                        .expect("Unpublished condition token") = Some(mutex_ticket);
+                                    self.condition_leases.push((guest_thread, lease));
+                                    pending.operation = ThreadOperation::ConditionWait {
+                                        ticket,
+                                        mutex_ticket: token_storage,
+                                        return_sp: sp,
+                                        return_address: ret,
+                                    };
+                                    pending_stack.set(true);
+                                    if terminal {
+                                        cpu.stop = 3;
+                                    } else {
+                                        cpu.registers[4] = sp + 8;
+                                    }
+                                    cpu.memory = 0;
+                                    drop(memory);
+                                    pending.continuation = Some(Continuation {
+                                        callbacks: Some(callbacks),
+                                        stack_lease: stack_lease.clone(),
+                                        quantum: slice.0,
+                                        return_convention,
+                                        guest_thread,
+                                        cpu,
+                                        stack: stack.take(),
+                                        stack_address,
+                                        remaining: remaining - transition - 1,
+                                        caller_bias,
+                                    });
+                                    return Ok(Flow::Finished(Execution::ThreadRequest(pending)));
+                                }
+                            }
+                        } else {
+                            let Outcome::Status(status) =
+                                self.conditions.commit(&mut memory, plan)?
+                            else {
+                                return Err("Unexpected condition service phase".into());
+                            };
+                            condition_value = Some(status as u32 as u64);
+                        }
+                    }
                     let mut semaphore_value = None;
                     if matches!(
                         service,
@@ -3387,6 +3799,7 @@ impl NativeExecutor {
                                 return Err("Blocking semaphore requires owned allocation, live image, or retained stack backing".into());
                             }
                             Some(Box::new(ThreadRequest {
+                                condition_faults: None,
                                 owner: self.mutex_wait_owner.clone(),
                                 continuation: None,
                                 operation: ThreadOperation::SemaphoreWait {
@@ -3504,6 +3917,7 @@ impl NativeExecutor {
                         drop(memory);
                         return Ok(Flow::Finished(Execution::ThreadRequest(Box::new(
                             ThreadRequest {
+                                condition_faults: None,
                                 owner: self.mutex_wait_owner.clone(),
                                 operation,
                                 continuation: Some(Continuation {
@@ -3676,6 +4090,8 @@ impl NativeExecutor {
                             pending_stack.set(true);
                             continue;
                         }
+                    } else if let Some(value) = condition_value {
+                        value
                     } else if let Some(value) = semaphore_value {
                         value
                     } else if matches!(service, Service::ThreadSelf) {
@@ -5796,5 +6212,182 @@ mod strdup_dispatch_tests {
             0
         );
         assert_eq!(memory.load(0x2000, 4).unwrap(), 12);
+    }
+}
+
+#[cfg(test)]
+mod condition_storage_tests {
+    use super::*;
+    #[test]
+    fn own_stack_heap_and_image_survive_foreign_and_spoofed_stack_rejection() {
+        let own = Rc::new(());
+        let foreign = Rc::new(());
+        let mut own_bytes = [0u8; 32];
+        let mut foreign_bytes = [0u8; 32];
+        let mut image = [0u8; 32];
+        let mut replaced = [0u8; 32];
+        let stacks = [
+            StackIdentity {
+                address: 0x1000,
+                length: 32,
+                backing: own_bytes.as_ptr() as usize,
+                lease: Rc::downgrade(&own),
+            },
+            StackIdentity {
+                address: 0x2000,
+                length: 32,
+                backing: foreign_bytes.as_ptr() as usize,
+                lease: Rc::downgrade(&foreign),
+            },
+        ];
+        let mut allocations = crate::guest_memory::OwnedMappings::default();
+        let mut memory = Memory::default();
+        memory.attach_owned(&mut allocations).unwrap();
+        memory.add(0x1000, &mut own_bytes, true, false).unwrap();
+        memory.add(0x2000, &mut foreign_bytes, true, false).unwrap();
+        memory.add(0x3000, &mut image, true, false).unwrap();
+        let heap = memory.malloc(32).unwrap();
+        assert_eq!(
+            condition_storage(&memory, 0x1018, &[], &stacks, &own).unwrap(),
+            (0x1000, 32)
+        );
+        assert_eq!(
+            condition_storage(&memory, heap + 8, &[], &stacks, &own)
+                .unwrap()
+                .0,
+            heap
+        );
+        assert_eq!(
+            condition_storage(&memory, 0x3008, &[(0x3000, 32)], &stacks, &own).unwrap(),
+            (0x3000, 32)
+        );
+        // The original foreign backing and identity are both live: still rejected.
+        assert!(
+            condition_storage(&memory, 0x2000, &[], &stacks, &own)
+                .unwrap_err()
+                .contains("foreign-stack")
+        );
+        assert!(condition_storage(&memory, 0x1019, &[], &stacks, &own).is_err());
+        assert!(condition_storage(&memory, 0x3000, &[], &stacks, &own).is_err());
+        drop(memory);
+        let mut replacement = Memory::default();
+        replacement.add(0x1000, &mut replaced, true, false).unwrap();
+        assert!(condition_storage(&replacement, 0x1000, &[], &stacks, &own).is_err());
+    }
+}
+
+#[cfg(test)]
+mod condition_transfer_tests {
+    use super::*;
+    fn completed(native: &NativeExecutor, image: &Image) -> ThreadRequest {
+        let mut stack = vec![0u8; 4096];
+        stack[4088..].copy_from_slice(&u64::MAX.to_le_bytes());
+        let mut cpu = Cpu {
+            stop: 3,
+            fuel: 16,
+            ..Cpu::default()
+        };
+        cpu.registers[4] = 0x900ff8;
+        ThreadRequest {
+            owner: native.mutex_wait_owner.clone(),
+            condition_faults: Some(native.condition_faults.clone()),
+            operation: ThreadOperation::Completed(0),
+            continuation: Some(Continuation {
+                callbacks: None,
+                stack_lease: Rc::new(()),
+                quantum: None,
+                return_convention: ReturnConvention::WorkerPointer,
+                guest_thread: MAIN_GUEST_THREAD,
+                cpu,
+                stack,
+                stack_address: 0x900000,
+                remaining: 8,
+                caller_bias: image.bias,
+            }),
+        }
+    }
+    #[test]
+    fn completed_condition_transfer_preflight_keeps_stack_and_drop_latches_fault() {
+        let mut native = NativeExecutor::new(0x900000, 4096, 16, 16).unwrap();
+        let image = Image::load(&memory_fixture(), 0x100000, 65536).unwrap();
+        let mut wrong = Image::load(&memory_fixture(), 0x200000, 65536).unwrap();
+        let mut request = completed(&native, &image);
+        let pointer = request.continuation.as_ref().unwrap().stack.as_ptr();
+        assert!(
+            native
+                .finish_thread_request(&mut request, &mut wrong, &mut [], &mut [], 0)
+                .is_err()
+        );
+        assert_eq!(
+            request.continuation.as_ref().unwrap().stack.as_ptr(),
+            pointer
+        );
+        assert!(native.require_running().is_ok()); // Still owned, never abandoned.
+        drop(request);
+        assert_eq!(native.condition_faults.borrow()[0].stack.as_ptr(), pointer);
+        assert!(native.require_running().is_err());
+    }
+    #[test]
+    fn completed_condition_bad_stack_or_alias_mapping_is_not_consumed() {
+        for bad in 0..4 {
+            let mut native = NativeExecutor::new(0x900000, 4096, 16, 16).unwrap();
+            let mut image = Image::load(&memory_fixture(), 0x100000, 65536).unwrap();
+            let mut request = completed(&native, &image);
+            match bad {
+                0 => request.continuation.as_mut().unwrap().stack_address = 0x8ff000,
+                1 => request.continuation.as_mut().unwrap().stack_address += 1,
+                2 => {
+                    request.continuation.as_mut().unwrap().stack.pop();
+                }
+                _ => {}
+            }
+            let pointer = request.continuation.as_ref().unwrap().stack.as_ptr();
+            let mut alias = [0u8; 8];
+            let mut data = if bad == 3 {
+                vec![DataRegion {
+                    address: 0x900000,
+                    bytes: &mut alias,
+                    writable: true,
+                }]
+            } else {
+                Vec::new()
+            };
+            assert!(
+                native
+                    .finish_thread_request(&mut request, &mut image, &mut [], &mut data, 0)
+                    .is_err()
+            );
+            assert_eq!(
+                request.continuation.as_ref().unwrap().stack.as_ptr(),
+                pointer
+            );
+            assert!(!native.condition_transfer_active);
+            assert!(native.require_running().is_ok());
+        }
+    }
+    #[test]
+    fn consuming_condition_resume_error_pins_bytes_but_success_retires_them() {
+        for fail in [true, false] {
+            let mut native = NativeExecutor::new(0x900000, 4096, 16, 16).unwrap();
+            let mut image = Image::load(&memory_fixture(), 0x100000, 65536).unwrap();
+            let mut request = completed(&native, &image);
+            if fail {
+                request.continuation.as_mut().unwrap().remaining = 0;
+            }
+            let pointer = request.continuation.as_ref().unwrap().stack.as_ptr();
+            let result =
+                native.finish_thread_request(&mut request, &mut image, &mut [], &mut [], 0);
+            assert!(request.continuation.is_none());
+            assert!(!native.condition_transfer_active);
+            if fail {
+                assert!(result.is_err());
+                assert_eq!(native.fault_stack.borrow()[0].1.as_ptr(), pointer);
+                assert!(native.require_running().is_err());
+            } else {
+                assert!(matches!(result, Ok(Execution::WorkerReturned(0))));
+                assert!(native.fault_stack.borrow().is_empty());
+                assert!(native.require_running().is_ok());
+            }
+        }
     }
 }
