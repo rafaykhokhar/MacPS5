@@ -40,6 +40,7 @@ mod wcstombs_native;
 mod sort_search_native;
 mod fgets_native;
 mod getcwd_native;
+mod strdup_native;
 mod system_service_native;
 mod threadattr_native;
 mod thread_services_native;
@@ -96,6 +97,7 @@ fn main() -> Result<(), String> {
     sort_search_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("sort-search"))?;
     fgets_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("fgets"))?;
     getcwd_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("getcwd"))?;
+    strdup_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strdup"))?;
     semaphore_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     stdio_file_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     system_service_native::verify(Path::new(&archive), Path::new(&directory))?;

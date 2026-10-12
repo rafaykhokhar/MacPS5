@@ -96,6 +96,24 @@ fn semaphore_storage_owned(
             && backing == s.backing + (address - s.address) as usize
     }))
 }
+fn strdup_service(
+    memory: &mut Memory<'_>,
+    source: u64,
+    errno: Option<u64>,
+    sp: u64,
+    ret: u64,
+) -> Result<u64> {
+    match crate::libc_memory::strdup(memory, source)? {
+        Ok(address) => Ok(address),
+        Err(error) => {
+            let errno = errno.ok_or("Missing strdup errno context")?;
+            validate_net_output(memory, errno, 4, sp, ret)?;
+            memory.validate_write(errno, 4)?;
+            memory.store(errno, error.into(), 4)?;
+            Ok(0)
+        }
+    }
+}
 fn callback_stack_slot(
     sp: u64,
     stack_address: u64,
@@ -4117,19 +4135,13 @@ impl NativeExecutor {
                             cpu.registers[2],
                         )?
                     } else if matches!(service, Service::Strdup) {
-                        let errno = self
-                            .kernel
-                            .as_ref()
-                            .ok_or("Missing strdup errno context")?
-                            .errno_address();
-                        memory.validate_write(errno, 4)?;
-                        match crate::libc_memory::strdup(&mut memory, cpu.registers[7])? {
-                            Ok(address) => address,
-                            Err(error) => {
-                                memory.store(errno, error.into(), 4)?;
-                                0
-                            }
-                        }
+                        strdup_service(
+                            &mut memory,
+                            cpu.registers[7],
+                            self.kernel.as_ref().map(|kernel| kernel.errno_address()),
+                            sp,
+                            ret,
+                        )?
                     } else if matches!(
                         service,
                         Service::Sprintf | Service::Snprintf | Service::Vsnprintf
@@ -5677,5 +5689,59 @@ mod callback_slot_tests {
         }
         assert!(callback_stack_slot(64, 0, 0x3000, 1, None).is_err());
         assert!(callback_stack_slot(0x2000, 0x1000, u64::MAX, 2, None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod strdup_dispatch_tests {
+    use super::*;
+    #[test]
+    fn strdup_success_ignores_errno_and_invalid_input_precedes_it() {
+        let mut source = *b"test\0";
+        let mut readonly_errno = 91u32.to_le_bytes();
+        let mut owner = crate::guest_memory::OwnedMappings::default();
+        {
+            let mut memory = Memory::default();
+            memory.add(0x1000, &mut source, false, false).unwrap();
+            memory
+                .add(0x2000, &mut readonly_errno, false, false)
+                .unwrap();
+            memory.attach_owned(&mut owner).unwrap();
+            for errno in [None, Some(0x2000), Some(0x3000)] {
+                let copy = strdup_service(&mut memory, 0x1000, errno, 0x4000, 0x5000).unwrap();
+                assert_eq!(memory.read(copy, 5).unwrap(), b"test\0");
+                memory.free(copy).unwrap();
+                let error = strdup_service(&mut memory, 0, errno, 0x4000, 0x5000).unwrap_err();
+                assert!(error.contains("Null guest strdup source"));
+            }
+            assert_eq!(memory.load(0x2000, 4).unwrap(), 91);
+        }
+        assert_eq!(owner.bytes_allocated(), 0);
+    }
+    #[test]
+    fn strdup_allocation_failure_guards_errno_and_return_frame_before_write() {
+        let mut source = *b"x\0";
+        let mut errno = 91u32.to_le_bytes();
+        let mut readonly_errno = 92u32.to_le_bytes();
+        let mut frame = 0x5000u64.to_le_bytes();
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut source, false, false).unwrap();
+        memory.add(0x2000, &mut errno, true, false).unwrap();
+        memory
+            .add(0x3000, &mut readonly_errno, false, false)
+            .unwrap();
+        memory.add(0x4000, &mut frame, true, false).unwrap();
+        // No allocator is attached: the real allocator returns ENOMEM without mutation.
+        for target in [None, Some(0x3000), Some(0x6000), Some(0x4000)] {
+            assert!(strdup_service(&mut memory, 0x1000, target, 0x4000, 0x5000).is_err());
+            assert_eq!(memory.load(0x4000, 8).unwrap(), 0x5000);
+            assert_eq!(memory.load(0x2000, 4).unwrap(), 91);
+            assert_eq!(memory.load(0x3000, 4).unwrap(), 92);
+        }
+        assert_eq!(
+            strdup_service(&mut memory, 0x1000, Some(0x2000), 0x4000, 0x5000).unwrap(),
+            0
+        );
+        assert_eq!(memory.load(0x2000, 4).unwrap(), 12);
     }
 }
