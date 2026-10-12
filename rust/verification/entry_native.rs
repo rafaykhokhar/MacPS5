@@ -35,6 +35,7 @@ mod atomic_xadd_native;
 mod adc_native;
 mod sysconf_native;
 mod sysctl_native;
+mod sigaction_native;
 mod system_service_native;
 mod threadattr_native;
 mod thread_services_native;
@@ -86,6 +87,7 @@ fn main() -> Result<(), String> {
     adc_native::verify(Path::new(&archive), Path::new(&directory))?;
     sysconf_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     sysctl_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+    sigaction_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     semaphore_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     stdio_file_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     system_service_native::verify(Path::new(&archive), Path::new(&directory))?;
@@ -448,6 +450,8 @@ fn main() -> Result<(), String> {
         ("sysconf", Service::Sysconf),
         ("sysctlbyname", Service::SysctlByName),
         ("sysctl", Service::Sysctl),
+        ("sigaction", Service::Sigaction),
+        ("signal", Service::Signal),
     ]
     .into_iter()
     .enumerate()
@@ -1353,6 +1357,14 @@ fn main() -> Result<(), String> {
                 (808, 0x7306c0),
                 (816, 0x7306d0),
                 (824, 0x7306e0),
+                (832, 0x7306f0),
+                (840, 0x730700),
+                (848, 0x7b0000),
+                (856, 0x7b0010),
+                (864, 0x7b0030),
+                (872, 0x7b0020),
+                (880, 0x7b0050),
+                (888, 0x7b0040),
             ] {
                 if locale_segment.bytes[locale_offset + delta..locale_offset + delta + 8]
                     != expected.to_le_bytes()
@@ -1379,13 +1391,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 116 libc exports: (116+1)*24=2808 (rounded2816) symbol bytes
-                // and 1+116*12=1393 NID bytes (rounded1408). The sysctl
-                // exports add48+32bytes to18480; retain the exact32KiB cap.
-                || native.bytes_allocated() != 18560
+                // 118 libc exports: (118+1)*24=2856 (rounded2864) symbol bytes
+                // and 1+118*12=1417 NID bytes (rounded1424). The signal
+                // exports add48+16bytes to18560; retain the exact32KiB cap.
+                || native.bytes_allocated() != 18624
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'sigaction'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'wcstombs'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1395,7 +1407,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; sysctl imports bound; unresolved sigaction causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; signal registration imports bound; unresolved wcstombs causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1457,7 +1469,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved sigaction triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved wcstombs triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     Ok(())

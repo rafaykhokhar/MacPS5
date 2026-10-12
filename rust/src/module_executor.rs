@@ -631,6 +631,8 @@ pub enum Service {
     Sysconf,
     Sysctl,
     SysctlByName,
+    Sigaction,
+    Signal,
     Nanosleep,
     SemInit,
     SemDestroy,
@@ -800,6 +802,8 @@ impl Service {
             | Self::Sysconf
             | Self::Sysctl
             | Self::SysctlByName
+            | Self::Sigaction
+            | Self::Signal
             | Self::Nanosleep
             | Self::SemInit
             | Self::SemDestroy
@@ -1267,6 +1271,7 @@ type EnvironmentCompletion = Option<(u64, Option<i32>, bool)>;
 pub struct NativeExecutor {
     system_profile: Option<crate::guest_system::GuestSystemProfile>,
     system_profile_locked: bool,
+    signal_actions: crate::guest_signal_action::Store,
     consumed_instruction_fuel: u128,
     worker_quantum: Option<u64>,
     mutex_wait_owner: Rc<()>,
@@ -2106,6 +2111,7 @@ impl NativeExecutor {
         Ok(Self {
             system_profile: None,
             system_profile_locked: false,
+            signal_actions: crate::guest_signal_action::Store::default(),
             consumed_instruction_fuel: 0,
             worker_quantum: None,
             mutex_wait_owner: Rc::new(()),
@@ -3940,6 +3946,40 @@ impl NativeExecutor {
                         } else {
                             0
                         }
+                    } else if matches!(service, Service::Sigaction | Service::Signal) {
+                        let signum = cpu.registers[7] as u32 as i32;
+                        let plan = if matches!(service, Service::Sigaction) {
+                            self.signal_actions.plan(
+                                &memory,
+                                signum,
+                                cpu.registers[6],
+                                cpu.registers[2],
+                            )?
+                        } else {
+                            self.signal_actions.plan_signal(signum, cpu.registers[6])
+                        };
+                        if let Some((address, length)) = plan.output_range() {
+                            validate_net_output(&memory, address, length, sp, ret)?;
+                            memory.validate_write(address, length)?;
+                        }
+                        let error = plan.errno();
+                        let errno = if error.is_some() {
+                            let address = self
+                                .kernel
+                                .as_ref()
+                                .ok_or("Missing signal action errno context")?
+                                .errno_address();
+                            validate_net_output(&memory, address, 4, sp, ret)?;
+                            memory.validate_write(address, 4)?;
+                            Some(address)
+                        } else {
+                            None
+                        };
+                        let value = self.signal_actions.commit(&mut memory, plan)?;
+                        if let (Some(address), Some(error)) = (errno, error) {
+                            memory.store(address, error as u64, 4)?;
+                        }
+                        value
                     } else if matches!(service, Service::Sysctl | Service::SysctlByName) {
                         let plan = if matches!(service, Service::Sysctl) {
                             crate::guest_sysctl::plan_numeric(
