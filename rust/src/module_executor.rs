@@ -115,6 +115,31 @@ fn strdup_service(
         }
     }
 }
+fn multibyte_service(
+    memory: &mut Memory<'_>,
+    plan: crate::guest_multibyte::Plan,
+    errno: Option<u64>,
+    sp: u64,
+    ret: u64,
+) -> Result<u64> {
+    for (address, length) in plan.write_ranges() {
+        validate_net_output(memory, address, length, sp, ret)?;
+    }
+    plan.validate(memory)?;
+    let error_output = if let Some(error) = plan.errno {
+        let address = errno.ok_or("Missing multibyte errno context")?;
+        validate_net_output(memory, address, 4, sp, ret)?;
+        memory.validate_write(address, 4)?;
+        Some((address, error))
+    } else {
+        None
+    };
+    plan.commit(memory)?;
+    if let Some((address, error)) = error_output {
+        memory.store(address, u64::from(error), 4)?;
+    }
+    Ok(plan.value)
+}
 fn callback_stack_slot(
     sp: u64,
     stack_address: u64,
@@ -713,6 +738,9 @@ pub enum Service {
     Setenv,
     Wcslen,
     Wcstombs,
+    Mbrtowc,
+    Wcrtomb,
+    Mbsrtowcs,
     Qsort,
     Bsearch,
     Wcsstr,
@@ -896,6 +924,9 @@ impl Service {
             | Self::Setenv
             | Self::Wcslen
             | Self::Wcstombs
+            | Self::Mbrtowc
+            | Self::Wcrtomb
+            | Self::Mbsrtowcs
             | Self::Qsort
             | Self::Bsearch
             | Self::Wcsstr
@@ -4770,6 +4801,35 @@ impl NativeExecutor {
                         } else {
                             0
                         }
+                    } else if matches!(
+                        service,
+                        Service::Mbrtowc | Service::Wcrtomb | Service::Mbsrtowcs
+                    ) {
+                        let args = [
+                            cpu.registers[7],
+                            cpu.registers[6],
+                            cpu.registers[2],
+                            cpu.registers[1],
+                        ];
+                        let plan = match service {
+                            Service::Mbrtowc => crate::guest_multibyte::mbrtowc(
+                                &memory, args[0], args[1], args[2], args[3],
+                            )?,
+                            Service::Wcrtomb => {
+                                crate::guest_multibyte::wcrtomb(args[0], args[1], args[2])?
+                            }
+                            Service::Mbsrtowcs => crate::guest_multibyte::mbsrtowcs(
+                                &memory, args[0], args[1], args[2], args[3],
+                            )?,
+                            _ => unreachable!(),
+                        };
+                        multibyte_service(
+                            &mut memory,
+                            plan,
+                            self.kernel.as_ref().map(|k| k.errno_address()),
+                            sp,
+                            ret,
+                        )?
                     } else if matches!(service, Service::Wcstombs) {
                         // GuestLocale currently supports C/POSIX only. Conversion
                         // is stateless and uses guest unsigned16 code units.
@@ -6389,5 +6449,71 @@ mod condition_transfer_tests {
                 assert!(native.require_running().is_ok());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod multibyte_dispatch_tests {
+    use super::*;
+    #[test]
+    fn success_does_not_require_errno_and_errors_guard_it() {
+        let mut src = [255, 0];
+        let mut dst = [0xa5; 4];
+        let mut readonly_errno = 91u32.to_le_bytes();
+        let mut writable_errno = 92u32.to_le_bytes();
+        let mut frame = 0x9000u64.to_le_bytes();
+        let mut memory = Memory::default();
+        for (address, bytes, writable) in [
+            (0x1000, &mut src[..], false),
+            (0x2000, &mut dst[..], true),
+            (0x3000, &mut readonly_errno[..], false),
+            (0x4000, &mut writable_errno[..], true),
+            (0x8000, &mut frame[..], true),
+        ] {
+            memory.add(address, bytes, writable, false).unwrap();
+        }
+        for errno in [None, Some(0x3000), Some(u64::MAX)] {
+            let p = crate::guest_multibyte::mbrtowc(&memory, 0x2000, 0x1000, 1, u64::MAX).unwrap();
+            assert_eq!(
+                multibyte_service(&mut memory, p, errno, 0x8000, 0x9000).unwrap(),
+                1
+            );
+            assert_eq!(memory.load(0x2000, 2).unwrap(), 255);
+            let p =
+                crate::guest_multibyte::mbrtowc(&memory, u64::MAX, u64::MAX, 0, u64::MAX).unwrap();
+            assert_eq!(
+                multibyte_service(&mut memory, p, errno, 0x8000, 0x9000).unwrap(),
+                u64::MAX - 1
+            );
+        }
+        for errno in [None, Some(0x3000), Some(u64::MAX), Some(0x8000)] {
+            let p = crate::guest_multibyte::wcrtomb(u64::MAX, 256, u64::MAX).unwrap();
+            assert!(multibyte_service(&mut memory, p, errno, 0x8000, 0x9000).is_err());
+            assert_eq!(memory.load(0x8000, 8).unwrap(), 0x9000);
+        }
+        let p = crate::guest_multibyte::wcrtomb(u64::MAX, 256, u64::MAX).unwrap();
+        assert_eq!(
+            multibyte_service(&mut memory, p, Some(0x4000), 0x8000, 0x9000).unwrap(),
+            u64::MAX
+        );
+        assert_eq!(memory.load(0x4000, 4).unwrap(), 86);
+        assert_eq!(memory.load(0x3000, 4).unwrap(), 91);
+    }
+    #[test]
+    fn source_pointer_and_output_frame_guards_precede_all_writes() {
+        let mut src = [65, 0];
+        let mut dst = [0xa5; 4];
+        let mut pointer = 0x1000u64.to_le_bytes();
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut src, false, false).unwrap();
+        memory.add(0x2000, &mut dst, true, false).unwrap();
+        memory.add(0x8000, &mut pointer, true, false).unwrap();
+        let p = crate::guest_multibyte::mbsrtowcs(&memory, 0x2000, 0x8000, 2, 0).unwrap();
+        assert!(multibyte_service(&mut memory, p, None, 0x8000, 0x1000).is_err());
+        assert_eq!(memory.read(0x2000, 4).unwrap(), [0xa5; 4]);
+        assert_eq!(memory.load(0x8000, 8).unwrap(), 0x1000);
+        let p = crate::guest_multibyte::mbrtowc(&memory, 0x8007, 0x1000, 1, 0).unwrap();
+        assert!(multibyte_service(&mut memory, p, None, 0x8000, 0x1000).is_err());
+        assert_eq!(memory.load(0x8000, 8).unwrap(), 0x1000);
     }
 }
