@@ -608,6 +608,7 @@ pub enum Service {
     Getenv,
     Setenv,
     Wcslen,
+    Wcstombs,
     Wcsstr,
     Wcscmp,
     Wcsncmp,
@@ -779,6 +780,7 @@ impl Service {
             | Self::Sigaddset
             | Self::Setenv
             | Self::Wcslen
+            | Self::Wcstombs
             | Self::Wcsstr
             | Self::Wcscmp
             | Self::Wcsncmp
@@ -3946,6 +3948,42 @@ impl NativeExecutor {
                         } else {
                             0
                         }
+                    } else if matches!(service, Service::Wcstombs) {
+                        // GuestLocale currently supports C/POSIX only. Conversion
+                        // is stateless and uses guest unsigned16 code units.
+                        let plan = crate::guest_wcstombs::plan(
+                            &memory,
+                            cpu.registers[7],
+                            cpu.registers[6],
+                            cpu.registers[2],
+                        )?;
+                        if !plan.bytes.is_empty() {
+                            validate_net_output(
+                                &memory,
+                                plan.destination,
+                                plan.bytes.len(),
+                                sp,
+                                ret,
+                            )?;
+                            memory.validate_write(plan.destination, plan.bytes.len())?;
+                        }
+                        let errno = if plan.errno.is_some() {
+                            let address = self
+                                .kernel
+                                .as_ref()
+                                .ok_or("Missing wcstombs errno context")?
+                                .errno_address();
+                            validate_net_output(&memory, address, 4, sp, ret)?;
+                            memory.validate_write(address, 4)?;
+                            Some(address)
+                        } else {
+                            None
+                        };
+                        plan.commit(&mut memory)?;
+                        if let (Some(address), Some(error)) = (errno, plan.errno) {
+                            memory.store(address, error as u64, 4)?;
+                        }
+                        plan.value
                     } else if matches!(service, Service::Sigaction | Service::Signal) {
                         let signum = cpu.registers[7] as u32 as i32;
                         let plan = if matches!(service, Service::Sigaction) {

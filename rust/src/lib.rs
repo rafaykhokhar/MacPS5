@@ -94,3 +94,5 @@ pub mod guest_system;
 pub mod guest_sysctl;
 
 pub mod guest_signal_action;
+
+pub mod guest_wcstombs;
