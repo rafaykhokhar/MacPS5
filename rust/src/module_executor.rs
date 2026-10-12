@@ -416,6 +416,7 @@ pub enum Service {
     ThreadAttrSetStackSize,
     ThreadCreate,
     ThreadSelf,
+    ThreadSetName,
     ThreadJoin,
     ThreadDetach,
     MutexAttrInit,
@@ -455,6 +456,7 @@ impl Service {
             | Self::ThreadAttrSetStackSize
             | Self::ThreadCreate
             | Self::ThreadSelf
+            | Self::ThreadSetName
             | Self::ThreadJoin
             | Self::ThreadDetach
             | Self::MutexAttrInit
@@ -2375,6 +2377,11 @@ impl NativeExecutor {
                     }
                     let value = if matches!(service, Service::ThreadSelf) {
                         guest_thread
+                    } else if matches!(service, Service::ThreadSetName) {
+                        self.tls.set_name(&memory, cpu.registers[7], cpu.registers[6])?;
+                        // SDK pthread_set_name_np is void, not a pthread errno
+                        // result. Preserve the caller's RAX rather than invent one.
+                        cpu.registers[0]
                     } else if matches!(service, Service::Getpid | Service::Syscall) {
                         let direct = matches!(service, Service::Getpid);
                         let number = if direct { 20 } else { cpu.registers[0] };

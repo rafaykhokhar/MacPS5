@@ -2,7 +2,9 @@
 
 ## Current parallel integration
 
-Guest create/join/detach services now pass native ARM64 fixtures. A translated parent creates a real child with inherited MXCSR and a parent-stack argument, waits for completion, and receives the full 64-bit result. The child observes its own TLS identity. Read-only handle publication, invalid entry and unsupported stack size leave the handle unchanged and create no child TLS; detached completion reaps the record (`work/arm64-prototype/thread-services-native-verified.log`). Actual startup now binds `pthread_create` and `pthread_self`, then stops at the missing `pthread_set_name_np` export with normal exit status -1 before game main. Its 16,032 owned dependency bytes include the independently accounted 144-byte increase from four additional provider exports.
+Guest create/join/detach services now pass native ARM64 fixtures. A translated parent creates a real child with inherited MXCSR and a parent-stack argument, waits for completion, and receives the full 64-bit result. The child observes its own TLS identity. Read-only handle publication, invalid entry and unsupported stack size leave the handle unchanged and create no child TLS; detached completion reaps the record (`work/arm64-prototype/thread-services-native-verified.log`). Actual startup now binds `pthread_create`, `pthread_self` and `pthread_set_name_np`, then stops at the missing `sigemptyset` export with normal exit status -1 before game main. Its 16,064 owned dependency bytes include the independently accounted symbol/NID table growth from the new exports.
+
+Thread names are copied into live guest-thread metadata and released at retirement. Translated checks cover the void ABI, long names, NULL clearing, ignored absent/retired identities, guarded pointer failures, and retention across suspension (`thread-name-native.log`). A 1,024-byte storage budget including NUL is an explicit prototype limit, not an asserted console ABI limit. Oversized or invalid memory stops before replacing the previous name.
 
 The Modules bridge uses a process-owned scheduler and preserves initializer lifecycle across thread requests. Native checks verify a void constructor followed by a status-bearing start function, each creating and joining a child; signed start failures remain failures. A child exit(-7) reaches Modules without resuming the parent or running later startup calls (`thread-exit-native-verified.log`). Background workers at a parent module boundary explicitly stop because process-wide image lifetime support is unfinished. Process exit cleanup also remains pending.
 
@@ -12,7 +14,7 @@ The cooperative scheduler also passes two round-robin workers with separate reta
 
 The real 242-instruction tiling wrapper also passes: it creates and joins 12 translated guest workers, and all 82,560 pixels in a 640×129 buffer match the untile reference. Its stack descriptors remain valid across scheduling, all child handles are reaped, and source data and destination canaries stay intact (`rust-tiler-threads.log`). Only its four-argument invocation uses a test adapter; the guest wrapper and worker bytes are unchanged. This does not execute the game loop.
 
-This source snapshot passes 216 unit tests, three integration tests and strict Clippy. Integrated entry verification passes against the final child-exit build with the modeled 2 MiB stack size (`thread-exit-entry.log`). It checks the new thread import bindings and the exact `pthread_set_name_np` failure before accepting normal exit -1; no game main has run.
+This source snapshot passes 217 unit tests, three integration tests and strict Clippy. Integrated entry verification passes against the matching thread-name build with the modeled 2 MiB stack size (`thread-name-entry.log`). It checks the new thread import bindings and the exact `sigemptyset` failure before accepting normal exit -1; no game main has run.
 
 ## Earlier integration milestones
 

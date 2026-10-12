@@ -6,6 +6,8 @@
 use crate::{Result, guest_memory::Memory};
 pub const KEY_LIMIT: usize = 256;
 pub const THREAD_LIMIT: usize = 64;
+/// Prototype storage budget including NUL; not a console ABI name limit.
+pub const THREAD_NAME_LIMIT: usize = 1024;
 pub const EAGAIN: i32 = 35;
 pub const EINVAL: i32 = 22;
 #[derive(Clone, Copy, Debug, Default)]
@@ -16,6 +18,7 @@ struct Key {
 #[derive(Debug)]
 struct Thread {
     id: u64,
+    name: Vec<u8>,
     values: [(u64, u64); KEY_LIMIT],
 }
 #[derive(Debug)]
@@ -50,6 +53,7 @@ impl GuestTls {
             .map_err(|_| "Cannot allocate guest TLS thread")?;
         self.threads.push(Thread {
             id,
+            name: Vec::new(),
             values: [(0, 0); KEY_LIMIT],
         });
         self.last_thread_id = id;
@@ -70,6 +74,41 @@ impl GuestTls {
     }
     pub fn live_threads(&self) -> usize {
         self.threads.len()
+    }
+    /// FreeBSD11.4 thr_info.c: void ABI, NULL clears, absent/dead IDs ignored.
+    /// Live IDs must be retired when execution completes. Names are copied raw
+    /// bytes; malformed/over-budget memory stops explicitly before replacement.
+    pub fn set_name(&mut self, memory: &Memory<'_>, id: u64, address: u64) -> Result<()> {
+        let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) else {
+            return Ok(());
+        };
+        if address == 0 {
+            thread.name.clear();
+            return Ok(());
+        }
+        let mut name = Vec::new();
+        name.try_reserve_exact(THREAD_NAME_LIMIT - 1)
+            .map_err(|_| "Cannot allocate guest thread name")?;
+        for index in 0..THREAD_NAME_LIMIT {
+            let source = address
+                .checked_add(index as u64)
+                .ok_or("Thread name address overflow")?;
+            let byte = memory.read(source, 1)?[0];
+            if byte == 0 {
+                thread.name = name;
+                return Ok(());
+            }
+            if index + 1 < THREAD_NAME_LIMIT {
+                name.push(byte);
+            }
+        }
+        Err("Guest thread name exceeds prototype storage budget".into())
+    }
+    pub fn thread_name(&self, id: u64) -> Option<&[u8]> {
+        self.threads
+            .iter()
+            .find(|thread| thread.id == id)
+            .map(|thread| thread.name.as_slice())
     }
     pub fn next_thread_id(&self) -> Result<u64> {
         self.last_thread_id
@@ -237,5 +276,41 @@ mod tests {
             tls.register_thread(id as u64).unwrap();
         }
         assert!(tls.register_thread(65).is_err());
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+    #[test]
+    fn copied_names_atomic_failure_and_retirement() {
+        let mut tls = GuestTls::default();
+        tls.register_thread(1).unwrap();
+        tls.register_thread(2).unwrap();
+        let mut bytes = b"worker\0".to_vec();
+        let mut m = Memory::default();
+        m.add(0x1000, &mut bytes, true, false).unwrap();
+        tls.set_name(&m, 1, 0x1000).unwrap();
+        m.write(0x1000, b"change").unwrap();
+        assert_eq!(tls.thread_name(1), Some(&b"worker"[..]));
+        assert!(tls.set_name(&m, 1, 0xffff).is_err());
+        assert_eq!(tls.thread_name(1), Some(&b"worker"[..]));
+        tls.set_name(&m, 99, u64::MAX).unwrap();
+        assert_eq!(tls.thread_name(2), Some(&b""[..]));
+        tls.set_name(&m, 1, 0).unwrap();
+        assert_eq!(tls.thread_name(1), Some(&b""[..]));
+        let mut full = vec![0xff; THREAD_NAME_LIMIT];
+        let mut long = Memory::default();
+        long.add(0x2000, &mut full, true, false).unwrap();
+        assert!(tls.set_name(&long, 1, 0x2000).is_err());
+        assert_eq!(tls.thread_name(1), Some(&b""[..]));
+        long.write(0x2000 + (THREAD_NAME_LIMIT - 1) as u64, &[0])
+            .unwrap();
+        tls.set_name(&long, 1, 0x2000).unwrap();
+        assert_eq!(tls.thread_name(1).unwrap().len(), THREAD_NAME_LIMIT - 1);
+        tls.retire_thread(1).unwrap();
+        tls.set_name(&long, 1, u64::MAX).unwrap();
+        assert_eq!(tls.thread_name(1), None);
+        assert_eq!(tls.thread_name(2), Some(&b""[..]));
     }
 }

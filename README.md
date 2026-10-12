@@ -20,7 +20,7 @@ Unlike AnyPS5's Linux/Windows relinking approach, MacPS5 needs CPU translation a
 
 **No commercial PS5 game has booted or reached verified gameplay. Tekken 8 remains a target, not a supported title.**
 
-The pinned homebrew startup resolves ten named dependency providers and the implemented mutex/thread-attribute imports, including `pthread_create` and `pthread_self`. It stops at the missing `pthread_set_name_np` import and requests normal exit with status -1 before game main. Background-worker module lifetimes and process cleanup remain incomplete.
+The pinned homebrew startup resolves ten named dependency providers and the implemented mutex/thread-attribute imports, including `pthread_create`, `pthread_self` and `pthread_set_name_np`. It stops at the missing `sigemptyset` import and requests normal exit with status -1 before game main. Background-worker module lifetimes and process cleanup remain incomplete.
 
 Focused ARM64 instruction and runtime checks, plus isolated Metal rendering/presentation checks, pass on the development machine. These do not establish game rendering, native-port performance, or full instruction/system compatibility. Scalar multiplication and fused multiply-add pass native checks. The pinned homebrew's tiling wrapper creates and joins 12 translated workers; all 82,560 test pixels match the reference. Guest thread fixtures also pass detach, inherited floating-point control, full-width returns and module-startup create/join checks. Returning to module loading while background workers remain active is explicitly unsupported.
 
