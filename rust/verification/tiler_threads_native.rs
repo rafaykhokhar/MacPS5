@@ -32,6 +32,17 @@ fn bind(image: &mut Image, offset: u64, name: &str, target: u64) {
     segment.bytes[at..at + 8].copy_from_slice(&target.to_le_bytes());
 }
 pub fn verify(file: &[u8], archive: &Path, directory: &Path) -> Result<(), String> {
+    produce(file, archive, directory).map(|_| ())
+}
+// The standalone CPU verifier discards these; the GPU integration consumes them.
+#[allow(dead_code)]
+pub struct TiledFrame {
+    pub width: u32,
+    pub height: u32,
+    pub tiled: Vec<u8>,
+    pub expected_rgba: Vec<u8>,
+}
+pub fn produce(file: &[u8], archive: &Path, directory: &Path) -> Result<TiledFrame, String> {
     std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
     let mut native = NativeExecutor::new(0x20000000, 2 * 1024 * 1024, 10_000_000, 10_000_000)?;
     native.register_service(0x780000, Service::ThreadCreate)?;
@@ -156,5 +167,11 @@ pub fn verify(file: &[u8], archive: &Path, directory: &Path) -> Result<(), Strin
         "PASS: actual pinned PS5_DrawPixelsAsTiles242instructions creates/joins12 real48instruction workers; {}pixels fullymatch independentuntile, parentstack descriptors retained, childrenreaped, {services}services/{joins}joinwaits; no syntheticwrapper or gameplayclaim",
         width * height
     );
-    Ok(())
+    destination.truncate(required);
+    Ok(TiledFrame {
+        width,
+        height,
+        tiled: destination,
+        expected_rgba: expected,
+    })
 }

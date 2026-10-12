@@ -14,6 +14,8 @@ The cooperative scheduler also passes two round-robin workers with separate reta
 
 The real 242-instruction tiling wrapper also passes: it creates and joins 12 translated guest workers, and all 82,560 pixels in a 640×129 buffer match the untile reference. Its stack descriptors remain valid across scheduling, all child handles are reaped, and source data and destination canaries stay intact (`rust-tiler-threads.log`). Only its four-argument invocation uses a test adapter; the guest wrapper and worker bytes are unchanged. This does not execute the game loop.
 
+The same real-worker output also reaches the existing Metal presenter on the Apple M5 Pro. The integration checks all 82,560 pixels after CPU untile, uploads that buffer, and requires a finite positive drawable presentation timestamp (`tiler-gpu-native.log`). This proves the exercised CPU-to-GPU presentation path; it does not include GPU pixel readback or a real game loop. Entry verification invokes this combined check on the main thread and briefly opens a window.
+
 This source snapshot passes 217 unit tests, three integration tests and strict Clippy. Integrated entry verification passes against the matching thread-name build with the modeled 2 MiB stack size (`thread-name-entry.log`). It checks the new thread import bindings and the exact `sigemptyset` failure before accepting normal exit -1; no game main has run.
 
 ## Earlier integration milestones

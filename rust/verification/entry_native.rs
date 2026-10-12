@@ -30,7 +30,7 @@ mod thread_services_native;
 mod thread_module_native;
 mod thread_name_native;
 mod tiler_native;
-mod tiler_threads_native;
+mod tiler_gpu_native;
 mod tls_native;
 mod truncate_native;
 mod user_service_native;
@@ -64,7 +64,7 @@ fn main() -> Result<(), String> {
     thread_module_native::verify(Path::new(&archive), Path::new(&directory))?;
     thread_name_native::verify(Path::new(&archive), Path::new(&directory))?;
     tiler_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
-    tiler_threads_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+    tiler_gpu_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     user_service_native::verify(Path::new(&archive), Path::new(&directory))?;
     pad_native::verify(Path::new(&archive), Path::new(&directory))?;
     puts_native::verify(Path::new(&archive), Path::new(&directory))?;
