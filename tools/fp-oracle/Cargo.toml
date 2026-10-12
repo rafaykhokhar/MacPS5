@@ -6,4 +6,28 @@ publish = false
 
 [dependencies]
 rustc_apfloat = "=0.2.3"
-native-ps5 = { path = "../../rust" }
+native-ps5 = { path = "../../rust", optional = true }
+
+[features]
+default = ["runtime"]
+runtime = ["dep:native-ps5"]
+
+[[bin]]
+name = "compare"
+path = "src/bin/compare.rs"
+required-features = ["runtime"]
+
+[[bin]]
+name = "compare-fma"
+path = "src/bin/compare-fma.rs"
+required-features = ["runtime"]
+
+[[bin]]
+name = "compare-controls"
+path = "src/bin/compare-controls.rs"
+required-features = ["runtime"]
+
+[[bin]]
+name = "compare-truncate"
+path = "src/bin/compare-truncate.rs"
+required-features = ["runtime"]

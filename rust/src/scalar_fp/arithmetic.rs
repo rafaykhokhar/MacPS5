@@ -87,7 +87,7 @@ pub fn multiply_binary64(a: u64, b: u64, mxcsr: u32) -> Result<FpResult, FpUnsup
     finish(sign | magnitude, mxcsr, status)
 }
 
-fn finish(bits: u64, mxcsr: u32, status: u32) -> Result<FpResult, FpUnsupported> {
+pub(super) fn finish(bits: u64, mxcsr: u32, status: u32) -> Result<FpResult, FpUnsupported> {
     let unmasked = status & !(mxcsr >> 7) & 0x3f;
     if unmasked != 0 {
         return Err(FpUnsupported::Exception {
@@ -101,7 +101,7 @@ fn finish(bits: u64, mxcsr: u32, status: u32) -> Result<FpResult, FpUnsupported>
     })
 }
 
-fn unpack(bits: u64, control: u32, status: &mut u32) -> (u64, i32) {
+pub(super) fn unpack(bits: u64, control: u32, status: &mut u32) -> (u64, i32) {
     let exponent = ((bits >> 52) & 0x7ff) as i32;
     let fraction = bits & FRACTION;
     if exponent == 0 {
@@ -116,9 +116,10 @@ fn unpack(bits: u64, control: u32, status: &mut u32) -> (u64, i32) {
     }
 }
 
-/// Round a positive exact integer times 2^scale once. Product is at most106bits.
-/// Kept separate so subsequent exact arithmetic can share packing rules.
-fn round_pack(
+/// Round a positive integer times2^scale once. Multiplication passes its exact
+/// 106-bit product; FMA passes127 leading bits with the low bit made sticky.
+/// That retained width exceeds destination precision plus guard/round bits.
+pub(super) fn round_pack(
     value: u128,
     scale: i32,
     negative: bool,

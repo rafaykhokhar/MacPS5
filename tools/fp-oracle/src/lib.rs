@@ -1,4 +1,89 @@
 //! Independent LLVM-based reference policy; never calls production arithmetic.
+
+/// Binary64 precision with a wider exponent range: permits the same precision
+/// rounding without prematurely overflowing or quantizing to subnormal doubles.
+/// This reference uses LLVM's own fused operation, not production accumulators.
+pub struct WideDoubleSemantics;
+impl rustc_apfloat::ieee::Semantics for WideDoubleSemantics {
+    const BITS: usize = 68;
+    const EXP_BITS: usize = 15;
+}
+pub fn finite_fma_reference(a: u64, b: u64, c: u64, rc: u32) -> (u64, u32) {
+    use rustc_apfloat::{
+        Float, FloatConvert, Round,
+        ieee::{Double, IeeeFloat},
+    };
+    type Wide = IeeeFloat<WideDoubleSemantics>;
+    let round = [
+        Round::NearestTiesToEven,
+        Round::TowardNegative,
+        Round::TowardPositive,
+        Round::TowardZero,
+    ][rc as usize];
+    let inputs = [a, b, c].map(|bits| {
+        let value = Double::from_bits(bits as u128);
+        assert!(value.is_finite());
+        value
+    });
+    let wide: [Wide; 3] = inputs.map(|input| input.convert(&mut false).value);
+    let rounded = wide[0].mul_add_r(wide[1], wide[2], round);
+    let double = inputs[0].mul_add_r(inputs[1], inputs[2], round);
+    let status = double.status.bits() as u32;
+    let mut flags = (status & 1) | ((status & 0x1e) << 1);
+    let magnitude = rounded.value.abs();
+    let minimum = Wide::from_bits((16383u128 - 1022) << 52);
+    let overflow = Wide::from_bits((16383u128 + 1024) << 52);
+    if magnitude >= overflow {
+        flags |= 40;
+    }
+    if !magnitude.is_zero() && magnitude < minimum && flags & 32 != 0 {
+        flags |= 16;
+    } else {
+        flags &= !16;
+    }
+    if [a, b, c]
+        .iter()
+        .any(|v| v & 0x7ff0_0000_0000_0000 == 0 && v & 0x000f_ffff_ffff_ffff != 0)
+    {
+        flags |= 2;
+    }
+    (double.value.to_bits() as u64, flags)
+}
+
+#[cfg(test)]
+mod fma_reference_tests {
+    use super::finite_fma_reference;
+    #[test]
+    fn fused_cancellation_and_intermediate_overflow() {
+        assert_eq!(
+            finite_fma_reference(
+                0x3ff0000000000001,
+                0x3feffffffffffffe,
+                0xbff0000000000000,
+                0
+            ),
+            (0xb970000000000000, 0)
+        );
+        assert_eq!(
+            finite_fma_reference(
+                0x7fefffffffffffff,
+                0x4000000000000000,
+                0xffefffffffffffff,
+                0
+            ),
+            (0x7fefffffffffffff, 0)
+        );
+        assert_eq!(
+            finite_fma_reference(
+                0x3ff0000000000000,
+                0x3ff0000000000000,
+                0xbff0000000000000,
+                1
+            ),
+            (1u64 << 63, 0)
+        );
+    }
+}
 /// LLVM APFloat's overflow_result reports only INEXACT when directed rounding
 /// saturates. x86 sets OE as well (Intel SDM vol.1 §4.9.1.4, table4-10):
 /// https://cdrdv2-public.intel.com/843820/325462-sdm-vol-1-2abcd-3abcd-4-1.pdf

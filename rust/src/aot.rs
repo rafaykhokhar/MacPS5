@@ -327,6 +327,31 @@ impl Emitter {
                 self.emit("ldr w20, [x19, #200]");
                 self.write(i, 0, 32, 20)?;
             }
+            M::Vfmadd213sd => {
+                if i.code() != iced_x86::Code::VEX_Vfmadd213sd_xmm_xmm_xmmm64 {
+                    return Err("Only VEX VFMADD213SD is implemented".into());
+                }
+                let dst = vector(i.op_register(0))?;
+                let first = vector(i.op_register(1))?;
+                if i.op_kind(2) == OpKind::Register {
+                    let second = vector(i.op_register(2))?;
+                    self.emit(format!("ldr x20, [x19, #{}]", 208 + second * 32));
+                } else {
+                    self.read(i, 2, 64, 20)?;
+                }
+                // Intel VFMADD213SD: (old destination * source1) + source2,
+                // with one rounding. Bits127:64 preserve the OLD destination.
+                // Snapshot every aliased source before any destination commit.
+                self.emit(format!(
+                    "ldr x21, [x19, #{}]\nldr x1, [x19, #{}]\nldr x2, [x19, #{}]\nmov x3, x20\nmov x0, x19\nbl _native_ps5_fma213_binary64_v1",
+                    216 + dst * 32, 208 + dst * 32, 208 + first * 32
+                ));
+                self.fault();
+                self.emit(format!(
+                    "str x0, [x19, #{}]\nstr x21, [x19, #{}]\nstr xzr, [x19, #{}]\nstr xzr, [x19, #{}]",
+                    208 + dst * 32, 216 + dst * 32, 224 + dst * 32, 232 + dst * 32
+                ));
+            }
             M::Vmulsd => {
                 if i.code() != iced_x86::Code::VEX_Vmulsd_xmm_xmm_xmmm64 {
                     return Err("Only VEX scalar binary64 VMULSD is implemented".into());
@@ -937,13 +962,23 @@ mod truncate_tests {
     use super::*;
     #[test]
     fn truncate_exact_vex32_forms() {
-        for bytes in [&[0xc5,0xfb,0x2c,0xc0][..], &[0xc4,0x41,0x7b,0x2c,0xcf][..], &[0xc5,0xfb,0x2c,0x07][..]] {
+        for bytes in [
+            &[0xc5, 0xfb, 0x2c, 0xc0][..],
+            &[0xc4, 0x41, 0x7b, 0x2c, 0xcf][..],
+            &[0xc5, 0xfb, 0x2c, 0x07][..],
+        ] {
             let instruction = decode::instruction(bytes, 0xc3fca).unwrap();
-            assert_eq!(instruction.code(), iced_x86::Code::VEX_Vcvttsd2si_r32_xmmm64);
+            assert_eq!(
+                instruction.code(),
+                iced_x86::Code::VEX_Vcvttsd2si_r32_xmmm64
+            );
             assert!(supported(&instruction).is_ok());
         }
-        for bytes in [&[0xf2,0x0f,0x2c,0xc0][..], &[0xc4,0xe1,0xfb,0x2c,0xc0][..]] {
-            assert!(translate_rust_memory_region(bytes,0,"unsupported_truncate").is_err());
+        for bytes in [
+            &[0xf2, 0x0f, 0x2c, 0xc0][..],
+            &[0xc4, 0xe1, 0xfb, 0x2c, 0xc0][..],
+        ] {
+            assert!(translate_rust_memory_region(bytes, 0, "unsupported_truncate").is_err());
         }
     }
 }
@@ -953,13 +988,41 @@ mod vmulsd_tests {
     use super::*;
     #[test]
     fn scalar_vex_multiply_forms_only() {
-        for bytes in [&[0xc5,0xdb,0x59,0xe0][..], &[0xc5,0xdb,0x59,0xd1][..], &[0xc5,0xdb,0x59,0x17][..], &[0xc4,0x41,0x83,0x59,0xfe][..]] {
-            let i = decode::instruction(bytes,0xc3f76).unwrap();
+        for bytes in [
+            &[0xc5, 0xdb, 0x59, 0xe0][..],
+            &[0xc5, 0xdb, 0x59, 0xd1][..],
+            &[0xc5, 0xdb, 0x59, 0x17][..],
+            &[0xc4, 0x41, 0x83, 0x59, 0xfe][..],
+        ] {
+            let i = decode::instruction(bytes, 0xc3f76).unwrap();
             assert_eq!(i.code(), iced_x86::Code::VEX_Vmulsd_xmm_xmm_xmmm64);
             assert!(supported(&i).is_ok());
         }
-        for bytes in [&[0xf2,0x0f,0x59,0xc1][..], &[0xc5,0xf9,0x59,0xc1][..]] {
-            assert!(translate_rust_memory_region(bytes,0,"unsupported_multiply").is_err());
+        for bytes in [&[0xf2, 0x0f, 0x59, 0xc1][..], &[0xc5, 0xf9, 0x59, 0xc1][..]] {
+            assert!(translate_rust_memory_region(bytes, 0, "unsupported_multiply").is_err());
+        }
+    }
+}
+#[cfg(test)]
+mod fma213_tests {
+    use super::*;
+    #[test]
+    fn exact_fma213_scalar_vex_forms() {
+        for bytes in [
+            &[0xc4, 0xe2, 0xe1, 0xa9, 0xe2][..],
+            &[0xc4, 0xe2, 0xe1, 0xa9, 0x27][..],
+            &[0xc4, 0x42, 0x89, 0xa9, 0xfd][..],
+        ] {
+            let i = decode::instruction(bytes, 0xc3fb4).unwrap();
+            assert_eq!(i.code(), iced_x86::Code::VEX_Vfmadd213sd_xmm_xmm_xmmm64);
+            assert!(supported(&i).is_ok());
+        }
+        for bytes in [
+            &[0xc4, 0xe2, 0xe1, 0x99, 0xe2][..],
+            &[0xc4, 0xe2, 0xe1, 0xb9, 0xe2][..],
+            &[0xc4, 0xe2, 0x61, 0xa9, 0xe2][..],
+        ] {
+            assert!(translate_rust_memory_region(bytes, 0, "unsupported_fma").is_err());
         }
     }
 }

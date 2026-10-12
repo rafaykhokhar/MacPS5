@@ -1,5 +1,16 @@
 # Independent finite arithmetic comparison
 
+## Fused multiply-add
+
+```sh
+cargo run --release --locked --no-default-features --manifest-path tools/fp-oracle/Cargo.toml --bin generate-fma -- /tmp/macps5-fma.tsv
+cargo run --release --locked --manifest-path tools/fp-oracle/Cargo.toml --bin compare-fma -- /tmp/macps5-fma.tsv
+```
+
+The fused comparison passes 223,328 finite cases in four rounding modes, with zero result-bit or status differences. Expected bits come from LLVM's fused operation. A separate LLVM format with 53-bit precision and a wider exponent range supplies x86 overflow and tininess classification; it does not call the production accumulator. Reference tests include exact cancellation and cancellation of an otherwise overflowing product. This corpus does not cover NaN operand priority or native lowering. `--no-default-features` lets reference generation run without building the implementation under test.
+
+## Multiplication
+
 Generate a deterministic 204,096-case LLVM APFloat corpus and compare it with the experimental multiplication engine:
 
 ```sh
