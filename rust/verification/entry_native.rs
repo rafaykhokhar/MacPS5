@@ -38,6 +38,7 @@ mod sysctl_native;
 mod sigaction_native;
 mod wcstombs_native;
 mod sort_search_native;
+mod fgets_native;
 mod system_service_native;
 mod threadattr_native;
 mod thread_services_native;
@@ -92,6 +93,7 @@ fn main() -> Result<(), String> {
     sigaction_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     wcstombs_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     sort_search_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("sort-search"))?;
+    fgets_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("fgets"))?;
     semaphore_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     stdio_file_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     system_service_native::verify(Path::new(&archive), Path::new(&directory))?;
@@ -338,6 +340,7 @@ fn main() -> Result<(), String> {
         ("vsnprintf", 0x720020),
         ("__isthreaded", 0x30003000),
         ("__stderrp", native_ps5::guest_stdio::STDERR_PTR_ADDR),
+        ("__stdinp", native_ps5::stdio_file::STDIN_PTR_ADDR),
     ];
     for (index, (name, service)) in [
         ("strcpy", Service::Strcpy),
@@ -459,6 +462,7 @@ fn main() -> Result<(), String> {
         ("wcstombs", Service::Wcstombs),
         ("qsort", Service::Qsort),
         ("bsearch", Service::Bsearch),
+        ("fgets", Service::Fgets),
     ]
     .into_iter()
     .enumerate()
@@ -499,6 +503,8 @@ fn main() -> Result<(), String> {
     bss.bytes[(begin - bss.address) as usize..(end - bss.address) as usize].fill(0xa5);
     let mut kernel = native_ps5::kernel::Kernel::new(65536, 0x30001000)?;
     kernel.files.set_stat_tracing(true);
+    // Explicit redirected empty input for this startup fixture, not implicit terminal EOF.
+    kernel.files.register(b"/fixture/stdin", Vec::new())?;
     kernel.register_sandbox_component(b"guest_sandbox")?;
     kernel.register_working_directory(b"/app0")?;
     kernel.register_process_name(std::process::id(), b"crispy-doom.elf")?;
@@ -575,6 +581,7 @@ fn main() -> Result<(), String> {
     kernel.map(base + 0x5100000, module.bytes, true)?;
     let mut isthreaded = [0u8; 4];
     let mut stderr_pointer = native_ps5::guest_stdio::stderr_pointer_bytes();
+    let mut stdin_pointer = native_ps5::stdio_file::stdin_pointer_bytes();
     let libc = {
         use native_ps5::kernel_module::{Export, Kind};
         let mut user = native_ps5::guest_memory::Memory::default();
@@ -585,6 +592,7 @@ fn main() -> Result<(), String> {
             false,
             false,
         )?;
+        user.add(native_ps5::stdio_file::STDIN_PTR_ADDR, &mut stdin_pointer, false, false)?;
         let nids = encode_exports(&libc_exports)?;
         let exports = nids
             .iter()
@@ -596,7 +604,8 @@ fn main() -> Result<(), String> {
                         size: 4,
                         writable: true,
                     }
-                } else if *address == native_ps5::guest_stdio::STDERR_PTR_ADDR {
+                } else if *address == native_ps5::guest_stdio::STDERR_PTR_ADDR
+                    || *address == native_ps5::stdio_file::STDIN_PTR_ADDR {
                     Kind::Object {
                         size: 8,
                         writable: false,
@@ -616,6 +625,7 @@ fn main() -> Result<(), String> {
             |address| {
                 address != 0x30003000
                     && address != native_ps5::guest_stdio::STDERR_PTR_ADDR
+                    && address != native_ps5::stdio_file::STDIN_PTR_ADDR
                     && libc_exports.iter().any(|(_, target)| *target == address)
             },
         )?
@@ -838,6 +848,7 @@ fn main() -> Result<(), String> {
         kernel.register_process_parameters(&memory, 2, 0x30002000)?;
     }
     native.kernel = Some(kernel);
+    native.configure_stdin(b"/fixture/stdin")?;
     let mut errno = [0u8; 4];
     let mut regions = [
         DataRegion {
@@ -1375,6 +1386,9 @@ fn main() -> Result<(), String> {
                 (896, 0x730710),
                 (904, 0x730720),
                 (912, 0x730730),
+                (920, native_ps5::stdio_file::STDIN_PTR_ADDR),
+                (928, 0x730740),
+                (936, 0x760010),
             ] {
                 if locale_segment.bytes[locale_offset + delta..locale_offset + delta + 8]
                     != expected.to_le_bytes()
@@ -1401,13 +1415,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 121 libc exports: (121+1)*24=2928 symbol bytes
-                // and 1+121*12=1453 NID bytes (rounded1456). Sort/search
-                // exports add48+16bytes to18656; retain the exact32KiB cap.
-                || native.bytes_allocated() != 18720
+                // 123 libc exports: (123+1)*24=2976 symbol bytes
+                // and 1+123*12=1477 NID bytes (rounded1488). Stdin/fgets
+                // exports add48+32bytes to18720; retain the exact32KiB cap.
+                || native.bytes_allocated() != 18800
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve '__stdinp'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'getcwd'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1417,7 +1431,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; qsort/bsearch imports bound; unresolved __stdinp causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; stdin/fgets imports bound; unresolved getcwd causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1479,7 +1493,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved __stdinp triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved getcwd triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     Ok(())

@@ -693,6 +693,7 @@ pub enum Service {
     Vsscanf,
     Gettimeofday,
     File(crate::stdio_file::Operation),
+    Fgets,
     Fstat,
     Stat,
     Sysconf,
@@ -867,6 +868,7 @@ impl Service {
             | Self::Vsscanf
             | Self::Gettimeofday
             | Self::File(_)
+            | Self::Fgets
             | Self::Fstat
             | Self::Stat
             | Self::Sysconf
@@ -1375,6 +1377,8 @@ pub struct NativeExecutor {
     pub stdio: crate::guest_stdio::GuestStdio,
     file_streams: crate::stdio_file::Store,
     file_metadata: Vec<u8>,
+    stdin_metadata: Option<[u8; crate::stdio_file::SLOT_SIZE]>,
+    stdin_pointer: [u8; 8],
     stderr_file: [u8; 312],
     stderr_pointer: [u8; 8],
     locale_name: [u8; 2],
@@ -1887,12 +1891,24 @@ impl NativeExecutor {
         if self
             .services
             .values()
-            .any(|service| matches!(service, Service::File(_)))
+            .any(|service| matches!(service, Service::File(_) | Service::Fgets))
         {
             mapped_data.push(DataRegion {
                 address: crate::stdio_file::BASE,
                 bytes: &mut self.file_metadata,
                 writable: true,
+            });
+        }
+        if let Some(metadata) = self.stdin_metadata.as_mut() {
+            mapped_data.push(DataRegion {
+                address: crate::stdio_file::STDIN_FILE_ADDR,
+                bytes: metadata,
+                writable: true,
+            });
+            mapped_data.push(DataRegion {
+                address: crate::stdio_file::STDIN_PTR_ADDR,
+                bytes: &mut self.stdin_pointer,
+                writable: false,
             });
         }
         continuation.with_memory_context(
@@ -2183,6 +2199,29 @@ impl NativeExecutor {
         self.system_profile = Some(profile);
         Ok(())
     }
+    /// Bind stdin to an explicitly registered guest file before any execution attempt.
+    /// The exported __stdinp cell is read-only; its FILE has real shared fd0 state.
+    pub fn configure_stdin(&mut self, path: &[u8]) -> Result<()> {
+        if self.system_profile_locked {
+            return Err("Guest stdin is frozen after execution starts".into());
+        }
+        if self.stdin_metadata.is_some() {
+            return Err("Guest stdin is already configured".into());
+        }
+        let metadata = self.file_streams.configure_stdin(
+            self.kernel.as_mut().ok_or("Missing stdin kernel context")?,
+            path,
+        )?;
+        self.stdin_metadata = Some(metadata);
+        Ok(())
+    }
+    /// Export this address as the data symbol __stdinp, not as a callable service.
+    pub fn stdin_pointer_address(&self) -> Result<u64> {
+        if self.stdin_metadata.is_none() {
+            return Err("Guest stdin source has not been configured".into());
+        }
+        Ok(crate::stdio_file::STDIN_PTR_ADDR)
+    }
     pub fn system_profile(&self) -> Option<&crate::guest_system::GuestSystemProfile> {
         self.system_profile.as_ref()
     }
@@ -2230,6 +2269,8 @@ impl NativeExecutor {
             stdio: crate::guest_stdio::GuestStdio::default(),
             file_streams: crate::stdio_file::Store::default(),
             file_metadata: vec![0; crate::stdio_file::ARENA_SIZE],
+            stdin_metadata: None,
+            stdin_pointer: crate::stdio_file::stdin_pointer_bytes(),
             stderr_file: crate::guest_stdio::stderr_file_bytes(),
             stderr_pointer: crate::guest_stdio::stderr_pointer_bytes(),
             locale_name: crate::guest_locale::C_NAME,
@@ -2926,7 +2967,7 @@ impl NativeExecutor {
         if self
             .services
             .values()
-            .any(|service| matches!(service, Service::File(_)))
+            .any(|service| matches!(service, Service::File(_) | Service::Fgets))
         {
             memory.add(
                 crate::stdio_file::BASE,
@@ -2934,6 +2975,10 @@ impl NativeExecutor {
                 true,
                 false,
             )?;
+        }
+        if let Some(metadata) = self.stdin_metadata.as_mut() {
+            memory.add(crate::stdio_file::STDIN_FILE_ADDR, metadata, true, false)?;
+            memory.add_service_data(crate::stdio_file::STDIN_PTR_ADDR, &mut self.stdin_pointer)?;
         }
         for &address in self.services.keys() {
             memory.reserve_service(address);
@@ -4471,6 +4516,21 @@ impl NativeExecutor {
                             [descriptor, cpu.registers[6], 0, 0, 0, 0],
                         )?;
                         value as u32 as u64
+                    } else if matches!(service, Service::Fgets) {
+                        self.file_streams.call(
+                            self.kernel.as_mut().ok_or("Missing fgets kernel context")?,
+                            &mut memory,
+                            crate::stdio_file::Operation::ReadLine,
+                            [
+                                cpu.registers[7],
+                                cpu.registers[6] as u32 as u64,
+                                cpu.registers[2],
+                                0,
+                            ],
+                            |memory, address, length| {
+                                validate_net_output(memory, address, length, sp, ret)
+                            },
+                        )?
                     } else if let Service::File(operation) = service {
                         if matches!(operation, crate::stdio_file::Operation::Write)
                             && cpu.registers[1] == crate::guest_stdio::FILE_ADDR
@@ -5307,6 +5367,54 @@ impl Executor for NativeExecutor {
 #[cfg(test)]
 mod service_registration_tests {
     use super::*;
+    #[test]
+    fn stdin_requires_real_source_and_freezes_even_after_rejected_entry() {
+        let mut native = NativeExecutor::new(0x900000, 4096, 100, 100).unwrap();
+        assert!(native.stdin_pointer_address().is_err());
+        assert!(native.configure_stdin(b"/input").is_err());
+        native.kernel = Some(crate::kernel::Kernel::new(65536, 0x800000).unwrap());
+        assert!(native.configure_stdin(b"/missing").is_err());
+        assert!(native
+            .kernel
+            .as_ref()
+            .unwrap()
+            .descriptors
+            .file_token(0)
+            .is_err());
+        native
+            .kernel
+            .as_mut()
+            .unwrap()
+            .files
+            .register(b"/input", b"line\n".to_vec())
+            .unwrap();
+        native.configure_stdin(b"/input").unwrap();
+        assert_eq!(
+            native.stdin_pointer_address().unwrap(),
+            crate::stdio_file::STDIN_PTR_ADDR
+        );
+        assert_eq!(
+            u64::from_le_bytes(native.stdin_pointer),
+            crate::stdio_file::STDIN_FILE_ADDR
+        );
+        assert!(native
+            .kernel
+            .as_ref()
+            .unwrap()
+            .descriptors
+            .file_token(0)
+            .is_ok());
+        assert!(native.configure_stdin(b"/input").is_err());
+        let mut image = Image::load(&crate::modules::fixture(), 0x100000, 65536).unwrap();
+        let mut unconfigured = NativeExecutor::new(0x900000, 4096, 100, 100).unwrap();
+        unconfigured.kernel = native.kernel.take();
+        let _ = unconfigured.run(&mut image, u64::MAX - 1, Arguments::default(), &mut []);
+        assert!(unconfigured
+            .configure_stdin(b"/input")
+            .unwrap_err()
+            .contains("frozen"));
+        assert!(unconfigured.stdin_pointer_address().is_err());
+    }
     #[test]
     fn system_profile_is_explicit_and_frozen_on_first_execution_attempt() {
         use crate::guest_system::GuestSystemProfile;

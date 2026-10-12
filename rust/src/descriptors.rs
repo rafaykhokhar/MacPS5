@@ -30,9 +30,178 @@ pub struct FileReadPlan {
     revision: u64,
     file_revision: u64,
 }
+/// A delimiter-limited read from an owned regular file. EOF means the line
+/// operation attempted to read beyond the available bytes, not merely that
+/// the final consumed byte happened to be the last byte of the file.
+pub struct FileLineReadPlan {
+    read: FileReadPlan,
+    eof: bool,
+}
+impl FileLineReadPlan {
+    pub fn bytes(&self) -> &[u8] {
+        self.read.bytes()
+    }
+    pub fn eof(&self) -> bool {
+        self.eof
+    }
+}
 impl FileReadPlan {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+}
+
+#[cfg(test)]
+mod stdin_line_tests {
+    use super::*;
+    use crate::kernel::Files;
+
+    #[test]
+    fn redirected_stdin_shares_raw_cursor_and_retirement() {
+        let mut files = Files::default();
+        files
+            .register(b"/input", b"first\nsecond\n".to_vec())
+            .unwrap();
+        let mut descriptors = Descriptors::default();
+        assert!(descriptors.file_token(0).is_err());
+        assert!(
+            descriptors
+                .configure_stdin_from_registered_file(&files, b"/missing")
+                .is_err()
+        );
+        let token = descriptors
+            .configure_stdin_from_registered_file(&files, b"/input")
+            .unwrap();
+        assert_eq!(token.descriptor(), 0);
+        assert_eq!(descriptors.kind(0), Some(DescriptorKind::RegisteredFile));
+        assert!(
+            descriptors
+                .configure_stdin_from_registered_file(&files, b"/input")
+                .is_err()
+        );
+        assert_eq!(
+            descriptors
+                .open_file(&files, b"/input")
+                .unwrap()
+                .descriptor(),
+            3
+        );
+        let plan = descriptors.preview_line_read(&token, 100).unwrap();
+        assert_eq!(plan.bytes(), b"first\n");
+        assert!(!plan.eof());
+        assert_eq!(descriptors.file_position(&token), Ok(0));
+        descriptors.commit_line_read(&plan).unwrap();
+        assert_eq!(descriptors.commit_line_read(&plan), Err(9));
+        let mut bytes = [0; 7];
+        let mut user = Memory::default();
+        user.add(0x1000, &mut bytes, true, false).unwrap();
+        let mut kernel = Memory::default();
+        assert_eq!(
+            descriptors.transfer(&mut user, &mut kernel, 0, 0x1000, 7, false),
+            Ok(7)
+        );
+        assert_eq!(user.read(0x1000, 7).unwrap(), b"second\n");
+        assert_eq!(descriptors.file_position(&token), Ok(13));
+        assert_eq!(descriptors.seek(0, 0, 0), Ok(0));
+        let pending = descriptors.preview_line_read(&token, 100).unwrap();
+        assert_eq!(descriptors.close(0), 0);
+        let replacement = descriptors
+            .configure_stdin_from_registered_file(&files, b"/input")
+            .unwrap();
+        assert_eq!(descriptors.commit_line_read(&pending), Err(9));
+        assert_eq!(descriptors.close_file(&token), 9);
+        assert_eq!(descriptors.file_position(&replacement), Ok(0));
+        assert_eq!(descriptors.close_file(&replacement), 0);
+        assert_eq!(descriptors.close(0), 9);
+    }
+
+    #[test]
+    fn line_limits_and_eof_match_bytewise_oracle() {
+        for contents in [&b""[..], b"a", b"a\n", b"\n\nb", b"a\0b\ncd", b"abcdef"] {
+            let mut files = Files::default();
+            files.register(b"/input", contents.to_vec()).unwrap();
+            let mut descriptors = Descriptors::default();
+            let token = descriptors
+                .configure_stdin_from_registered_file(&files, b"/input")
+                .unwrap();
+            for offset in 0..=contents.len() + 2 {
+                for capacity in [0, 1, 2, 3, 8, u64::MAX] {
+                    descriptors.seek(0, offset as i64, 0).unwrap();
+                    let mut expected = Vec::new();
+                    let mut cursor = offset;
+                    let mut eof = false;
+                    while (expected.len() as u64) < capacity {
+                        let Some(&byte) = contents.get(cursor) else {
+                            eof = true;
+                            break;
+                        };
+                        expected.push(byte);
+                        cursor += 1;
+                        if byte == b'\n' {
+                            break;
+                        }
+                    }
+                    let plan = descriptors.preview_line_read(&token, capacity).unwrap();
+                    assert_eq!(
+                        plan.bytes(),
+                        expected,
+                        "offset={offset}, capacity={capacity}"
+                    );
+                    assert_eq!(plan.eof(), eof, "offset={offset}, capacity={capacity}");
+                    assert_eq!(descriptors.file_position(&token), Ok(offset as u64));
+                    descriptors.commit_line_read(&plan).unwrap();
+                    assert_eq!(descriptors.file_position(&token), Ok(cursor as u64));
+                    assert_eq!(descriptors.commit_line_read(&plan), Err(9));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stdin_quota_domain_and_line_plan_staleness() {
+        let mut files = Files::default();
+        files
+            .register_writable(b"/input", b"a\nb".to_vec())
+            .unwrap();
+        let mut descriptors = Descriptors::default();
+        let token = descriptors
+            .configure_stdin_from_registered_file(&files, b"/input")
+            .unwrap();
+        let plan = descriptors.preview_line_read(&token, 100).unwrap();
+        let mut foreign = Descriptors::default();
+        foreign
+            .configure_stdin_from_registered_file(&files, b"/input")
+            .unwrap();
+        assert_eq!(foreign.commit_line_read(&plan), Err(9));
+        let mut other_files = Files::default();
+        other_files.register(b"/other", b"z".to_vec()).unwrap();
+        assert!(descriptors.open_file(&other_files, b"/other").is_err());
+        assert_eq!(descriptors.registered_file_bytes(), 3);
+        let writer = descriptors
+            .open_file_options(
+                &mut files,
+                b"/input",
+                OpenOptions {
+                    read: false,
+                    write: true,
+                    ..OpenOptions::read_only()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(descriptors.preview_line_read(&writer, 10).is_err());
+        let write = descriptors.preview_write_count(&writer, b"x", 1).unwrap();
+        descriptors.commit_write(write).unwrap();
+        assert_eq!(descriptors.commit_line_read(&plan), Err(9));
+        assert_eq!(descriptors.file_position(&token), Ok(0));
+        let plan = descriptors.preview_line_read(&token, 10).unwrap();
+        descriptors.seek(0, 1, 0).unwrap();
+        assert_eq!(descriptors.commit_line_read(&plan), Err(9));
+        assert_eq!(descriptors.file_position(&token), Ok(1));
+        assert_eq!(descriptors.close_file(&writer), 0);
+        assert!(descriptors.open_file(&other_files, b"/other").is_err());
+        assert_eq!(descriptors.close(0), 0);
+        assert!(descriptors.open_file(&other_files, b"/other").is_ok());
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +278,7 @@ struct Pipe {
 }
 pub struct Descriptors {
     endpoints: [Option<Endpoint>; LIMIT],
+    stdin: Option<Endpoint>,
     owner: Rc<()>,
     next_file: u64,
     file_quota: Option<Rc<crate::kernel::Quota>>,
@@ -117,6 +287,7 @@ impl Default for Descriptors {
     fn default() -> Self {
         Self {
             endpoints: std::array::from_fn(|_| None),
+            stdin: None,
             owner: Rc::new(()),
             next_file: 1,
             file_quota: None,
@@ -133,6 +304,7 @@ impl Descriptors {
             if self
                 .endpoints
                 .iter()
+                .chain(std::iter::once(&self.stdin))
                 .any(|e| matches!(e, Some(Endpoint::File(_))))
                 && !Rc::ptr_eq(quota, &files.quota())
             {
@@ -152,6 +324,41 @@ impl Descriptors {
         self.validate_file_namespace(files).map_err(|_| 9u32)?;
         let backing = files.backing(path)?;
         self.install_file(backing, OpenOptions::read_only())
+    }
+    /// Explicit regular-file redirection. No input source is installed by
+    /// default. The execution owner must prevent configuration during guest
+    /// execution. Reconfiguration requires closing the previous fd0 instance;
+    /// its tokens and pending plans never become valid again.
+    pub fn configure_stdin_from_registered_file(
+        &mut self,
+        files: &crate::kernel::Files,
+        path: &[u8],
+    ) -> Result<FileToken> {
+        self.validate_file_namespace(files)?;
+        if self.stdin.is_some() {
+            return Err("Guest stdin is already configured".into());
+        }
+        let backing = files
+            .backing(path)
+            .map_err(|error| format!("Cannot configure guest stdin: errno {error}"))?;
+        let identity = self.next_file;
+        let next = identity
+            .checked_add(1)
+            .ok_or("Guest file identity exhausted")?;
+        self.file_quota = Some(backing.quota.clone());
+        self.stdin = Some(Endpoint::File(OpenFile {
+            backing,
+            options: OpenOptions::read_only(),
+            identity,
+            position: Cell::new(0),
+            revision: Cell::new(0),
+        }));
+        self.next_file = next;
+        Ok(FileToken {
+            descriptor: 0,
+            identity,
+            owner: self.owner.clone(),
+        })
     }
     pub fn open_file_options(
         &mut self,
@@ -344,13 +551,11 @@ impl Descriptors {
         Ok(self.file(token)?.options)
     }
     pub fn kind(&self, descriptor: u64) -> Option<DescriptorKind> {
-        Self::index(descriptor)
-            .and_then(|i| self.endpoints[i].as_ref())
-            .map(|endpoint| match endpoint {
-                Endpoint::File(_) => DescriptorKind::RegisteredFile,
-                Endpoint::Pipe { .. } => DescriptorKind::Pipe,
-                Endpoint::Control { .. } => DescriptorKind::Control,
-            })
+        self.endpoint(descriptor).map(|endpoint| match endpoint {
+            Endpoint::File(_) => DescriptorKind::RegisteredFile,
+            Endpoint::Pipe { .. } => DescriptorKind::Pipe,
+            Endpoint::Control { .. } => DescriptorKind::Control,
+        })
     }
     pub fn stat_file(
         &self,
@@ -359,9 +564,7 @@ impl Descriptors {
         Ok(self.file(token)?.backing.stat())
     }
     pub fn file_token(&self, descriptor: u64) -> std::result::Result<FileToken, u32> {
-        let Some(Endpoint::File(file)) =
-            Self::index(descriptor).and_then(|i| self.endpoints[i].as_ref())
-        else {
+        let Some(Endpoint::File(file)) = self.endpoint(descriptor) else {
             return Err(9);
         };
         Ok(FileToken {
@@ -374,7 +577,7 @@ impl Descriptors {
         if !Rc::ptr_eq(&self.owner, &token.owner) {
             return Err(9);
         }
-        match Self::index(token.descriptor.into()).and_then(|i| self.endpoints[i].as_ref()) {
+        match self.endpoint(token.descriptor.into()) {
             Some(Endpoint::File(file)) if file.identity == token.identity => Ok(file),
             _ => Err(9),
         }
@@ -409,6 +612,46 @@ impl Descriptors {
             revision: file.revision.get(),
             file_revision: state.revision,
         })
+    }
+    /// Snapshot a regular-file line without consuming it. The delimiter is
+    /// included, and no bytes after it are consumed or used to establish EOF.
+    /// A zero capacity never attempts a read and therefore never reports EOF.
+    pub fn preview_line_read(
+        &self,
+        token: &FileToken,
+        capacity: u64,
+    ) -> std::result::Result<FileLineReadPlan, u32> {
+        let file = self.file(token)?;
+        if !file.options.read {
+            return Err(9);
+        }
+        let state = file.backing.state.borrow();
+        let position = file.position.get();
+        let available = (state.bytes.len() as u64).saturating_sub(position);
+        let limit = capacity.min(available) as usize;
+        let candidates = if limit == 0 {
+            &[][..]
+        } else {
+            &state.bytes[position as usize..position as usize + limit]
+        };
+        let newline = candidates.iter().position(|&byte| byte == b'\n');
+        let amount = newline.map_or(limit, |index| index + 1);
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(amount).map_err(|_| 12u32)?;
+        bytes.extend_from_slice(&candidates[..amount]);
+        Ok(FileLineReadPlan {
+            read: FileReadPlan {
+                bytes,
+                token: token.clone(),
+                position,
+                revision: file.revision.get(),
+                file_revision: state.revision,
+            },
+            eof: newline.is_none() && available < capacity,
+        })
+    }
+    pub fn commit_line_read(&self, plan: &FileLineReadPlan) -> std::result::Result<(), u32> {
+        self.commit_read(&plan.read)
     }
     /// Call only after all output guards. One-shot even for an EOF/zero-byte read.
     pub fn commit_read(&self, plan: &FileReadPlan) -> std::result::Result<(), u32> {
@@ -479,7 +722,7 @@ impl Descriptors {
         self.close(token.descriptor.into())
     }
     pub fn seek(&self, descriptor: u64, offset: i64, whence: i32) -> std::result::Result<u64, u32> {
-        match Self::index(descriptor).and_then(|i| self.endpoints[i].as_ref()) {
+        match self.endpoint(descriptor) {
             None => Err(9),
             Some(Endpoint::File(_)) => {
                 self.seek_file(&self.file_token(descriptor)?, offset, whence)
@@ -539,8 +782,18 @@ impl Descriptors {
             .filter(|&n| n < LIMIT as u64)
             .map(|n| n as usize)
     }
+    fn endpoint(&self, descriptor: u64) -> Option<&Endpoint> {
+        if descriptor == 0 {
+            self.stdin.as_ref()
+        } else {
+            Self::index(descriptor).and_then(|index| self.endpoints[index].as_ref())
+        }
+    }
     /// Guest errno, matching the retained payload model (zero is success).
     pub fn close(&mut self, descriptor: u64) -> u32 {
+        if descriptor == 0 {
+            return if self.stdin.take().is_some() { 0 } else { 9 };
+        }
         let Some(index) = Self::index(descriptor) else {
             return 9;
         };
@@ -566,8 +819,7 @@ impl Descriptors {
         arguments: [u64; 5],
     ) -> u32 {
         let [descriptor, level, option, address, length] = arguments;
-        let Some(endpoint) = Self::index(descriptor).and_then(|i| self.endpoints[i].as_ref())
-        else {
+        let Some(endpoint) = self.endpoint(descriptor) else {
             return 9;
         };
         let Endpoint::Control { target, selector } = endpoint else {

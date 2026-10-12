@@ -2,7 +2,9 @@
 //! Policy: FreeBSD releng/11.4 libc/stdio/{fread,fseek,ftell,flags}.c.
 //! Layout: SDK10b539de8f2b6773a9a78caa7576a97dbd99b29a/freebsd/stdio.h.
 //! No host FILE pointers, host paths, duplicated cursors or invented close.
-use crate::descriptors::{Descriptors, FileReadPlan, FileToken, FileWritePlan, OpenOptions};
+use crate::descriptors::{
+    Descriptors, FileLineReadPlan, FileReadPlan, FileToken, FileWritePlan, OpenOptions,
+};
 use crate::stdio_write::{Direction, Mode};
 use std::rc::Rc;
 #[derive(Debug, PartialEq, Eq)]
@@ -31,6 +33,24 @@ pub struct ReadPlan {
     owner: Rc<()>,
 }
 impl ReadPlan {
+    pub fn bytes(&self) -> &[u8] {
+        self.read.as_ref().map_or(&[], |read| read.bytes())
+    }
+}
+/// fgets snapshot for owned regular files. They cannot produce a mid-read
+/// device error; future streaming backends must preserve partial-error bytes
+/// without appending NUL, rather than converting an error into EOF.
+pub struct LinePlan {
+    pub success: bool,
+    pub errno: Option<u32>,
+    read: Option<FileLineReadPlan>,
+    eof: bool,
+    error: bool,
+    direction: Direction,
+    revision: u64,
+    owner: Rc<()>,
+}
+impl LinePlan {
     pub fn bytes(&self) -> &[u8] {
         self.read.as_ref().map_or(&[], |read| read.bytes())
     }
@@ -212,6 +232,65 @@ impl Stream {
             .map_err(Error::Errno)?;
         self.revision = revision;
         self.eof = false;
+        Ok(())
+    }
+    /// FreeBSD releng/11.4 libc/stdio/fgets.c and refill.c policy. Orientation
+    /// precedes n validation; n==1 never accesses the underlying descriptor.
+    pub fn line_plan(&self, descriptors: &Descriptors, n: i32) -> Result<LinePlan> {
+        self.live()?;
+        let mut plan = LinePlan {
+            success: false,
+            errno: None,
+            read: None,
+            eof: self.eof,
+            error: self.error,
+            direction: self.direction,
+            revision: self.revision,
+            owner: self.owner.clone(),
+        };
+        if n <= 0 {
+            plan.error = true;
+            plan.errno = Some(22);
+        } else if n == 1 {
+            plan.success = true;
+        } else if !self.eof {
+            if !self.mode.read {
+                plan.error = true;
+                plan.errno = Some(9);
+            } else {
+                plan.direction = Direction::Read;
+                match descriptors.preview_line_read(&self.token, (n - 1) as u64) {
+                    Ok(read) => {
+                        plan.eof = read.eof();
+                        plan.success = !read.bytes().is_empty();
+                        plan.read = Some(read);
+                    }
+                    Err(error) => {
+                        plan.error = true;
+                        plan.errno = Some(error);
+                    }
+                }
+            }
+        }
+        Ok(plan)
+    }
+    pub fn commit_line(&mut self, descriptors: &Descriptors, plan: &LinePlan) -> Result<()> {
+        self.live()?;
+        if !Rc::ptr_eq(&self.owner, &plan.owner) || self.revision != plan.revision {
+            return Err(Error::Unsupported("Foreign or stale FILE line plan"));
+        }
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(Error::Unsupported("FILE revision exhausted"))?;
+        if let Some(read) = &plan.read {
+            descriptors.commit_line_read(read).map_err(Error::Errno)?;
+        }
+        self.revision = revision;
+        self.orientation = true;
+        self.eof = plan.eof;
+        self.error = plan.error;
+        self.direction = plan.direction;
         Ok(())
     }
     pub fn tell(&self, descriptors: &Descriptors) -> Result<i64> {
@@ -438,10 +517,22 @@ pub const BASE: u64 = 0x7ffd_0000_0000;
 pub const SLOT_SIZE: usize = 312;
 pub const SLOTS: usize = 128;
 pub const ARENA_SIZE: usize = SLOT_SIZE * SLOTS;
+pub const STDIN_FILE_ADDR: u64 = BASE + ARENA_SIZE as u64;
+pub const STDIN_PTR_ADDR: u64 = STDIN_FILE_ADDR + 512;
+pub fn stdin_pointer_bytes() -> [u8; 8] {
+    STDIN_FILE_ADDR.to_le_bytes()
+}
+fn overlaps_metadata(address: u64, length: usize) -> crate::Result<bool> {
+    let end = address
+        .checked_add(length as u64)
+        .ok_or("FILE output overflow")?;
+    Ok(length != 0 && address < STDIN_FILE_ADDR + SLOT_SIZE as u64 && BASE < end)
+}
 #[derive(Clone, Copy, Debug)]
 pub enum Operation {
     Open,
     Read,
+    ReadLine,
     Write,
     Seek,
     Tell,
@@ -454,6 +545,7 @@ pub enum Operation {
 #[derive(Default)]
 pub struct Store {
     streams: Vec<Stream>,
+    stdin: Option<Stream>,
 }
 fn text(
     memory: &crate::guest_memory::Memory<'_>,
@@ -479,12 +571,46 @@ fn diagnostic(error: Error) -> String {
     format!("Unsupported FILE operation: {error:?}")
 }
 impl Store {
+    /// Host-only setup; the executor freezes it before guest execution. No
+    /// default source, implicit EOF, host terminal reads or fabricated input.
+    pub fn configure_stdin(
+        &mut self,
+        kernel: &mut crate::kernel::Kernel,
+        path: &[u8],
+    ) -> crate::Result<[u8; SLOT_SIZE]> {
+        if self.stdin.is_some() {
+            return Err("Guest stdin FILE is already configured".into());
+        }
+        let token = kernel
+            .descriptors
+            .configure_stdin_from_registered_file(&kernel.files, path)?;
+        let prepared = Stream::new(token.clone()).and_then(|stream| {
+            let metadata = stream.metadata(STDIN_FILE_ADDR)?;
+            Ok((stream, metadata))
+        });
+        let (stream, metadata) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                kernel.descriptors.close_file(&token);
+                return Err(diagnostic(error));
+            }
+        };
+        self.stdin = Some(stream);
+        Ok(metadata)
+    }
     pub fn flush(
         &self,
         _descriptors: &Descriptors,
         memory: &crate::guest_memory::Memory<'_>,
         address: u64,
     ) -> crate::Result<()> {
+        if address == STDIN_FILE_ADDR {
+            let stream = self.stdin.as_ref().ok_or("Guest stdin is not configured")?;
+            if memory.read(address, SLOT_SIZE)? != stream.metadata(address).map_err(diagnostic)? {
+                return Err("Unsupported or modified stdin FILE metadata".into());
+            }
+            return Ok(());
+        }
         for (index, stream) in self.streams.iter().enumerate() {
             let identity = BASE + (index * SLOT_SIZE) as u64;
             if stream.closed || (address != 0 && address != identity) {
@@ -519,9 +645,7 @@ impl Store {
         let errno_guard = |memory: &crate::guest_memory::Memory<'_>| -> crate::Result<()> {
             guard(memory, errno_address, 4)?;
             memory.validate_write(errno_address, 4)?;
-            if errno_address < BASE + ARENA_SIZE as u64
-                && BASE < errno_address.checked_add(4).ok_or("FILE errno overflow")?
-            {
+            if overlaps_metadata(errno_address, 4)? {
                 return Err("FILE errno overlaps FILE arena".into());
             }
             Ok(())
@@ -539,7 +663,7 @@ impl Store {
                 Ok(mode) => mode,
                 Err(crate::stdio_write::ModeError::Invalid) => return fail(memory, 22, 0),
                 Err(crate::stdio_write::ModeError::VerifyUnsupported) => {
-                    return Err("Verified-execution FILE mode unsupported".into())
+                    return Err("Verified-execution FILE mode unsupported".into());
                 }
             };
             let path = text(memory, args[0], 1024)?;
@@ -598,23 +722,60 @@ impl Store {
         }
         let address = if matches!(operation, Operation::Read | Operation::Write) {
             args[3]
+        } else if matches!(operation, Operation::ReadLine) {
+            args[2]
         } else {
             args[0]
         };
-        let index = address
-            .checked_sub(BASE)
-            .filter(|o| o % SLOT_SIZE as u64 == 0)
-            .map(|o| o / SLOT_SIZE as u64)
-            .ok_or("Unknown FILE identity")?;
-        let stream = self
-            .streams
-            .get_mut(index as usize)
-            .ok_or("Unknown FILE identity")?;
+        let stream = if address == STDIN_FILE_ADDR {
+            self.stdin.as_mut().ok_or("Guest stdin is not configured")?
+        } else {
+            let index = address
+                .checked_sub(BASE)
+                .filter(|o| o % SLOT_SIZE as u64 == 0)
+                .map(|o| o / SLOT_SIZE as u64)
+                .ok_or("Unknown FILE identity")?;
+            self.streams
+                .get_mut(index as usize)
+                .ok_or("Unknown FILE identity")?
+        };
         if memory.read(address, SLOT_SIZE)? != stream.metadata(address).map_err(diagnostic)? {
             return Err("Unsupported or modified FILE metadata".into());
         }
         let mut update = false;
         let result = match operation {
+            Operation::ReadLine => {
+                let plan = stream
+                    .line_plan(&kernel.descriptors, args[1] as u32 as i32)
+                    .map_err(diagnostic)?;
+                let length = plan.bytes().len() + usize::from(plan.success);
+                if length != 0 {
+                    if overlaps_metadata(args[0], length)? {
+                        return Err("FILE line output aliases FILE metadata".into());
+                    }
+                    guard(memory, args[0], length)?;
+                    memory.validate_write(args[0], length)?;
+                }
+                guard(memory, address, SLOT_SIZE)?;
+                memory.validate_write(address, SLOT_SIZE)?;
+                if plan.errno.is_some() {
+                    errno_guard(memory)?;
+                }
+                stream
+                    .commit_line(&kernel.descriptors, &plan)
+                    .map_err(diagnostic)?;
+                if !plan.bytes().is_empty() {
+                    memory.write(args[0], plan.bytes())?;
+                }
+                if plan.success {
+                    memory.store(args[0] + plan.bytes().len() as u64, 0, 1)?;
+                }
+                if let Some(error) = plan.errno {
+                    memory.store(errno_address, error as u64, 4)?;
+                }
+                update = true;
+                if plan.success { args[0] } else { 0 }
+            }
             Operation::Write => {
                 let preparation = stream
                     .write_preparation(args[1], args[2])
@@ -654,10 +815,7 @@ impl Store {
                     .read_plan(&kernel.descriptors, args[1], args[2])
                     .map_err(diagnostic)?;
                 if !plan.bytes().is_empty() {
-                    let end = args[0]
-                        .checked_add(plan.bytes().len() as u64)
-                        .ok_or("FILE read output overflow")?;
-                    if args[0] < BASE + ARENA_SIZE as u64 && BASE < end {
+                    if overlaps_metadata(args[0], plan.bytes().len())? {
                         return Err("FILE read output aliases FILE arena".into());
                     }
                     guard(memory, args[0], plan.bytes().len())?;
@@ -741,6 +899,224 @@ impl Store {
 mod store_tests {
     use super::*;
     use crate::{guest_memory::Memory, kernel::Kernel};
+    #[test]
+    fn line_boundaries_orientation_and_sticky_state() {
+        let mut kernel = Kernel::new(4096, 0x2000).unwrap();
+        kernel
+            .files
+            .register(b"/input", b"a\0b\ncd".to_vec())
+            .unwrap();
+        let token = kernel
+            .descriptors
+            .open_file(&kernel.files, b"/input")
+            .unwrap();
+        let mut stream = Stream::new(token).unwrap();
+        let bad = stream.line_plan(&kernel.descriptors, -1).unwrap();
+        assert_eq!(bad.errno, Some(22));
+        assert!(!bad.success);
+        stream.commit_line(&kernel.descriptors, &bad).unwrap();
+        assert!(stream.error().unwrap());
+        assert_eq!(
+            stream.metadata(BASE).unwrap()[172..176],
+            (-1i32).to_le_bytes()
+        );
+        let first = stream.line_plan(&kernel.descriptors, 20).unwrap();
+        assert_eq!(first.bytes(), b"a\0b\n");
+        stream.commit_line(&kernel.descriptors, &first).unwrap();
+        assert!(stream.error().unwrap());
+        assert!(!stream.eof().unwrap());
+        let exact = stream.line_plan(&kernel.descriptors, 3).unwrap();
+        assert_eq!(exact.bytes(), b"cd");
+        stream.commit_line(&kernel.descriptors, &exact).unwrap();
+        assert!(!stream.eof().unwrap());
+        let eof = stream.line_plan(&kernel.descriptors, 3).unwrap();
+        assert!(!eof.success);
+        stream.commit_line(&kernel.descriptors, &eof).unwrap();
+        assert!(stream.eof().unwrap());
+        let empty = stream.line_plan(&kernel.descriptors, 1).unwrap();
+        assert!(empty.success);
+        stream.commit_line(&kernel.descriptors, &empty).unwrap();
+        assert!(stream.eof().unwrap());
+        stream.seek(&mut kernel.descriptors, 4, 0).unwrap();
+        let partial = stream.line_plan(&kernel.descriptors, 20).unwrap();
+        assert_eq!(partial.bytes(), b"cd");
+        stream.commit_line(&kernel.descriptors, &partial).unwrap();
+        assert!(stream.eof().unwrap());
+        assert!(stream.commit_line(&kernel.descriptors, &partial).is_err());
+        stream.clearerr().unwrap();
+        assert!(!stream.eof().unwrap());
+        assert!(!stream.error().unwrap());
+    }
+    #[test]
+    fn line_one_does_not_read_writeonly_or_retired_descriptor() {
+        let mut kernel = Kernel::new(4096, 0x2000).unwrap();
+        kernel
+            .files
+            .register_writable(b"/input", Vec::new())
+            .unwrap();
+        let token = kernel
+            .descriptors
+            .open_file_options(
+                &mut kernel.files,
+                b"/input",
+                OpenOptions {
+                    read: false,
+                    write: true,
+                    ..OpenOptions::read_only()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let mut stream = Stream::with_mode(token.clone(), Mode::parse(b"w").unwrap()).unwrap();
+        assert_eq!(kernel.descriptors.close_file(&token), 0);
+        let one = stream.line_plan(&kernel.descriptors, 1).unwrap();
+        assert!(one.success);
+        assert_eq!(one.errno, None);
+        stream.commit_line(&kernel.descriptors, &one).unwrap();
+        assert!(!stream.error().unwrap());
+        let read = stream.line_plan(&kernel.descriptors, 2).unwrap();
+        assert_eq!(read.errno, Some(9));
+        stream.commit_line(&kernel.descriptors, &read).unwrap();
+        assert!(stream.error().unwrap());
+    }
+    #[test]
+    fn stdin_lines_guard_cursor_metadata_and_high_pointer_result() {
+        const OUTPUT: u64 = 0x1_0000_1000;
+        let mut kernel = Kernel::new(4096, 0x2000).unwrap();
+        kernel
+            .files
+            .register(b"/input", b"hello\nlast".to_vec())
+            .unwrap();
+        let mut store = Store::default();
+        let mut metadata = store.configure_stdin(&mut kernel, b"/input").unwrap();
+        assert!(store.configure_stdin(&mut kernel, b"/input").is_err());
+        let original = metadata;
+        let mut output = [0xcc; 32];
+        let mut errno = 77u32.to_le_bytes();
+        let mut memory = Memory::default();
+        memory
+            .add(STDIN_FILE_ADDR, &mut metadata, true, false)
+            .unwrap();
+        memory.add(OUTPUT, &mut output, true, false).unwrap();
+        memory.add(0x2000, &mut errno, true, false).unwrap();
+        for rejected in [OUTPUT, STDIN_FILE_ADDR] {
+            assert!(
+                store
+                    .call(
+                        &mut kernel,
+                        &mut memory,
+                        Operation::ReadLine,
+                        [OUTPUT, 32, STDIN_FILE_ADDR, 0],
+                        |_, address, _| {
+                            if address == rejected {
+                                Err("protected frame".into())
+                            } else {
+                                Ok(())
+                            }
+                        }
+                    )
+                    .is_err()
+            );
+            assert_eq!(kernel.descriptors.seek(0, 0, 1), Ok(0));
+            assert_eq!(memory.read(STDIN_FILE_ADDR, SLOT_SIZE).unwrap(), original);
+            assert_eq!(memory.read(OUTPUT, 32).unwrap(), &[0xcc; 32]);
+        }
+        assert!(
+            store
+                .call(
+                    &mut kernel,
+                    &mut memory,
+                    Operation::ReadLine,
+                    [STDIN_FILE_ADDR, 32, STDIN_FILE_ADDR, 0],
+                    |_, _, _| Ok(())
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .call(
+                    &mut kernel,
+                    &mut memory,
+                    Operation::ReadLine,
+                    [OUTPUT, 32, STDIN_FILE_ADDR, 0],
+                    |_, _, _| Ok(())
+                )
+                .unwrap(),
+            OUTPUT
+        );
+        assert_eq!(memory.read(OUTPUT, 7).unwrap(), b"hello\n\0");
+        assert_eq!(memory.load(0x2000, 4).unwrap(), 77);
+        assert_eq!(kernel.descriptors.seek(0, 0, 1), Ok(6));
+        assert_eq!(
+            store
+                .call(
+                    &mut kernel,
+                    &mut memory,
+                    Operation::ReadLine,
+                    [OUTPUT, 32, STDIN_FILE_ADDR, 0],
+                    |_, _, _| Ok(())
+                )
+                .unwrap(),
+            OUTPUT
+        );
+        assert_eq!(memory.read(OUTPUT, 5).unwrap(), b"last\0");
+        memory.store(OUTPUT, 0xcc, 1).unwrap();
+        assert_eq!(
+            store
+                .call(
+                    &mut kernel,
+                    &mut memory,
+                    Operation::ReadLine,
+                    [OUTPUT, 32, STDIN_FILE_ADDR, 0],
+                    |_, _, _| Ok(())
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(memory.load(OUTPUT, 1).unwrap(), 0xcc);
+        assert_eq!(
+            store
+                .call(
+                    &mut kernel,
+                    &mut memory,
+                    Operation::ReadLine,
+                    [OUTPUT, 0x1_0000_0001, STDIN_FILE_ADDR, 0],
+                    |_, _, _| Ok(())
+                )
+                .unwrap(),
+            OUTPUT
+        );
+        assert_eq!(memory.load(OUTPUT, 1).unwrap(), 0);
+        assert_eq!(
+            store
+                .call(
+                    &mut kernel,
+                    &mut memory,
+                    Operation::ReadLine,
+                    [u64::MAX, 0x8000_0000, STDIN_FILE_ADDR, 0],
+                    |_, _, _| Ok(())
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(memory.load(0x2000, 4).unwrap(), 22);
+        assert_eq!(memory.load(STDIN_FILE_ADDR + 16, 2).unwrap() & 0x60, 0x60);
+        assert_eq!(
+            store
+                .call(
+                    &mut kernel,
+                    &mut memory,
+                    Operation::Fileno,
+                    [STDIN_FILE_ADDR, 0, 0, 0],
+                    |_, _, _| Ok(())
+                )
+                .unwrap(),
+            0
+        );
+        store
+            .flush(&kernel.descriptors, &memory, STDIN_FILE_ADDR)
+            .unwrap();
+    }
     #[test]
     fn reuse_slots_and_live_limit() {
         let mut k = Kernel::new(4096, 0x2000).unwrap();
