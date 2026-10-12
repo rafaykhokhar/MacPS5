@@ -421,6 +421,10 @@ pub enum Service {
     Sigaddset,
     ThreadSigmask,
     ThreadSetCancelType,
+    ThreadGetschedparam,
+    ThreadSetschedparam,
+    SchedPriorityMin,
+    SchedPriorityMax,
     ThreadJoin,
     ThreadDetach,
     MutexAttrInit,
@@ -465,6 +469,10 @@ impl Service {
             | Self::Sigaddset
             | Self::ThreadSigmask
             | Self::ThreadSetCancelType
+            | Self::ThreadGetschedparam
+            | Self::ThreadSetschedparam
+            | Self::SchedPriorityMin
+            | Self::SchedPriorityMax
             | Self::ThreadJoin
             | Self::ThreadDetach
             | Self::MutexAttrInit
@@ -2392,6 +2400,60 @@ impl NativeExecutor {
                     }
                     let value = if matches!(service, Service::ThreadSelf) {
                         guest_thread
+                    } else if matches!(
+                        service,
+                        Service::SchedPriorityMin | Service::SchedPriorityMax
+                    ) {
+                        match crate::guest_sched::priority_limit(
+                            cpu.registers[7] as u32 as i32,
+                            matches!(service, Service::SchedPriorityMax),
+                        ) {
+                            Ok(value) => value as u64,
+                            Err(error) => {
+                                let errno = self
+                                    .kernel
+                                    .as_ref()
+                                    .ok_or("Missing scheduling errno context")?
+                                    .errno_address();
+                                validate_net_output(&memory, errno, 4, sp, ret)?;
+                                memory.store(errno, error as u64, 4)?;
+                                u32::MAX as u64
+                            }
+                        }
+                    } else if matches!(
+                        service,
+                        Service::ThreadGetschedparam | Service::ThreadSetschedparam
+                    ) {
+                        // Caller identity is the retained guest continuation; RDI names
+                        // the queried target, which can be a different live guest thread.
+                        self.tls.scheduling(guest_thread)?;
+                        let target = cpu.registers[7];
+                        if matches!(service, Service::ThreadGetschedparam) {
+                            let policy = cpu.registers[6];
+                            let parameter = cpu.registers[2];
+                            if policy != 0
+                                && parameter != 0
+                                && crate::guest_sched::target_error(&self.tls, target).is_none()
+                            {
+                                validate_net_output(&memory, policy, 4, sp, ret)?;
+                                validate_net_output(&memory, parameter, 4, sp, ret)?;
+                            }
+                            crate::guest_sched::get(
+                                &self.tls,
+                                &mut memory,
+                                target,
+                                policy,
+                                parameter,
+                            )? as u32 as u64
+                        } else {
+                            crate::guest_sched::set(
+                                &mut self.tls,
+                                &memory,
+                                target,
+                                cpu.registers[6] as u32 as i32,
+                                cpu.registers[2],
+                            )? as u32 as u64
+                        }
                     } else if matches!(service, Service::ThreadSetCancelType) {
                         let kind = cpu.registers[7] as u32 as i32;
                         let previous = cpu.registers[6];

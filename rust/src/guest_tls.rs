@@ -23,6 +23,7 @@ struct Thread {
     signal_mask: [u8; crate::guest_signal::SIZE],
     cancel_type: i32,
     cancel_enabled: bool,
+    scheduling: (i32, i32),
 }
 #[derive(Debug)]
 pub struct GuestTls {
@@ -61,6 +62,9 @@ impl GuestTls {
             signal_mask: [0; crate::guest_signal::SIZE],
             cancel_type: 0,
             cancel_enabled: true,
+            // FreeBSD11.4 thr_init.c _pthread_attr_default: OTHER, prio0.
+            // This is the prototype's initial policy, not a console measurement.
+            scheduling: (2, 0),
         });
         self.last_thread_id = id;
         Ok(())
@@ -70,11 +74,29 @@ impl GuestTls {
     /// td_startcopy..td_endcopy, containing td_sigmask in sys/sys/proc.h.
     pub fn register_thread_inheriting(&mut self, id: u64, parent: u64) -> Result<()> {
         let mask = self.signal_mask(parent)?;
+        let scheduling = self.scheduling(parent)?;
         self.register_thread(id)?;
+        let child = self.threads.last_mut().expect("Just registered");
+        child.signal_mask = mask;
+        // Default PTHREAD_INHERIT_SCHED, FreeBSD11.4 thr_create.c.
+        // Explicit scheduling attributes remain unsupported.
+        child.scheduling = scheduling;
+        Ok(())
+    }
+    pub fn scheduling(&self, id: u64) -> Result<(i32, i32)> {
         self.threads
-            .last_mut()
-            .expect("Just registered")
-            .signal_mask = mask;
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.scheduling)
+            .ok_or_else(|| "Unregistered guest scheduling thread".into())
+    }
+    pub(crate) fn replace_scheduling(&mut self, id: u64, policy: i32, priority: i32) -> Result<()> {
+        let thread = self
+            .threads
+            .iter_mut()
+            .find(|t| t.id == id)
+            .ok_or("Unregistered guest scheduling thread")?;
+        thread.scheduling = (policy, priority);
         Ok(())
     }
     pub fn signal_mask(&self, id: u64) -> Result<[u8; crate::guest_signal::SIZE]> {
@@ -269,6 +291,24 @@ impl GuestTls {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scheduling_inheritance_is_owned_and_retired() {
+        let mut tls = GuestTls::default();
+        tls.register_thread(1).unwrap();
+        assert_eq!(tls.scheduling(1).unwrap(), (2, 0));
+        tls.replace_scheduling(1, 2, 17).unwrap();
+        tls.register_thread_inheriting(2, 1).unwrap();
+        assert_eq!(tls.scheduling(2).unwrap(), (2, 17));
+        tls.replace_scheduling(2, 2, 23).unwrap();
+        assert_eq!(tls.scheduling(1).unwrap(), (2, 17));
+        tls.retire_thread(2).unwrap();
+        assert!(tls.scheduling(2).is_err());
+        assert!(tls.replace_scheduling(2, 2, 0).is_err());
+        assert!(tls.register_thread_inheriting(3, 2).is_err());
+        assert!(!tls.contains_thread(3));
+        tls.register_thread(3).unwrap();
+        assert_eq!(tls.scheduling(3).unwrap(), (2, 0));
+    }
     #[test]
     fn cancellation_configuration_atomic_and_not_inherited() {
         let mut tls = GuestTls::default();
