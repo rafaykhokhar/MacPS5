@@ -1,0 +1,366 @@
+//! Registered-file contents through actual pinned Doom/SDL stdio wrappers.
+use native_ps5::{
+    guest_memory::DataRegion,
+    kernel::Kernel,
+    loader::Image,
+    module_executor::{Execution, NativeExecutor, Service, memory_fixture},
+    stdio_file::Operation,
+};
+use std::{collections::BTreeSet, path::Path};
+const BIAS: u64 = 0x10000000;
+const DATA: u64 = 0x1_31000000;
+const ARGS: u64 = 0x32000000;
+const ERRNO: u64 = 0x33000000;
+fn invoke(
+    n: &mut NativeExecutor,
+    a: &mut Image,
+    r: &mut Image,
+    args: [u64; 5],
+    data: &mut [u8],
+    writable: bool,
+    errno: &mut [u8],
+) -> Result<u64, String> {
+    let mut descriptor: Vec<u8> = args.into_iter().flat_map(u64::to_le_bytes).collect();
+    match n.run_worker_with_data(
+        a,
+        0x100100,
+        ARGS,
+        &mut [r],
+        &mut [
+            DataRegion {
+                address: ARGS,
+                bytes: &mut descriptor,
+                writable: false,
+            },
+            DataRegion {
+                address: DATA,
+                bytes: data,
+                writable,
+            },
+            DataRegion {
+                address: ERRNO,
+                bytes: errno,
+                writable: true,
+            },
+        ],
+    )? {
+        Execution::WorkerReturned(value) => Ok(value),
+        _ => Err("FILE call did not return".into()),
+    }
+}
+pub fn verify(file: &[u8], archive: &Path, directory: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+    let mut fixture = memory_fixture();
+    let code = [
+        0x48, 0x8b, 0x47, 32, 0x48, 0x8b, 0x4f, 24, 0x48, 0x8b, 0x57, 16, 0x48, 0x8b, 0x77, 8,
+        0x48, 0x8b, 0x3f, 0xff, 0xd0, 0xc3,
+    ];
+    fixture[0x100..0x100 + code.len()].copy_from_slice(&code);
+    let mut n = NativeExecutor::new(0x20000000, 65536, 100000, 100000)?;
+    n.kernel = Some(Kernel::new(4096, ERRNO)?);
+    n.kernel
+        .as_mut()
+        .unwrap()
+        .files
+        .register(b"/app0/data", b"abcde".to_vec())?;
+    let mut real = Image::load(file, BIAS, 64 * 1024 * 1024)?;
+    let mut adapter = Image::load(&fixture, 0x100000, 65536)?;
+    for (index, (op, got)) in [
+        (Operation::Open, Some(0x26f928)),
+        (Operation::Read, Some(0x26f968)),
+        (Operation::Seek, Some(0x26f958)),
+        (Operation::Tell, Some(0x26f960)),
+        (Operation::Close, Some(0x26f950)),
+        (Operation::Fileno, Some(0x26f938)),
+        (Operation::Eof, None),
+        (Operation::Error, Some(0x26f970)),
+        (Operation::Clearerr, None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let target = 0x790000 + 16 * index as u64;
+        n.register_service(target, Service::File(op))?;
+        if let Some(got) = got {
+            let address = BIAS + got;
+            let s = real
+                .segments
+                .iter_mut()
+                .find(|s| address >= s.address && address + 8 <= s.address + s.bytes.len() as u64)
+                .ok_or("Missing FILE GOT")?;
+            let at = (address - s.address) as usize;
+            s.bytes[at..at + 8].copy_from_slice(&target.to_le_bytes());
+        }
+    }
+    unsafe {
+        n.compile_image(
+            file,
+            BIAS,
+            BTreeSet::from([0x118470, 0x1184d0, 0x318f0, 0x31950]),
+            20000,
+            archive,
+            &directory.join("real"),
+        )?;
+        n.compile_image(
+            &fixture,
+            0x100000,
+            BTreeSet::from([0x100]),
+            1000,
+            archive,
+            &directory.join("adapter"),
+        )?;
+    }
+    let mut data = [0u8; 256];
+    data[..11].copy_from_slice(b"/app0/data\0");
+    data[16..19].copy_from_slice(b"rb\0");
+    let mut errno = 77u32.to_le_bytes();
+    let stream = invoke(
+        &mut n,
+        &mut adapter,
+        &mut real,
+        [DATA, DATA + 16, 0, 0, BIAS + 0x118470],
+        &mut data,
+        true,
+        &mut errno,
+    )?;
+    assert!(stream > u32::MAX as u64);
+    assert_eq!(errno, 77u32.to_le_bytes());
+    data[128 + 56..128 + 64].copy_from_slice(&stream.to_le_bytes());
+    assert_eq!(
+        invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            [DATA + 128, DATA + 32, 2, 3, BIAS + 0x31950],
+            &mut data,
+            true,
+            &mut errno
+        )?,
+        2
+    );
+    assert_eq!(&data[32..37], b"abcde");
+    assert_eq!(
+        invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            [stream, 0, 0, 0, 0x790060],
+            &mut data,
+            true,
+            &mut errno
+        )?,
+        1
+    );
+    assert_eq!(
+        invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            [DATA + 128, 0, 0, 0, BIAS + 0x318f0],
+            &mut data,
+            true,
+            &mut errno
+        )?,
+        0
+    );
+    // Bad destination cannot consume bytes or modify FILE metadata.
+    let before = data;
+    assert!(
+        invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            [DATA + 254, 1, 5, stream, 0x790010],
+            &mut data,
+            true,
+            &mut errno
+        )
+        .is_err()
+    );
+    assert_eq!(data, before);
+    assert_eq!(
+        invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            [stream, 0, 0, 0, 0x790030],
+            &mut data,
+            true,
+            &mut errno
+        )?,
+        0
+    );
+    assert!(
+        invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            [DATA + 32, 1, 2, stream, 0x790010],
+            &mut data,
+            false,
+            &mut errno
+        )
+        .is_err()
+    );
+    assert_eq!(
+        invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            [DATA + 32, 1, 2, stream, 0x790010],
+            &mut data,
+            true,
+            &mut errno
+        )?,
+        2
+    );
+    assert_eq!(&data[32..34], b"ab");
+    assert_eq!(
+        invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            [DATA + 32, u64::MAX, 2, stream, 0x790010],
+            &mut data,
+            true,
+            &mut errno
+        )?,
+        0
+    );
+    assert_eq!(errno, 22u32.to_le_bytes());
+    assert_eq!(
+        invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            [stream, 0, 0, 0, 0x790070],
+            &mut data,
+            true,
+            &mut errno
+        )?,
+        1
+    );
+    invoke(
+        &mut n,
+        &mut adapter,
+        &mut real,
+        [stream, 0, 0, 0, 0x790080],
+        &mut data,
+        true,
+        &mut errno,
+    )?;
+    assert_eq!(
+        invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            [stream, 0, 0, 0, 0x790070],
+            &mut data,
+            true,
+            &mut errno
+        )?,
+        0
+    );
+    let fd = invoke(
+        &mut n,
+        &mut adapter,
+        &mut real,
+        [stream, 0, 0, 0, 0x790050],
+        &mut data,
+        true,
+        &mut errno,
+    )?;
+    // A raw descriptor seek must be visible to the FILE cursor.
+    let token = n
+        .kernel
+        .as_ref()
+        .unwrap()
+        .descriptors
+        .file_token(fd)
+        .map_err(|e| e.to_string())?;
+    n.kernel
+        .as_mut()
+        .unwrap()
+        .descriptors
+        .seek_file(&token, 4, 0)
+        .map_err(|e| e.to_string())?;
+    assert_eq!(
+        invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            [stream, 0, 0, 0, 0x790030],
+            &mut data,
+            true,
+            &mut errno
+        )?,
+        4
+    );
+    assert_eq!(
+        invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            [stream, 0, 0, 0, 0x790040],
+            &mut data,
+            true,
+            &mut errno
+        )?,
+        0
+    );
+    assert!(
+        invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            [stream, 0, 0, 0, 0x790030],
+            &mut data,
+            true,
+            &mut errno
+        )
+        .is_err()
+    );
+    assert_eq!(
+        invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            [DATA, 0, 0, 0, BIAS + 0x1184d0],
+            &mut data,
+            true,
+            &mut errno
+        )?,
+        1
+    );
+    data[..11].copy_from_slice(b"/app0/nope\0");
+    assert_eq!(
+        invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            [DATA, DATA + 16, 0, 0, BIAS + 0x118470],
+            &mut data,
+            true,
+            &mut errno
+        )?,
+        0
+    );
+    assert_eq!(errno, 2u32.to_le_bytes());
+    data[16] = b'w';
+    assert!(
+        invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            [DATA, DATA + 16, 0, 0, BIAS + 0x118470],
+            &mut data,
+            true,
+            &mut errno
+        )
+        .is_err()
+    );
+    println!(
+        "PASS: actual M_fopen/M_FileExists and SDL stdio read/seek consume registered bytes, partial elements/EOF, shared descriptor cursor, errno/error/clearerr/close and atomic memory guards; writable modes unsupported."
+    );
+    Ok(())
+}

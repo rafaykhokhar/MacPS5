@@ -361,7 +361,7 @@ pub fn verify(file: &[u8], archive: &Path, directory: &Path) -> Result<(), Strin
     .unwrap_err()
     .contains("cursor aliases"));
     assert_eq!(f.va, va);
-    for format in [b"%f".as_slice(), b"%Lf", b"%ls", b"%2$d", b"%[a-a]"] {
+    for format in [b"%Lf".as_slice(), b"%ls", b"%2$d", b"%[a-a]"] {
         let mut f = Fixture::new(b"1", format, 0, &ptrs[..1]);
         let before = f.data.clone();
         assert!(invoke(
@@ -376,6 +376,81 @@ pub fn verify(file: &[u8], archive: &Path, directory: &Path) -> Result<(), Strin
         )
         .is_err());
         assert_eq!(f.data, before);
+    }
+    for rc in 0..4u32 {
+        let input = b"0.1 1e-60 1.0000000596046447753906250000000000000001";
+        let mut f = Fixture::new(input, b"%f %e %g%n", 40, &ptrs[..4]);
+        let cw = 0x037fu16 | ((rc as u16) << 10);
+        f.data[800..802].copy_from_slice(&cw.to_le_bytes());
+        f.data[804..808].copy_from_slice(&(0x1f81 | (rc << 13)).to_le_bytes());
+        assert_eq!(
+            invoke(
+                &mut n,
+                &mut adapter,
+                &mut real,
+                &mut f,
+                true,
+                true,
+                4,
+                0x100200
+            )?,
+            3
+        );
+        let inward = rc == 1 || rc == 3;
+        let first = if inward { 0x3dcc_ccccu32 } else { 0x3dcc_cccd };
+        let halfway = if inward { 0x3f80_0000u32 } else { 0x3f80_0001 };
+        assert_eq!(&f.data[256..260], &first.to_le_bytes());
+        assert_eq!(&f.data[272..276], &0u32.to_le_bytes());
+        assert_eq!(&f.data[288..292], &halfway.to_le_bytes());
+        assert_eq!(&f.data[304..308], &(input.len() as u32).to_le_bytes());
+        for start in [260, 276, 292, 308] {
+            assert_eq!(&f.data[start..start + 4], &[0xa5; 4]);
+        }
+        assert_eq!(&f.data[808..812], &(0x1fa1 | (rc << 13)).to_le_bytes());
+        assert_eq!(&f.data[812..814], &cw.to_le_bytes());
+        assert_eq!(f.errno, 34u32.to_le_bytes());
+        assert_eq!(&f.va[..4], &48u32.to_le_bytes());
+        assert_eq!(&f.va[8..16], &(STACK + 24).to_le_bytes());
+    }
+    // Mixed widths retain both target conversions and union their effects.
+    let mut f = Fixture::new(b"0x1p-149 0.1", b"%a %lf", 0, &ptrs[..2]);
+    assert_eq!(
+        invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            &mut f,
+            true,
+            true,
+            4,
+            0x100200
+        )?,
+        2
+    );
+    assert_eq!(&f.data[256..260], &1u32.to_le_bytes());
+    assert_eq!(&f.data[272..280], &0x3fb999999999999au64.to_le_bytes());
+    assert_eq!(&f.data[808..812], &0x1fa0u32.to_le_bytes());
+    assert_eq!(f.errno, 77u32.to_le_bytes());
+    // Precisely three output bytes and three errno bytes must reject before
+    // any output, va_list cursor, errno or architectural flag commit.
+    for (pointer, errno_len) in [(DATA + 1021, 4), (ptrs[0], 3)] {
+        let mut f = Fixture::new(b"1e-60", b"%f", 0, &[pointer]);
+        let before = f.data.clone();
+        let va = f.va;
+        assert!(invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            &mut f,
+            true,
+            true,
+            errno_len,
+            0x100200
+        )
+        .is_err());
+        assert_eq!(f.data, before);
+        assert_eq!(f.va, va);
+        assert_eq!(f.errno, 77u32.to_le_bytes());
     }
     for rc in 0..4u32 {
         let mut f = Fixture::new(b"0.1 1e-400", b"%lf %le%n", 40, &ptrs[..3]);
@@ -473,7 +548,7 @@ pub fn verify(file: &[u8], archive: &Path, directory: &Path) -> Result<(), Strin
         assert_eq!(f.errno, 77u32.to_le_bytes());
     }
     println!(
-        "PASS: actual SDL_vsscanf GP/overflow va_list, integer/narrowtext/scanset/count, binary64 floats with4RC/generalflags/errno, incomplete-exponent rollback, suppression withoutFP effects, cursor advancement, guardedoutputs/va/errno/returnframe and explicit binary32/wide/longdouble boundaries."
+        "PASS: actual SDL_vsscanf GP/overflow va_list, integer/narrowtext/scanset/count, binary32/binary64 floats with4RC/generalflags/errno and direct24bit rounding, mixed widths, incomplete-exponent rollback, suppression withoutFP effects, cursor advancement, guarded4/8byte outputs/va/errno/returnframe and explicit wide/longdouble boundaries."
     );
     Ok(())
 }

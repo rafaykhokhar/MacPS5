@@ -1,10 +1,54 @@
-//! Bounded, process-local descriptors for the selected payload's control pairs.
-//! These are modeled kernel-copy controls, not host sockets or network access.
+//! Bounded process-local descriptors for registered read-only files and control pairs.
+//! No host filesystem, sockets, or network access.
+//! File ABI sources: pinned SDK sys/syscall.h, sys/sysproto.h, sys/errno.h at
+//! 10b539de8f2b6773a9a78caa7576a97dbd99b29a; FreeBSD releng/11.4
+//! sys/kern/vfs_vnops.c::vn_seek and sys/kern/sys_generic.c::sys_read.
+//! https://raw.githubusercontent.com/freebsd/freebsd-src/releng/11.4/sys/kern/vfs_vnops.c
+//! https://raw.githubusercontent.com/freebsd/freebsd-src/releng/11.4/sys/kern/sys_generic.c
+//! Guarded copies are all-or-nothing; this does not model partial EFAULT copies.
 use crate::{Result, guest_memory::Memory};
 use std::{cell::Cell, rc::Rc};
 
 const LIMIT: usize = 256;
+/// Process-table and open-instance identity; fd reuse cannot revive this token.
+#[derive(Clone, Debug)]
+pub struct FileToken {
+    descriptor: u32,
+    identity: u64,
+    owner: Rc<()>,
+}
+impl FileToken {
+    pub fn descriptor(&self) -> u32 {
+        self.descriptor
+    }
+}
+pub struct FileReadPlan {
+    bytes: Vec<u8>,
+    token: FileToken,
+    position: u64,
+    revision: u64,
+}
+impl FileReadPlan {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DescriptorKind {
+    RegisteredFile,
+    Pipe,
+    Control,
+}
+struct OpenFile {
+    stat: [u8; crate::kernel::STAT_SIZE],
+    bytes: Rc<[u8]>,
+    identity: u64,
+    position: Cell<u64>,
+    revision: Cell<u64>,
+}
+
 enum Endpoint {
+    File(OpenFile),
     Control {
         target: Rc<Cell<u64>>,
         selector: bool,
@@ -21,15 +65,183 @@ struct Pipe {
 }
 pub struct Descriptors {
     endpoints: [Option<Endpoint>; LIMIT],
+    owner: Rc<()>,
+    next_file: u64,
 }
 impl Default for Descriptors {
     fn default() -> Self {
         Self {
             endpoints: std::array::from_fn(|_| None),
+            owner: Rc::new(()),
+            next_file: 1,
         }
     }
 }
 impl Descriptors {
+    pub fn open_file(
+        &mut self,
+        files: &crate::kernel::Files,
+        path: &[u8],
+    ) -> std::result::Result<FileToken, u32> {
+        let bytes = files.contents(path)?;
+        let stat = files.stat_record(path)?;
+        let index = self
+            .endpoints
+            .iter()
+            .position(Option::is_none)
+            .ok_or(24u32)?;
+        let identity = self.next_file;
+        let next = identity.checked_add(1).ok_or(24u32)?;
+        self.endpoints[index] = Some(Endpoint::File(OpenFile {
+            bytes,
+            stat,
+            identity,
+            position: Cell::new(0),
+            revision: Cell::new(0),
+        }));
+        self.next_file = next;
+        Ok(FileToken {
+            descriptor: index as u32 + 3,
+            identity,
+            owner: self.owner.clone(),
+        })
+    }
+    pub fn kind(&self, descriptor: u64) -> Option<DescriptorKind> {
+        Self::index(descriptor)
+            .and_then(|i| self.endpoints[i].as_ref())
+            .map(|endpoint| match endpoint {
+                Endpoint::File(_) => DescriptorKind::RegisteredFile,
+                Endpoint::Pipe { .. } => DescriptorKind::Pipe,
+                Endpoint::Control { .. } => DescriptorKind::Control,
+            })
+    }
+    pub fn stat_file(
+        &self,
+        token: &FileToken,
+    ) -> std::result::Result<[u8; crate::kernel::STAT_SIZE], u32> {
+        Ok(self.file(token)?.stat)
+    }
+    pub fn file_token(&self, descriptor: u64) -> std::result::Result<FileToken, u32> {
+        let Some(Endpoint::File(file)) =
+            Self::index(descriptor).and_then(|i| self.endpoints[i].as_ref())
+        else {
+            return Err(9);
+        };
+        Ok(FileToken {
+            descriptor: descriptor as u32,
+            identity: file.identity,
+            owner: self.owner.clone(),
+        })
+    }
+    fn file(&self, token: &FileToken) -> std::result::Result<&OpenFile, u32> {
+        if !Rc::ptr_eq(&self.owner, &token.owner) {
+            return Err(9);
+        }
+        match Self::index(token.descriptor.into()).and_then(|i| self.endpoints[i].as_ref()) {
+            Some(Endpoint::File(file)) if file.identity == token.identity => Ok(file),
+            _ => Err(9),
+        }
+    }
+    pub fn file_position(&self, token: &FileToken) -> std::result::Result<u64, u32> {
+        Ok(self.file(token)?.position.get())
+    }
+    pub fn file_len(&self, token: &FileToken) -> std::result::Result<u64, u32> {
+        Ok(self.file(token)?.bytes.len() as u64)
+    }
+    pub fn preview_read(
+        &self,
+        token: &FileToken,
+        count: u64,
+    ) -> std::result::Result<FileReadPlan, u32> {
+        let file = self.file(token)?;
+        let position = file.position.get();
+        let amount = count.min((file.bytes.len() as u64).saturating_sub(position)) as usize;
+        let bytes = if amount == 0 {
+            Vec::new()
+        } else {
+            file.bytes[position as usize..position as usize + amount].to_vec()
+        };
+        Ok(FileReadPlan {
+            bytes,
+            token: token.clone(),
+            position,
+            revision: file.revision.get(),
+        })
+    }
+    /// Call only after all output guards. One-shot even for an EOF/zero-byte read.
+    pub fn commit_read(&self, plan: &FileReadPlan) -> std::result::Result<(), u32> {
+        let file = self.file(&plan.token)?;
+        if file.position.get() != plan.position || file.revision.get() != plan.revision {
+            return Err(9);
+        }
+        let next = plan.revision.checked_add(1).ok_or(22u32)?;
+        file.position.set(plan.position + plan.bytes.len() as u64);
+        file.revision.set(next);
+        Ok(())
+    }
+    pub fn read_file(
+        &self,
+        token: &FileToken,
+        memory: &mut Memory<'_>,
+        address: u64,
+        count: u64,
+    ) -> std::result::Result<u64, u32> {
+        let plan = self.preview_read(token, count)?;
+        if !plan.bytes.is_empty() {
+            memory
+                .validate_write(address, plan.bytes.len())
+                .map_err(|_| 14u32)?;
+        }
+        // No fallible guest-memory operation remains after this validation.
+        self.commit_read(&plan)?;
+        if !plan.bytes.is_empty() {
+            memory
+                .write(address, &plan.bytes)
+                .expect("Prevalidated file read");
+        }
+        Ok(plan.bytes.len() as u64)
+    }
+    /// LP64 off_t, SEEK_SET/CUR/END. Seeking beyond EOF is legal; negative offsets are not.
+    pub fn seek_file(
+        &self,
+        token: &FileToken,
+        offset: i64,
+        whence: i32,
+    ) -> std::result::Result<u64, u32> {
+        let file = self.file(token)?;
+        let base = match whence {
+            0 => 0,
+            1 => file.position.get(),
+            2 => file.bytes.len() as u64,
+            _ => return Err(22),
+        };
+        let position = i128::from(base) + i128::from(offset);
+        if position > i128::from(i64::MAX) {
+            return Err(84);
+        }
+        if position < 0 {
+            return Err(22);
+        }
+        let revision = file.revision.get().checked_add(1).ok_or(22u32)?;
+        file.position.set(position as u64);
+        file.revision.set(revision);
+        Ok(position as u64)
+    }
+    pub fn close_file(&mut self, token: &FileToken) -> u32 {
+        if self.file(token).is_err() {
+            return 9;
+        }
+        self.close(token.descriptor.into())
+    }
+    pub fn seek(&self, descriptor: u64, offset: i64, whence: i32) -> std::result::Result<u64, u32> {
+        match Self::index(descriptor).and_then(|i| self.endpoints[i].as_ref()) {
+            None => Err(9),
+            Some(Endpoint::File(_)) => {
+                self.seek_file(&self.file_token(descriptor)?, offset, whence)
+            }
+            Some(_) => Err(29),
+        }
+    }
     pub fn packet_control_pair(&mut self) -> Result<(u32, u32)> {
         let mut free = self
             .endpoints
@@ -146,6 +358,15 @@ impl Descriptors {
         count: u64,
         write: bool,
     ) -> std::result::Result<u64, u32> {
+        if let Ok(token) = self.file_token(descriptor) {
+            if write {
+                return Err(9);
+            }
+            if count > i64::MAX as u64 {
+                return Err(22);
+            }
+            return self.read_file(&token, user, address, count);
+        }
         let Some(Endpoint::Pipe { state, writer }) =
             Self::index(descriptor).and_then(|i| self.endpoints[i].as_ref())
         else {
@@ -232,6 +453,101 @@ impl Descriptors {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn files_share_cursor_guard_copies_and_reject_stale_tokens() {
+        let mut files = crate::kernel::Files::default();
+        files.register(b"/file", b"abcdef".to_vec()).unwrap();
+        let mut d = Descriptors::default();
+        let token = d.open_file(&files, b"/file").unwrap();
+        let independent = d.open_file(&files, b"/file").unwrap();
+        assert_eq!(token.descriptor(), 3);
+        let mut bytes = [0xa5; 8];
+        let mut readonly = [0xa5; 8];
+        let mut user = Memory::default();
+        user.add(0x1_0000_0001, &mut bytes, true, false).unwrap();
+        user.add(0x2000, &mut readonly, false, false).unwrap();
+        for address in [0x2000, 0x1_0000_0008, u64::MAX] {
+            assert_eq!(d.read_file(&token, &mut user, address, 3), Err(14));
+            assert_eq!(d.file_position(&token), Ok(0));
+        }
+        assert_eq!(d.read_file(&token, &mut user, u64::MAX, 0), Ok(0));
+        let pending = d.preview_read(&token, 2).unwrap();
+        assert_eq!(pending.bytes, b"ab");
+        assert_eq!(d.read_file(&token, &mut user, 0x1_0000_0001, 3), Ok(3));
+        assert_eq!(d.commit_read(&pending), Err(9));
+        assert_eq!(d.file_position(&independent), Ok(0));
+        let alias = d.file_token(3).unwrap();
+        let plan = d.preview_read(&alias, u64::MAX).unwrap();
+        assert_eq!(plan.bytes, b"def");
+        d.commit_read(&plan).unwrap();
+        assert_eq!(d.commit_read(&plan), Err(9));
+        assert_eq!(d.file_position(&token), Ok(6));
+        assert_eq!(d.read_file(&token, &mut user, u64::MAX, u64::MAX), Ok(0));
+        assert_eq!(d.seek_file(&token, 7, 0), Ok(7));
+        assert_eq!(d.seek_file(&token, -1, 2), Ok(5));
+        assert_eq!(d.seek_file(&token, -6, 1), Err(22));
+        assert_eq!(d.seek_file(&token, i64::MAX, 1), Err(84));
+        assert_eq!(d.seek_file(&token, 0, 7), Err(22));
+        assert_eq!(d.file_position(&token), Ok(5));
+        let pending = d.preview_read(&token, 1).unwrap();
+        d.seek_file(&token, 5, 0).unwrap();
+        assert_eq!(d.commit_read(&pending), Err(9));
+        let other = Descriptors::default();
+        assert_eq!(other.file_position(&token), Err(9));
+        assert_eq!(d.close_file(&token), 0);
+        let replacement = d.open_file(&files, b"/file").unwrap();
+        assert_eq!(replacement.descriptor(), token.descriptor());
+        assert_eq!(d.close_file(&token), 9);
+        assert_eq!(d.file_position(&replacement), Ok(0));
+        assert_eq!(d.file_position(&token), Err(9));
+        let (control, _) = d.packet_control_pair().unwrap();
+        assert_eq!(d.seek(control.into(), 0, 0), Err(29));
+        assert!(d.file_token(control.into()).is_err());
+        let mut kernel = Memory::default();
+        assert_eq!(
+            d.transfer(
+                &mut user,
+                &mut kernel,
+                replacement.descriptor().into(),
+                0x2000,
+                1,
+                true
+            ),
+            Err(9)
+        );
+        assert_eq!(
+            d.transfer(
+                &mut user,
+                &mut kernel,
+                replacement.descriptor().into(),
+                0x2000,
+                u64::MAX,
+                false
+            ),
+            Err(22)
+        );
+        assert_eq!(
+            user.read(0x1_0000_0001, 8).unwrap(),
+            &[b'a', b'b', b'c', 0xa5, 0xa5, 0xa5, 0xa5, 0xa5]
+        );
+        assert_eq!(user.read(0x2000, 8).unwrap(), &[0xa5; 8]);
+    }
+    #[test]
+    fn file_descriptor_capacity_is_atomic() {
+        let mut files = crate::kernel::Files::default();
+        files.register(b"/file", vec![7]).unwrap();
+        let mut d = Descriptors::default();
+        let token = d.open_file(&files, b"/file").unwrap();
+        let plan = d.preview_read(&token, 1).unwrap();
+        assert_eq!(plan.bytes(), &[7]);
+        assert_eq!(d.file_position(&token), Ok(0));
+        for _ in 1..LIMIT {
+            d.open_file(&files, b"/file").unwrap();
+        }
+        assert!(matches!(d.open_file(&files, b"/file"), Err(24)));
+        assert!(matches!(d.open_file(&files, b"/absent"), Err(2)));
+        assert_eq!(files.content_bytes(), 1);
+    }
     #[test]
     fn kernel_ring_wraparound_failures_and_close() {
         let mut descriptors = Descriptors::default();

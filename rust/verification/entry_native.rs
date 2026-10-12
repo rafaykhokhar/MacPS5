@@ -4,6 +4,7 @@ use native_ps5::{
     loader::Image,
     module_executor::{Execution, NativeExecutor, Service},
     modules::Arguments,
+    stdio_file::Operation as FileOperation,
 };
 use std::{collections::BTreeSet, path::Path};
 mod audio_native;
@@ -25,6 +26,9 @@ mod scheduler_native;
 mod sprx_symbol_native;
 mod stat_native;
 mod stdio_native;
+mod stdio_file_native;
+mod file_syscalls_native;
+mod fstat_native;
 mod system_service_native;
 mod threadattr_native;
 mod thread_services_native;
@@ -69,6 +73,9 @@ fn main() -> Result<(), String> {
         std::env::var_os("NATIVE_PS5_AOT_DIRECTORY").ok_or("Missing compiler output directory")?;
     stat_native::verify(Path::new(&archive), Path::new(&directory))?;
     stdio_native::verify(Path::new(&archive), Path::new(&directory))?;
+    file_syscalls_native::verify(Path::new(&archive), Path::new(&directory))?;
+    fstat_native::verify(Path::new(&archive), Path::new(&directory))?;
+    stdio_file_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     system_service_native::verify(Path::new(&archive), Path::new(&directory))?;
     tls_native::verify(Path::new(&archive), Path::new(&directory))?;
     threadattr_native::verify(Path::new(&archive), Path::new(&directory))?;
@@ -399,6 +406,18 @@ fn main() -> Result<(), String> {
         ("gettimeofday", Service::Gettimeofday),
         ("nanosleep", Service::Nanosleep),
         ("_Exit", Service::ImmediateExit),
+        ("fopen", Service::File(FileOperation::Open)),
+        ("fread", Service::File(FileOperation::Read)),
+        ("fseek", Service::File(FileOperation::Seek)),
+        ("ftell", Service::File(FileOperation::Tell)),
+        ("fclose", Service::File(FileOperation::Close)),
+        ("fileno", Service::File(FileOperation::Fileno)),
+        ("feof", Service::File(FileOperation::Eof)),
+        ("ferror", Service::File(FileOperation::Error)),
+        ("clearerr", Service::File(FileOperation::Clearerr)),
+        ("fseeko", Service::File(FileOperation::Seek)),
+        ("ftello", Service::File(FileOperation::Tell)),
+        ("fstat", Service::Fstat),
     ]
     .into_iter()
     .enumerate()
@@ -1281,6 +1300,16 @@ fn main() -> Result<(), String> {
                 (616, 0x730540),
                 (632, 0x730550),
                 (640, 0x730560),
+                (648, 0x730570),
+                (656, 0x30003000),
+                (664, 0x7305c0),
+                (672, 0x730620),
+                (680, 0x720010),
+                (688, 0x7305b0),
+                (696, 0x730600),
+                (704, 0x730610),
+                (712, 0x730580),
+                (720, 0x7305e0),
             ] {
                 if locale_segment.bytes[locale_offset + delta..locale_offset + delta + 8]
                     != expected.to_le_bytes()
@@ -1307,13 +1336,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 92 libc exports: (92+1)*24=2232 symbol bytes (rounded2240)
-                // and 1+92*12=1105 NID bytes (rounded1120). Sleep and _Exit
-                // add48+32bytes to17616; retain the exact32KiB cap.
-                || native.bytes_allocated() != 17696
+                // 104 libc exports: (104+1)*24=2520 symbol bytes (rounded2528)
+                // and 1+104*12=1249 NID bytes (rounded1264). File services
+                // add288+144bytes to17696; retain the exact32KiB cap.
+                || native.bytes_allocated() != 18128
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'fopen'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'fwrite'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1323,7 +1352,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; nanosleep and _Exit imports bound; unresolved fopen causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; read-only file imports bound; unresolved fwrite causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1385,7 +1414,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved fopen triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved fwrite triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     Ok(())

@@ -205,9 +205,28 @@ impl Kernel {
     ) -> Result<(u64, bool)> {
         if !matches!(
             number,
-            3 | 4 | 6 | 73 | 105 | 188 | 326 | 477 | 601 | 602 | 616 | 649
+            3 | 4 | 5 | 6 | 73 | 105 | 188 | 189 | 326 | 477 | 478 | 601 | 602 | 616 | 649
         ) {
             return Err(format!("Unsupported Rust kernel syscall {number}"));
+        }
+        // This backend accepts only the audited O_RDONLY subset; other flags
+        // remain unsupported instead of silently losing create/write semantics.
+        if number == 5 && args[1] as u32 != 0 {
+            return Err("Registered file open flags outside O_RDONLY are unsupported".into());
+        }
+        if number == 478 && matches!(args[2] as u32, 3 | 4) {
+            return Err("Registered file SEEK_DATA/SEEK_HOLE are unsupported".into());
+        }
+        if number == 189
+            && matches!(
+                self.descriptors.kind(args[0] as u32 as u64),
+                Some(
+                    crate::descriptors::DescriptorKind::Pipe
+                        | crate::descriptors::DescriptorKind::Control
+                )
+            )
+        {
+            return Err("fstat for non-file descriptor endpoints is unsupported".into());
         }
         user.validate_write(self.errno_address, 4)?;
         let mut memory = Memory::default();
@@ -215,7 +234,30 @@ impl Kernel {
             memory.add(r.address, &mut r.bytes, r.writable, false)?;
         }
         let result = match number {
+            // Pinned SDK SYS_open=5, SYS_lseek=478; fd/flags/whence are int,
+            // off_t is signed64. No host syscall or implicit cwd resolution.
+            5 => guest_files::read_path(user, args[0]).and_then(|path| {
+                self.descriptors
+                    .open_file(&self.files, &path)
+                    .map(|token| u64::from(token.descriptor()))
+            }),
+            478 => {
+                self.descriptors
+                    .seek(args[0] as u32 as u64, args[1] as i64, args[2] as u32 as i32)
+            }
             188 => self.files.stat(user, args[0], args[1]),
+            // FreeBSD kern_fstat obtains descriptor metadata before sys_fstat copyout.
+            189 => self
+                .descriptors
+                .file_token(args[0] as u32 as u64)
+                .and_then(|token| self.descriptors.stat_file(&token))
+                .and_then(|record| {
+                    if args[1] == 0 {
+                        Err(14)
+                    } else {
+                        user.write(args[1], &record).map(|()| 0).map_err(|_| 14)
+                    }
+                }),
             326 => {
                 // SDK __rtld_find_file and ELF 0x4b9a: (output, capacity).
                 // A successful __getcwd syscall returns 0, unlike libc getcwd.
@@ -316,13 +358,20 @@ impl Kernel {
                     Err(3)
                 }
             }
-            3 | 4 => {
-                self.descriptors
-                    .transfer(user, &mut memory, args[0], args[1], args[2], number == 4)
-            }
+            // Explicit LP64 IOSIZE_MAX=SSIZE_MAX domain (FreeBSD permits an
+            // optional INT_MAX clamp). Check count before descriptor lookup.
+            3 | 4 if args[2] > i64::MAX as u64 => Err(22),
+            3 | 4 => self.descriptors.transfer(
+                user,
+                &mut memory,
+                args[0] as u32 as u64,
+                args[1],
+                args[2],
+                number == 4,
+            ),
             _ => {
                 let error = if number == 6 {
-                    self.descriptors.close(args[0])
+                    self.descriptors.close(args[0] as u32 as u64)
                 } else {
                     self.descriptors.set_socket_option(
                         user,
@@ -379,6 +428,170 @@ fn copy_sandbox_component(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn descriptor_stat_matches_path_stat_without_moving_cursor() {
+        let mut kernel = Kernel::new(4096, 0x1000).unwrap();
+        kernel.files.register(b"/file", vec![7; 513]).unwrap();
+        let token = kernel
+            .descriptors
+            .open_file(&kernel.files, b"/file")
+            .unwrap();
+        let other = kernel
+            .descriptors
+            .open_file(&kernel.files, b"/file")
+            .unwrap();
+        let record = kernel.descriptors.stat_file(&token).unwrap();
+        assert_eq!(record, kernel.descriptors.stat_file(&other).unwrap());
+        kernel.descriptors.seek_file(&token, 99, 0).unwrap();
+        let mut bytes = [0xa5; 384];
+        bytes[16..22].copy_from_slice(b"/file\0");
+        let mut user = Memory::default();
+        user.add(0x1000, &mut bytes, true, false).unwrap();
+        assert_eq!(
+            kernel
+                .syscall(&mut user, 188, [0x1010, 0x1040, 0, 0, 0, 0])
+                .unwrap(),
+            (0, false)
+        );
+        assert_eq!(
+            kernel
+                .syscall(&mut user, 189, [0x1_0000_0003, 0x10c0, 0, 0, 0, 0])
+                .unwrap(),
+            (0, false)
+        );
+        assert_eq!(
+            user.read(0x1040, STAT_SIZE).unwrap(),
+            user.read(0x10c0, STAT_SIZE).unwrap()
+        );
+        assert_eq!(kernel.descriptors.file_position(&token), Ok(99));
+        for (fd, output, errno) in [
+            (u64::MAX, u64::MAX, 9),
+            (3, 0, 14),
+            (3, 0x1170, 14),
+            (3, u64::MAX, 14),
+        ] {
+            let before = user.read(0x1004, 380).unwrap().to_vec();
+            assert_eq!(
+                kernel
+                    .syscall(&mut user, 189, [fd, output, 0, 0, 0, 0])
+                    .unwrap(),
+                (u64::MAX, true)
+            );
+            assert_eq!(user.load(0x1000, 4).unwrap(), errno);
+            assert_eq!(user.read(0x1004, 380).unwrap(), before);
+            assert_eq!(kernel.descriptors.file_position(&token), Ok(99));
+        }
+        // An open description retains its own file identity even if the host
+        // replaces the explicit registration namespace afterward.
+        kernel.files = Files::default();
+        kernel.files.register(b"/file", vec![8]).unwrap();
+        assert_eq!(kernel.descriptors.stat_file(&token).unwrap(), record);
+        assert_eq!(kernel.descriptors.close_file(&token), 0);
+        assert_eq!(kernel.descriptors.stat_file(&token), Err(9));
+        let (control, _) = kernel.descriptors.packet_control_pair().unwrap();
+        assert!(
+            kernel
+                .syscall(&mut user, 189, [control.into(), 0x1040, 0, 0, 0, 0])
+                .unwrap_err()
+                .contains("unsupported")
+        );
+    }
+    #[test]
+    fn registered_file_syscalls_share_offsets_and_preserve_error_order() {
+        let mut kernel = Kernel::new(4096, 0x1000).unwrap();
+        kernel.files.register(b"/file", b"abcdef".to_vec()).unwrap();
+        let mut bytes = [0xa5; 64];
+        bytes[16..22].copy_from_slice(b"/file\0");
+        let mut user = Memory::default();
+        user.add(0x1000, &mut bytes, true, false).unwrap();
+        user.store(0x1000, 77, 4).unwrap();
+        assert_eq!(
+            kernel
+                .syscall(&mut user, 5, [0x1010, 0, 0, 0, 0, 0])
+                .unwrap(),
+            (3, false)
+        );
+        assert_eq!(user.load(0x1000, 4).unwrap(), 77);
+        let token = kernel.descriptors.file_token(3).unwrap();
+        assert_eq!(
+            kernel
+                .syscall(&mut user, 3, [0x1_0000_0003, 0x1020, 3, 0, 0, 0])
+                .unwrap(),
+            (3, false)
+        );
+        assert_eq!(kernel.descriptors.file_position(&token), Ok(3));
+        assert_eq!(user.read(0x1020, 3).unwrap(), b"abc");
+        assert_eq!(
+            kernel
+                .syscall(&mut user, 478, [3, (-1i64) as u64, 2, 0, 0, 0])
+                .unwrap(),
+            (5, false)
+        );
+        assert_eq!(
+            kernel
+                .syscall(&mut user, 3, [3, 0x103f, 50, 0, 0, 0])
+                .unwrap(),
+            (1, false)
+        );
+        assert_eq!(user.load(0x103f, 1).unwrap(), b'f' as u64);
+        assert_eq!(
+            kernel
+                .syscall(&mut user, 3, [3, u64::MAX, 50, 0, 0, 0])
+                .unwrap(),
+            (0, false)
+        );
+        assert_eq!(
+            kernel
+                .syscall(&mut user, 478, [3, i64::MAX as u64, 1, 0, 0, 0])
+                .unwrap(),
+            (u64::MAX, true)
+        );
+        assert_eq!(user.load(0x1000, 4).unwrap(), 84);
+        assert_eq!(kernel.descriptors.file_position(&token), Ok(6));
+        assert!(
+            kernel
+                .syscall(&mut user, 5, [0x1010, 1, 0, 0, 0, 0])
+                .unwrap_err()
+                .contains("unsupported")
+        );
+        assert_eq!(
+            kernel.syscall(&mut user, 6, [3, 0, 0, 0, 0, 0]).unwrap(),
+            (0, false)
+        );
+        assert_eq!(
+            kernel
+                .syscall(&mut user, 5, [0x1010, 0, 0, 0, 0, 0])
+                .unwrap(),
+            (3, false)
+        );
+        assert_eq!(kernel.descriptors.close_file(&token), 9);
+        assert_eq!(
+            kernel
+                .syscall(&mut user, 3, [u64::MAX, 0x1020, u64::MAX, 0, 0, 0])
+                .unwrap(),
+            (u64::MAX, true)
+        );
+        assert_eq!(user.load(0x1000, 4).unwrap(), 22);
+        assert_eq!(
+            kernel
+                .syscall(&mut user, 4, [u64::MAX, 0x1020, u64::MAX, 0, 0, 0])
+                .unwrap(),
+            (u64::MAX, true)
+        );
+        assert_eq!(user.load(0x1000, 4).unwrap(), 22);
+        // Missing errno output must fail before moving the shared cursor.
+        let fresh = kernel.descriptors.file_token(3).unwrap();
+        let mut output = [0xa5; 8];
+        let mut no_errno = Memory::default();
+        no_errno.add(0x2000, &mut output, true, false).unwrap();
+        assert!(
+            kernel
+                .syscall(&mut no_errno, 3, [3, 0x2000, 1, 0, 0, 0])
+                .is_err()
+        );
+        assert_eq!(kernel.descriptors.file_position(&fresh), Ok(0));
+        assert_eq!(no_errno.read(0x2000, 8).unwrap(), &[0xa5; 8]);
+    }
     #[test]
     fn module_path_publication_is_owned_validated_and_atomic() {
         const BASE: u64 = 0x10000;

@@ -5,7 +5,7 @@
 //! https://raw.githubusercontent.com/ps5-payload-dev/sdk/master/include/freebsd/sys/stat.h
 //! https://raw.githubusercontent.com/ps5-payload-dev/sdk/master/include/freebsd/sys/_types.h
 use crate::{Result, guest_memory::Memory};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, rc::Rc};
 
 pub const STAT_SIZE: usize = 120;
 const PATH_MAX: usize = 1024;
@@ -14,7 +14,7 @@ const MAX_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TRACE_RECORDS: usize = 256;
 const MAX_TRACE_BYTES: usize = 65536;
 struct File {
-    bytes: Vec<u8>,
+    bytes: Rc<[u8]>,
     inode: u32,
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -50,9 +50,21 @@ impl Files {
             return Err("Guest file content budget exceeded".into());
         }
         let inode = self.files.len() as u32 + 1;
-        self.files.insert(path.to_vec(), File { bytes, inode });
+        self.files.insert(
+            path.to_vec(),
+            File {
+                bytes: bytes.into(),
+                inode,
+            },
+        );
         self.content_bytes = total;
         Ok(())
+    }
+    /// Shared immutable backing; opening a descriptor never copies file contents.
+    /// Kept behind this API so a later explicit mounted-file backend can supply
+    /// bounded read-at chunks without changing stream/descriptor cursor ownership.
+    pub(crate) fn contents(&self, path: &[u8]) -> std::result::Result<Rc<[u8]>, u32> {
+        self.files.get(path).map(|f| f.bytes.clone()).ok_or(2)
     }
     /// Tracing is off by default. Disabling retains already captured requests
     /// until drained; exhaustion drops trace records without changing syscall results.
@@ -89,18 +101,8 @@ impl Files {
         }
         result
     }
-    fn stat_path(
-        &self,
-        user: &mut Memory<'_>,
-        path: &[u8],
-        output: u64,
-    ) -> std::result::Result<u64, u32> {
-        // This namespace intentionally has no implicit cwd/path normalization.
-        // Non-canonical paths cannot name a registered file.
+    pub(crate) fn stat_record(&self, path: &[u8]) -> std::result::Result<[u8; STAT_SIZE], u32> {
         let file = self.files.get(path).ok_or(2u32)?;
-        if output == 0 {
-            return Err(14);
-        }
         let mut record = [0u8; STAT_SIZE];
         // A deterministic virtual regular-file identity, with read permissions,
         // one link, zero owner/timestamps, and 512-byte allocation units.
@@ -111,6 +113,20 @@ impl Files {
         record[72..80].copy_from_slice(&(file.bytes.len() as i64).to_le_bytes());
         record[80..88].copy_from_slice(&(file.bytes.len().div_ceil(512) as i64).to_le_bytes());
         record[88..92].copy_from_slice(&512u32.to_le_bytes());
+        Ok(record)
+    }
+    fn stat_path(
+        &self,
+        user: &mut Memory<'_>,
+        path: &[u8],
+        output: u64,
+    ) -> std::result::Result<u64, u32> {
+        // This namespace intentionally has no implicit cwd/path normalization.
+        // Non-canonical paths cannot name a registered file.
+        let record = self.stat_record(path)?;
+        if output == 0 {
+            return Err(14);
+        }
         // Memory::write validates the entire range before touching any byte.
         user.write(output, &record).map_err(|_| 14u32)?;
         Ok(0)
@@ -125,7 +141,7 @@ fn canonical(path: &[u8]) -> bool {
             .split(|b| *b == b'/')
             .all(|part| !part.is_empty() && part != b"." && part != b".." && part.len() <= 255)
 }
-fn read_path(user: &Memory<'_>, address: u64) -> std::result::Result<Vec<u8>, u32> {
+pub(crate) fn read_path(user: &Memory<'_>, address: u64) -> std::result::Result<Vec<u8>, u32> {
     if address == 0 {
         return Err(14);
     }

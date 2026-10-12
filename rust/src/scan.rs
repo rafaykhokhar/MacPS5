@@ -1,7 +1,7 @@
 //! Bounded C-locale scanf planning, based on FreeBSD releng/11.4 vfscanf.c.
 //! Integer fields use its512-byte cap and intmax conversion then destination
-//! narrowing. Binary64 floating fields use source-ordered gdtoa effects;
-//! binary32, long-double, wide and positional assignments remain unsupported.
+//! narrowing. Binary32 and binary64 fields use source-ordered gdtoa effects;
+//! long-double, wide and positional assignments remain unsupported.
 //! Input/format/va-list aliasing with outputs is rejected by the guest planner;
 //! committing a snapshot in those cases would change sequential scanf behavior.
 use crate::{guest_memory::Memory, Result};
@@ -262,19 +262,29 @@ pub fn scan_with_rounding(
             if suppress {
                 None
             } else {
-                if !double {
-                    return Err("Scanf binary32 policy/effects pending".into());
-                }
                 let rounding =
                     rounding.ok_or("Floating scanf requires supported guest controls")?;
-                let effects =
-                    crate::float_parse::effects::parse_effects(&input[start..pos], rounding)
-                        .map_err(|e| format!("Scanf floating conversion: {e:?}"))?;
-                plan.mxcsr_flags |= effects.mxcsr_flags;
-                if let Some(errno) = effects.parsed.errno {
-                    plan.errno = Some(errno as u32);
+                if double {
+                    let effects =
+                        crate::float_parse::effects::parse_effects(&input[start..pos], rounding)
+                            .map_err(|e| format!("Scanf floating conversion: {e:?}"))?;
+                    plan.mxcsr_flags |= effects.mxcsr_flags;
+                    if let Some(errno) = effects.parsed.errno {
+                        plan.errno = Some(errno as u32);
+                    }
+                    Some(effects.parsed.bits.to_le_bytes().to_vec())
+                } else {
+                    let effects = crate::float_parse::strtof_effects::parse_effects(
+                        &input[start..pos],
+                        rounding,
+                    )
+                    .map_err(|e| format!("Scanf floating conversion: {e:?}"))?;
+                    plan.mxcsr_flags |= effects.mxcsr_flags;
+                    if effects.errno.is_some() {
+                        plan.errno = effects.errno;
+                    }
+                    Some(effects.bits.to_le_bytes().to_vec())
                 }
-                Some(effects.parsed.bits.to_le_bytes().to_vec())
             }
         } else {
             let count = if width == 0 { 512 } else { width.min(512) };
@@ -468,7 +478,8 @@ mod tests {
         assert_eq!(p.writes[0].bytes, 0x3fb9999999999999u64.to_le_bytes());
         assert_eq!(p.writes[1].bytes, (1u64 << 63).to_le_bytes());
         assert!(scan(b"0.1", b"%lf", &mut next).is_err());
-        assert!(scan_with_rounding(b"0.1", b"%f", &mut next, Some(Rounding::NearestEven)).is_err());
+        let p = scan_with_rounding(b"0.1", b"%f", &mut next, Some(Rounding::NearestEven)).unwrap();
+        assert_eq!(p.writes[0].bytes, 0x3dcccccdu32.to_le_bytes());
     }
     #[test]
     fn suppressed_floats_have_no_conversion_effects_or_argument() {

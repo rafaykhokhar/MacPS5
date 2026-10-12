@@ -358,6 +358,8 @@ pub enum Service {
     Strtod,
     Vsscanf,
     Gettimeofday,
+    File(crate::stdio_file::Operation),
+    Fstat,
     Nanosleep,
     Malloc,
     Realloc,
@@ -514,6 +516,8 @@ impl Service {
             | Self::Strtod
             | Self::Vsscanf
             | Self::Gettimeofday
+            | Self::File(_)
+            | Self::Fstat
             | Self::Nanosleep
             | Self::ThreadSigmask
             | Self::ThreadSetCancelType
@@ -987,6 +991,8 @@ pub struct NativeExecutor {
     sleep_clock: crate::guest_sleep::Clock,
     pub stdout: crate::captured_stdout::CapturedStdout,
     pub stdio: crate::guest_stdio::GuestStdio,
+    file_streams: crate::stdio_file::Store,
+    file_metadata: Vec<u8>,
     stderr_file: [u8; 312],
     stderr_pointer: [u8; 8],
     locale_name: [u8; 2],
@@ -1319,6 +1325,9 @@ impl NativeExecutor {
                 writable: false,
             });
         }
+        if self.services.values().any(|service| matches!(service, Service::File(_))) {
+            mapped_data.push(DataRegion { address: crate::stdio_file::BASE, bytes: &mut self.file_metadata, writable: true });
+        }
         continuation.with_memory_context(
             image,
             dependencies,
@@ -1629,6 +1638,8 @@ impl NativeExecutor {
             sleep_clock: crate::guest_sleep::Clock::default(),
             stdout: crate::captured_stdout::CapturedStdout::default(),
             stdio: crate::guest_stdio::GuestStdio::default(),
+            file_streams: crate::stdio_file::Store::default(),
+            file_metadata: vec![0; crate::stdio_file::ARENA_SIZE],
             stderr_file: crate::guest_stdio::stderr_file_bytes(),
             stderr_pointer: crate::guest_stdio::stderr_pointer_bytes(),
             locale_name: crate::guest_locale::C_NAME,
@@ -2237,6 +2248,9 @@ impl NativeExecutor {
                 crate::guest_stdio::STDERR_PTR_ADDR,
                 &mut self.stderr_pointer,
             )?;
+        }
+        if self.services.values().any(|service| matches!(service, Service::File(_))) {
+            memory.add(crate::stdio_file::BASE, &mut self.file_metadata, true, false)?;
         }
         for &address in self.services.keys() {
             memory.reserve_service(address);
@@ -3220,7 +3234,24 @@ impl NativeExecutor {
                         } else {
                             0
                         }
+                    } else if matches!(service, Service::Fstat) {
+                        let kernel = self.kernel.as_mut().ok_or("Missing fstat kernel context")?;
+                        validate_net_output(&memory, kernel.errno_address(), 4, sp, ret)?;
+                        let descriptor = cpu.registers[7] as u32 as u64;
+                        if matches!(kernel.descriptors.kind(descriptor), Some(crate::descriptors::DescriptorKind::RegisteredFile)) {
+                            validate_net_output(&memory, cpu.registers[6], 120, sp, ret)?;
+                        }
+                        let (value, _) = kernel.syscall(&mut memory, 189, [descriptor,cpu.registers[6],0,0,0,0])?;
+                        value as u32 as u64
+                    } else if let Service::File(operation) = service {
+                        self.file_streams.call(
+                            self.kernel.as_mut().ok_or("Missing FILE kernel context")?,
+                            &mut memory, *operation,
+                            [cpu.registers[7],cpu.registers[6],cpu.registers[2],cpu.registers[1]],
+                            |memory,address,length| validate_net_output(memory,address,length,sp,ret),
+                        )?
                     } else if matches!(service, Service::Gettimeofday) {
+
                         let plan = self.guest_time.plan(cpu.registers[7], cpu.registers[6])?;
                         for write in &plan.writes {
                             validate_net_output(
