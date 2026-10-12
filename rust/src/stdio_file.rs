@@ -571,6 +571,27 @@ fn diagnostic(error: Error) -> String {
     format!("Unsupported FILE operation: {error:?}")
 }
 impl Store {
+    /// Preflight the supported unbuffered __cleanup invariant. This neither
+    /// closes descriptors nor claims to execute arbitrary FILE callbacks.
+    pub fn validate_cleanup(&self, memory: &crate::guest_memory::Memory<'_>) -> crate::Result<()> {
+        for (index, stream) in self.streams.iter().enumerate() {
+            if !stream.closed {
+                let address = BASE + (index * SLOT_SIZE) as u64;
+                if memory.read(address, SLOT_SIZE)? != stream.metadata(address).map_err(diagnostic)? {
+                    return Err("Unsupported or modified FILE metadata during cleanup".into());
+                }
+            }
+        }
+        if let Some(stream) = &self.stdin {
+            if !stream.closed
+                && memory.read(STDIN_FILE_ADDR, SLOT_SIZE)?
+                    != stream.metadata(STDIN_FILE_ADDR).map_err(diagnostic)?
+            {
+                return Err("Unsupported or modified stdin FILE metadata during cleanup".into());
+            }
+        }
+        Ok(())
+    }
     /// Host-only setup; the executor freezes it before guest execution. No
     /// default source, implicit EOF, host terminal reads or fabricated input.
     pub fn configure_stdin(
@@ -895,6 +916,35 @@ impl Store {
 mod store_tests {
     use super::*;
     use crate::{guest_memory::Memory, kernel::Kernel};
+    #[test]
+    fn cleanup_validates_stdin_and_open_files_without_closing_or_writing() {
+        let mut kernel = Kernel::new(4096, 0x2000).unwrap();
+        kernel.files.register(b"/input", b"abc".to_vec()).unwrap();
+        let mut store = Store::default();
+        store.validate_cleanup(&Memory::default()).unwrap();
+        let mut stdin = store.configure_stdin(&mut kernel, b"/input").unwrap();
+        let token = kernel.descriptors.open_file(&kernel.files, b"/input").unwrap();
+        let stream = Stream::new(token).unwrap();
+        let fd = stream.descriptor().unwrap();
+        let mut file = stream.metadata(BASE).unwrap();
+        store.streams.push(stream);
+        let original_stdin = stdin;
+        let original_file = file;
+        let mut memory = Memory::default();
+        memory.add(STDIN_FILE_ADDR, &mut stdin, true, false).unwrap();
+        memory.add(BASE, &mut file, true, false).unwrap();
+        store.validate_cleanup(&memory).unwrap();
+        assert_eq!(memory.read(STDIN_FILE_ADDR, SLOT_SIZE).unwrap(), original_stdin);
+        assert_eq!(memory.read(BASE, SLOT_SIZE).unwrap(), original_file);
+        assert_eq!(store.streams[0].descriptor().unwrap(), fd);
+        assert_eq!(store.streams[0].tell(&kernel.descriptors).unwrap(), 0);
+        memory.store(STDIN_FILE_ADDR, 1, 8).unwrap();
+        assert!(store.validate_cleanup(&memory).is_err());
+        memory.write(STDIN_FILE_ADDR, &original_stdin).unwrap();
+        memory.store(BASE, 1, 8).unwrap();
+        assert!(store.validate_cleanup(&memory).is_err());
+        assert_eq!(store.streams[0].tell(&kernel.descriptors).unwrap(), 0);
+    }
     #[test]
     fn line_boundaries_orientation_and_sticky_state() {
         let mut kernel = Kernel::new(4096, 0x2000).unwrap();

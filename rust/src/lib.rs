@@ -26,6 +26,7 @@ pub mod exports;
 pub mod game_controller;
 pub mod graphics;
 pub mod guest_cond;
+pub mod guest_abort;
 pub mod guest_locale;
 pub mod guest_memory;
 pub mod guest_mutex;

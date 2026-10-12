@@ -1,9 +1,9 @@
 //! Internal owned state for nested, resumable comparator calls.
 use crate::{
+    Result,
     guest_compare::{Event, Request},
     guest_search::Search,
     guest_sort::Sort,
-    Result,
 };
 use std::{
     cell::RefCell,
@@ -102,9 +102,34 @@ pub(crate) struct Frame {
     pub callback_sp: u64,
     pub _lease: Rc<()>,
 }
+/// An ordinary synchronous abort handler. Full CPU state is owned, not rebuilt
+/// from ABI callee-saved registers; restoring it must keep live remaining fuel.
+pub(crate) struct AbortFrame {
+    pub model: crate::guest_abort::Abort,
+    pub ticket: crate::guest_abort::HandlerTicket,
+    pub cpu: crate::legacy_cpu::Cpu,
+    pub restore_mask: [u8; 16],
+    pub thread: u64,
+    pub comparator_depth: usize,
+    pub callback_sp: u64,
+    pub _lease: Rc<()>,
+}
+impl AbortFrame {
+    pub fn restore_cpu(&self, cpu: &mut crate::legacy_cpu::Cpu) {
+        let live_fuel = cpu.fuel;
+        *cpu = self.cpu.clone();
+        cpu.fuel = live_fuel;
+        cpu.memory = 0;
+    }
+}
+pub(crate) type AbortFaults = Rc<RefCell<Vec<AbortFrame>>>;
+pub(crate) type RetainedStacks = Rc<RefCell<Vec<(u64, Vec<u8>, Rc<()>)>>>;
 pub(crate) type Faults = Rc<RefCell<Vec<Frame>>>;
 pub(crate) struct Context {
     pub frames: Vec<Frame>,
+    pub abort_frames: Vec<AbortFrame>,
+    abort_faults: AbortFaults,
+    abort_stack_faults: RetainedStacks,
     pub registry: Registry,
     faults: Faults,
 }
@@ -112,11 +137,40 @@ impl Context {
     pub fn new(registry: Registry, faults: Faults) -> Self {
         Self {
             frames: Vec::new(),
+            abort_frames: Vec::new(),
+            abort_faults: Rc::new(RefCell::new(Vec::new())),
+            abort_stack_faults: Rc::new(RefCell::new(Vec::new())),
             registry,
             faults,
         }
     }
+    pub fn with_abort_faults(mut self, faults: AbortFaults, stacks: RetainedStacks) -> Self {
+        self.abort_faults = faults;
+        self.abort_stack_faults = stacks;
+        self
+    }
+    pub fn retain_abort_stack(&self, address: u64, bytes: Vec<u8>, lease: Rc<()>) {
+        self.abort_stack_faults
+            .borrow_mut()
+            .push((address, bytes, lease));
+    }
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty() && self.abort_frames.is_empty()
+    }
+    pub fn authentic_abort_return(&self, sp: u64, target: u64) -> bool {
+        target == u64::MAX
+            && self.abort_frames.last().is_some_and(|frame| {
+                frame.comparator_depth == self.frames.len() && frame.callback_sp == sp
+            })
+    }
     pub fn authentic_return(&self, sp: u64, target: u64) -> bool {
+        if self
+            .abort_frames
+            .last()
+            .is_some_and(|frame| frame.comparator_depth == self.frames.len())
+        {
+            return self.authentic_abort_return(sp, target);
+        }
         target == u64::MAX
             && self
                 .frames
@@ -141,6 +195,11 @@ impl Context {
 }
 impl Drop for Context {
     fn drop(&mut self) {
+        if !self.abort_frames.is_empty() {
+            self.abort_faults
+                .borrow_mut()
+                .append(&mut self.abort_frames);
+        }
         if !self.frames.is_empty() {
             self.faults.borrow_mut().append(&mut self.frames);
         }

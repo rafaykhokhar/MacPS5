@@ -44,6 +44,7 @@ mod strdup_native;
 mod mkdir_native;
 mod cond_native;
 mod multibyte_native;
+mod abort_native;
 mod system_service_native;
 mod threadattr_native;
 mod thread_services_native;
@@ -104,6 +105,7 @@ fn main() -> Result<(), String> {
     mkdir_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("mkdir"))?;
     cond_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("condition"))?;
     multibyte_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("multibyte"))?;
+    abort_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("abort"))?;
     semaphore_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     stdio_file_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     system_service_native::verify(Path::new(&archive), Path::new(&directory))?;
@@ -490,6 +492,7 @@ fn main() -> Result<(), String> {
         ("mbrtowc", Service::Mbrtowc),
         ("wcrtomb", Service::Wcrtomb),
         ("mbsrtowcs", Service::Mbsrtowcs),
+        ("abort", Service::Abort),
     ]
     .into_iter()
     .enumerate()
@@ -1454,13 +1457,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 134 libc exports: (134+1)*24=3240 symbol bytes (rounded3248)
-                // and 1+134*12=1609 NID bytes (rounded1616).
-                // Three multibyte exports add112bytes to19088.
-                || native.bytes_allocated() != 19200
+                // 135 libc exports: (135+1)*24=3264 symbol bytes
+                // and 1+135*12=1621 NID bytes (rounded1632).
+                // Abort adds32bytes to19200.
+                || native.bytes_allocated() != 19232
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'abort'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'vasprintf'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1470,7 +1473,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; mbrtowc import bound; unresolved abort causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; abort import bound; unresolved vasprintf causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1532,7 +1535,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved abort triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved vasprintf triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     presentation_result?;

@@ -15,7 +15,7 @@ use crate::{
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::{Rc, Weak};
-type FaultStack = Rc<RefCell<Vec<(u64, Vec<u8>, Rc<()>)>>>;
+type FaultStack = crate::guest_callback::RetainedStacks;
 struct StackIdentity {
     address: u64,
     length: usize,
@@ -96,6 +96,34 @@ fn semaphore_storage_owned(
             && end <= s.address + s.length as u64
             && backing == s.backing + (address - s.address) as usize
     }))
+}
+fn force_abort_default(
+    abort: &mut crate::guest_abort::Abort,
+    actions: &mut crate::guest_signal_action::Store,
+    tls: &mut crate::guest_tls::GuestTls,
+    thread: u64,
+) -> Result<i32> {
+    if abort.phase() != crate::guest_abort::Phase::ForceDefault {
+        return Err("Abort forced default at wrong phase".into());
+    }
+    let snapshot = actions.snapshot(crate::guest_abort::SIGABRT)?;
+    let action = actions.prepare_snapshot(&snapshot, Some(crate::guest_abort::forced_default()))?;
+    tls.replace_signal_mask(thread, crate::guest_abort::abort_mask())?;
+    action.commit();
+    abort
+        .default_installed()
+        .expect("Validated forced-default phase");
+    let snapshot = actions
+        .snapshot(crate::guest_abort::SIGABRT)
+        .expect("Valid fixed signal");
+    let decision = abort
+        .prepare_raise(&snapshot)
+        .expect("Committed default second raise")
+        .commit();
+    match decision {
+        crate::guest_abort::Decision::Terminate { signal } => Ok(signal),
+        _ => unreachable!("Second raise uses default disposition"),
+    }
 }
 fn strdup_service(
     memory: &mut Memory<'_>,
@@ -887,6 +915,7 @@ pub enum Service {
     TlsSetSpecific,
     Exit,
     ImmediateExit,
+    Abort,
     Strcpy,
     Strcat,
     Strcmp,
@@ -991,6 +1020,7 @@ impl Service {
             | Self::TlsSetSpecific
             | Self::Exit
             | Self::ImmediateExit
+            | Self::Abort
             | Self::Malloc
             | Self::Realloc
             | Self::Calloc
@@ -1090,6 +1120,19 @@ pub struct Continuation {
     stack_address: u64,
     remaining: u64,
     caller_bias: u64,
+}
+impl Drop for Continuation {
+    fn drop(&mut self) {
+        if let Some(context) = &self.callbacks {
+            if !context.abort_frames.is_empty() && !self.stack.is_empty() {
+                context.retain_abort_stack(
+                    self.stack_address,
+                    std::mem::take(&mut self.stack),
+                    self.stack_lease.clone(),
+                );
+            }
+        }
+    }
 }
 impl Continuation {
     pub fn guest_thread_id(&self) -> u64 {
@@ -1358,6 +1401,9 @@ impl ThreadRequest {
     }
 }
 pub enum Execution {
+    SignalTerminated {
+        signal: i32,
+    },
     ThreadRequest(Box<ThreadRequest>),
     QuantumYield(Box<QuantumYield>),
     /// Full-width pointer return from an explicitly invoked worker entry.
@@ -1423,7 +1469,10 @@ impl Execution {
             | Self::SysmoduleLoadInternal { continuation, .. }
             | Self::StopUnloadModule { continuation, .. }
             | Self::LoadStartModule { continuation, .. } => Ok(Some(continuation.stack_region())),
-            Self::WorkerReturned(_) | Self::Returned(_) | Self::ExitRequested(_) => Ok(None),
+            Self::WorkerReturned(_)
+            | Self::Returned(_)
+            | Self::ExitRequested(_)
+            | Self::SignalTerminated { .. } => Ok(None),
         }
     }
 }
@@ -1448,6 +1497,8 @@ type EnvironmentCompletion = Option<(u64, Option<i32>, bool)>;
 pub struct NativeExecutor {
     callback_ranges: crate::guest_callback::Registry,
     callback_faults: crate::guest_callback::Faults,
+    abort_faults: crate::guest_callback::AbortFaults,
+    signal_termination: Option<i32>,
     system_profile: Option<crate::guest_system::GuestSystemProfile>,
     system_profile_locked: bool,
     signal_actions: crate::guest_signal_action::Store,
@@ -1633,7 +1684,7 @@ impl NativeExecutor {
                         && saved
                             .callbacks
                             .as_ref()
-                            .is_none_or(|context| context.frames.is_empty())))
+                            .is_none_or(|context| context.is_empty())))
                 || saved.cpu.registers[4] != return_sp
             {
                 return Err("Semaphore terminal return changed".into());
@@ -1787,7 +1838,7 @@ impl NativeExecutor {
                         && saved
                             .callbacks
                             .as_ref()
-                            .is_none_or(|context| context.frames.is_empty())))
+                            .is_none_or(|context| context.is_empty())))
                 || saved.cpu.registers[4] != return_sp
             {
                 return Err("Condition terminal return changed".into());
@@ -2116,10 +2167,19 @@ impl NativeExecutor {
     pub fn exit_remaining_fuel(&self) -> Option<u64> {
         self.exit_context.as_ref().map(|context| context.cpu.fuel)
     }
+    pub fn signal_termination(&self) -> Option<i32> {
+        self.signal_termination
+    }
     pub(crate) fn require_running(&self) -> Result<()> {
+        if let Some(signal) = self.signal_termination {
+            return Err(format!(
+                "Guest terminated by signal {signal}; teardown remains pending"
+            ));
+        }
         if !self.fault_stack.borrow().is_empty()
             || !self.callback_faults.borrow().is_empty()
             || !self.condition_faults.borrow().is_empty()
+            || !self.abort_faults.borrow().is_empty()
         {
             return Err("Guest stack or callback retirement fault pinned".into());
         }
@@ -2198,7 +2258,7 @@ impl NativeExecutor {
         if self.services.values().any(|service| {
             matches!(
                 service,
-                Service::Fprintf | Service::Fflush | Service::File(_)
+                Service::Fprintf | Service::Fflush | Service::File(_) | Service::Abort
             )
         }) {
             mapped_data.push(DataRegion {
@@ -2215,7 +2275,7 @@ impl NativeExecutor {
         if self
             .services
             .values()
-            .any(|service| matches!(service, Service::File(_) | Service::Fgets))
+            .any(|service| matches!(service, Service::File(_) | Service::Fgets | Service::Abort))
         {
             mapped_data.push(DataRegion {
                 address: crate::stdio_file::BASE,
@@ -2562,6 +2622,8 @@ impl NativeExecutor {
         Ok(Self {
             callback_ranges: crate::guest_callback::Registry::default(),
             callback_faults: Rc::new(RefCell::new(Vec::new())),
+            abort_faults: Rc::new(RefCell::new(Vec::new())),
+            signal_termination: None,
             system_profile: None,
             system_profile_locked: false,
             signal_actions: crate::guest_signal_action::Store::default(),
@@ -2690,6 +2752,9 @@ impl NativeExecutor {
         dependencies: &mut [&mut Image],
     ) -> Result<i32> {
         match self.run(image, address, arguments, dependencies)? {
+            Execution::SignalTerminated { signal } => {
+                Err(format!("Guest terminated by signal {signal}"))
+            }
             Execution::ThreadRequest(_) => {
                 Err("Thread request requires scheduler orchestration".into())
             }
@@ -2855,7 +2920,7 @@ impl NativeExecutor {
                         || continuation
                             .callbacks
                             .as_ref()
-                            .is_some_and(|context| !context.frames.is_empty())))
+                            .is_some_and(|context| !context.is_empty())))
             {
                 return Err("Mutex terminal return changed".into());
             }
@@ -3115,6 +3180,7 @@ impl NativeExecutor {
                     self.callback_ranges.clone(),
                     self.callback_faults.clone(),
                 )
+                .with_abort_faults(self.abort_faults.clone(), self.fault_stack.clone())
             });
         let (address, arguments, initial_convention) = entry;
         let caller_bias = image.bias;
@@ -3127,14 +3193,14 @@ impl NativeExecutor {
             return_convention,
             stack_lease,
         ) = match continuation {
-            Some(state) => (
-                Some(state.cpu),
-                state.stack,
+            Some(mut state) => (
+                Some(std::mem::take(&mut state.cpu)),
+                std::mem::take(&mut state.stack),
                 state.remaining,
                 state.stack_address,
                 state.guest_thread,
                 state.return_convention,
-                state.stack_lease,
+                state.stack_lease.clone(),
             ),
             None => {
                 let mut candidate = self.stack_address;
@@ -3273,7 +3339,7 @@ impl NativeExecutor {
         if self.services.values().any(|service| {
             matches!(
                 service,
-                Service::Fprintf | Service::Fflush | Service::File(_)
+                Service::Fprintf | Service::Fflush | Service::File(_) | Service::Abort
             )
         }) {
             memory.add(
@@ -3290,7 +3356,7 @@ impl NativeExecutor {
         if self
             .services
             .values()
-            .any(|service| matches!(service, Service::File(_) | Service::Fgets))
+            .any(|service| matches!(service, Service::File(_) | Service::Fgets | Service::Abort))
         {
             memory.add(
                 crate::stdio_file::BASE,
@@ -3335,7 +3401,7 @@ impl NativeExecutor {
         macro_rules! completed {
             ($value:expr) => {{
                 let value = $value;
-                if !callbacks.frames.is_empty() { return Err("Process return bypasses active comparator frame".into()); }
+                if !callbacks.is_empty() { return Err("Process return bypasses active comparator frame".into()); }
                 drop(memory);
                 let pinned = retained_overlap(&self.semaphores, &self.callback_ranges, stack_address, stack.len());
                 pending_stack.set(pinned);
@@ -3345,6 +3411,27 @@ impl NativeExecutor {
                 }
                 stack.condition_transfer = false;
                 return Ok(Flow::Finished(return_convention.completed(value)));
+            }};
+        }
+        macro_rules! signal_terminated {
+            ($signal:expr, $remaining:expr) => {{
+                let signal = $signal;
+                cpu.memory = 0;
+                drop(memory);
+                self.exit_context = Some(Box::new(Continuation {
+                    callbacks: Some(callbacks),
+                    stack_lease: stack_lease.clone(),
+                    quantum: slice.0,
+                    return_convention,
+                    guest_thread,
+                    cpu,
+                    stack: stack.take(),
+                    stack_address,
+                    remaining: $remaining,
+                    caller_bias,
+                }));
+                self.signal_termination = Some(signal);
+                return Ok(Flow::Finished(Execution::SignalTerminated { signal }));
             }};
         }
         if let Some((errno, error, terminal)) = environment_completion {
@@ -3528,6 +3615,30 @@ impl NativeExecutor {
             }
             if cpu.stop == 3 {
                 let target = memory.load(cpu.registers[4], 8)?;
+                if callbacks.authentic_abort_return(cpu.registers[4], target) {
+                    let frame = callbacks
+                        .abort_frames
+                        .last_mut()
+                        .ok_or("Missing abort handler frame")?;
+                    if frame.thread != guest_thread {
+                        return Err("Abort handler returned on another thread".into());
+                    }
+                    let returned = frame
+                        .model
+                        .prepare_handler_return(&frame.ticket, guest_thread)?;
+                    // TLS validity is checked before publishing the model transition.
+                    self.tls
+                        .replace_signal_mask(guest_thread, frame.restore_mask)?;
+                    returned.commit();
+                    frame.restore_cpu(&mut cpu);
+                    let signal = force_abort_default(
+                        &mut frame.model,
+                        &mut self.signal_actions,
+                        &mut self.tls,
+                        guest_thread,
+                    )?;
+                    signal_terminated!(signal, remaining - transition - 1);
+                }
                 if callbacks.authentic_return(cpu.registers[4], target) {
                     callbacks.accept_return(cpu.registers[0])?;
                     cpu.stop = 0;
@@ -3559,6 +3670,168 @@ impl NativeExecutor {
                 if let Some(service) = self.services.get(&cpu.target) {
                     // A noreturn service has no valid continuation to translate
                     // or pop. Real callers commonly put UD2 immediately after it.
+                    if matches!(service, Service::Abort) {
+                        // Cleanup is a metadata-checked flush of supported unbuffered
+                        // FILEs. No host exit, atexit, fclose or fake resource teardown.
+                        self.stdio.validate_cleanup(&memory)?;
+                        self.file_streams.validate_cleanup(&memory)?;
+                        self.tls.signal_mask(guest_thread)?;
+                        let mut abort = crate::guest_abort::Abort::new(guest_thread)?;
+                        abort.cleanup_validated()?;
+                        let snapshot = self.signal_actions.snapshot(crate::guest_abort::SIGABRT)?;
+                        let raise = abort.prepare_raise(&snapshot)?;
+                        let handler_setup = if let crate::guest_abort::Decision::Handler {
+                            address,
+                            mask,
+                            restore_mask,
+                            reset_before_entry,
+                            ..
+                        } = raise.decision()
+                        {
+                            if callbacks.abort_frames.len() + callbacks.frames.len() >= 32 {
+                                return Err("Abort/callback nesting budget exhausted".into());
+                            }
+                            let address = *address;
+                            let target_bias = owner(address)?;
+                            let target_offset = address
+                                .checked_sub(target_bias)
+                                .ok_or("Abort handler below image")?;
+                            if block_at(target_bias, target_offset).is_none() {
+                                translation_miss!(target_bias, target_offset);
+                            }
+                            if !memory.executable(address)
+                                || block_at(target_bias, target_offset).is_none()
+                            {
+                                return Err("Unregistered abort handler".into());
+                            }
+                            let handler_sp =
+                                callback_stack_slot(cpu.registers[4], stack_address, 0, 0, None)?;
+                            memory.validate_write(handler_sp, 8)?;
+                            callbacks
+                                .abort_frames
+                                .try_reserve(1)
+                                .map_err(|_| "Cannot reserve abort handler frame")?;
+                            self.abort_faults
+                                .borrow_mut()
+                                .try_reserve(callbacks.abort_frames.len() + 1)
+                                .map_err(|_| "Cannot reserve abort fault ownership")?;
+                            self.fault_stack
+                                .borrow_mut()
+                                .try_reserve(self.stack_identities.len() + 1)
+                                .map_err(|_| "Cannot reserve abort stack fault ownership")?;
+                            let mut ranges = Vec::new();
+                            ranges
+                                .try_reserve(3)
+                                .map_err(|_| "Cannot reserve abort backing ranges")?;
+                            ranges.push(condition_storage(
+                                &memory,
+                                handler_sp,
+                                &image_storage,
+                                &self.stack_identities,
+                                &stack_lease,
+                            )?);
+                            ranges.push(callback_storage(
+                                &memory,
+                                address,
+                                1,
+                                &image_storage,
+                                &self.stack_identities,
+                            )?);
+                            let interrupted = cpu
+                                .bias
+                                .checked_add(cpu.rip)
+                                .ok_or("Abort interrupted address overflow")?;
+                            ranges.push(callback_storage(
+                                &memory,
+                                interrupted,
+                                1,
+                                &image_storage,
+                                &self.stack_identities,
+                            )?);
+                            let lease = self
+                                .callback_ranges
+                                .acquire(ranges, [handler_sp, handler_sp])?;
+                            Some((
+                                address,
+                                target_bias,
+                                target_offset,
+                                handler_sp,
+                                *mask,
+                                *restore_mask,
+                                *reset_before_entry,
+                                lease,
+                            ))
+                        } else {
+                            None
+                        };
+                        let replacement = handler_setup
+                            .as_ref()
+                            .and_then(|s| s.6.then(|| snapshot.reset_for_delivery()));
+                        let action = self
+                            .signal_actions
+                            .prepare_snapshot(&snapshot, replacement)?;
+                        let mask = handler_setup
+                            .as_ref()
+                            .map(|s| s.4)
+                            .unwrap_or_else(crate::guest_abort::abort_mask);
+                        // No state publication precedes frame/ownership preflight.
+                        if let Some(setup) = &handler_setup {
+                            memory.store(setup.3, u64::MAX, 8)?;
+                        }
+                        self.tls.replace_signal_mask(guest_thread, mask)?;
+                        action.commit();
+                        let decision = raise.commit();
+                        cpu.fuel -= 1;
+                        self.consumed_instruction_fuel += 1;
+                        slice.1 = slice.1.saturating_sub(1);
+                        match decision {
+                            crate::guest_abort::Decision::Terminate { signal } => {
+                                signal_terminated!(signal, remaining - transition - 1)
+                            }
+                            crate::guest_abort::Decision::ForceDefault => {
+                                let signal = force_abort_default(
+                                    &mut abort,
+                                    &mut self.signal_actions,
+                                    &mut self.tls,
+                                    guest_thread,
+                                )?;
+                                signal_terminated!(signal, remaining - transition - 1);
+                            }
+                            crate::guest_abort::Decision::Handler { ticket, .. } => {
+                                let (
+                                    _,
+                                    target_bias,
+                                    target_offset,
+                                    handler_sp,
+                                    _,
+                                    restore_mask,
+                                    _,
+                                    lease,
+                                ) = handler_setup.expect("Prepared caught handler");
+                                let mut saved_cpu = cpu.clone();
+                                saved_cpu.memory = 0;
+                                callbacks
+                                    .abort_frames
+                                    .push(crate::guest_callback::AbortFrame {
+                                        model: abort,
+                                        ticket,
+                                        cpu: saved_cpu,
+                                        restore_mask,
+                                        thread: guest_thread,
+                                        comparator_depth: callbacks.frames.len(),
+                                        callback_sp: handler_sp,
+                                        _lease: lease,
+                                    });
+                                pending_stack.set(true);
+                                cpu.registers[7] = crate::guest_abort::SIGABRT as u64;
+                                cpu.registers[4] = handler_sp;
+                                cpu.bias = target_bias;
+                                cpu.rip = target_offset;
+                                cpu.stop = 0;
+                                continue;
+                            }
+                        }
+                    }
                     if matches!(service, Service::Exit | Service::ImmediateExit) {
                         let request = ExitRequest {
                             status: cpu.registers[7] as u32 as i32,
@@ -3596,7 +3869,7 @@ impl NativeExecutor {
                     let terminal = tail
                         && ret == u64::MAX
                         && (callbacks.authentic_return(cpu.registers[4], ret)
-                            || (cpu.registers[4] == top && callbacks.frames.is_empty()));
+                            || (cpu.registers[4] == top && callbacks.is_empty()));
                     if !terminal {
                         let return_bias = owner(ret)?;
                         let return_offset = ret
@@ -5848,6 +6121,10 @@ impl NativeExecutor {
     }
 }
 impl Executor for NativeExecutor {
+    fn signal_termination(&self) -> Option<i32> {
+        self.signal_termination
+    }
+
     fn validate_image_retirement(&self, image: &Image) -> Result<()> {
         if image.segments.iter().any(|segment| {
             retained_overlap(
@@ -6515,5 +6792,234 @@ mod multibyte_dispatch_tests {
         let p = crate::guest_multibyte::mbrtowc(&memory, 0x8007, 0x1000, 1, 0).unwrap();
         assert!(multibyte_service(&mut memory, p, None, 0x8000, 0x1000).is_err());
         assert_eq!(memory.load(0x8000, 8).unwrap(), 0x1000);
+    }
+}
+
+#[cfg(test)]
+mod abort_dispatch_tests {
+    use super::*;
+    const ABORT: u64 = 0x700000;
+    fn pending(image: &Image) -> Continuation {
+        let mut cpu = Cpu {
+            stop: 1,
+            target: ABORT,
+            bias: image.bias,
+            rip: 0x100,
+            next_rip: 0x106,
+            fuel: 16,
+            ..Cpu::default()
+        };
+        cpu.registers[4] = 0x900ff8;
+        cpu.registers[7] = 0xfeed;
+        cpu.flags = 0x847;
+        cpu.mxcsr = 0x5f80;
+        cpu.x87_control = 0x077f;
+        cpu.x87_status = 0x120;
+        cpu.vectors[3] = [0x6d; 32];
+        Continuation {
+            callbacks: None,
+            stack_lease: Rc::new(()),
+            quantum: None,
+            return_convention: ReturnConvention::ModuleStatus,
+            guest_thread: MAIN_GUEST_THREAD,
+            cpu,
+            stack: vec![0; 4096],
+            stack_address: 0x900000,
+            remaining: 16,
+            caller_bias: image.bias,
+        }
+    }
+    fn action(n: &mut NativeExecutor, handler: u64, flags: u32) {
+        let snapshot = n.signal_actions.snapshot(6).unwrap();
+        n.signal_actions
+            .prepare_snapshot(
+                &snapshot,
+                Some(crate::guest_signal_action::Disposition {
+                    handler,
+                    flags,
+                    mask: [0; 16],
+                }),
+            )
+            .unwrap()
+            .commit();
+    }
+    #[test]
+    fn default_and_ignored_abort_stop_at_service_without_following_ud2() {
+        for handler in [0, 1] {
+            let mut file = memory_fixture();
+            file[0x106..0x108].copy_from_slice(&[0x0f, 0x0b]);
+            let mut image = Image::load(&file, 0x100000, 65536).unwrap();
+            let mut n = NativeExecutor::new(0x900000, 4096, 16, 16).unwrap();
+            n.register_service(ABORT, Service::Abort).unwrap();
+            action(&mut n, handler, 0);
+            n.tls
+                .replace_signal_mask(MAIN_GUEST_THREAD, [255; 16])
+                .unwrap();
+            let state = pending(&image);
+            let result = n
+                .execute_flow(
+                    &mut image,
+                    0,
+                    Arguments::default(),
+                    &mut [],
+                    Some(state),
+                    &mut [],
+                )
+                .unwrap();
+            assert!(matches!(result, Execution::SignalTerminated { signal: 6 }));
+            assert_eq!(n.signal_termination(), Some(6));
+            assert_eq!(n.exit_request(), None);
+            assert_eq!(n.exit_context.as_ref().unwrap().cpu.fuel, 15);
+            assert_eq!(
+                n.tls.signal_mask(MAIN_GUEST_THREAD).unwrap(),
+                crate::guest_abort::abort_mask()
+            );
+            assert!(n.require_running().is_err());
+        }
+    }
+    #[test]
+    fn unsupported_handler_delivery_changes_no_mask_disposition_or_phase() {
+        for flags in [1, 0x40] {
+            let mut image = Image::load(&memory_fixture(), 0x100000, 65536).unwrap();
+            let mut n = NativeExecutor::new(0x900000, 4096, 16, 16).unwrap();
+            n.register_service(ABORT, Service::Abort).unwrap();
+            action(&mut n, 0x100100, flags);
+            let before = n.tls.signal_mask(MAIN_GUEST_THREAD).unwrap();
+            let state = pending(&image);
+            assert!(
+                n.execute_flow(
+                    &mut image,
+                    0,
+                    Arguments::default(),
+                    &mut [],
+                    Some(state),
+                    &mut []
+                )
+                .is_err()
+            );
+            assert_eq!(n.tls.signal_mask(MAIN_GUEST_THREAD).unwrap(), before);
+            assert_eq!(n.signal_actions.snapshot(6).unwrap().handler(), 0x100100);
+            assert_eq!(n.signal_termination(), None);
+            assert!(n.abort_faults.borrow().is_empty());
+        }
+    }
+    #[test]
+    fn dropping_suspended_abort_handler_preserves_actual_stack_backing() {
+        unsafe extern "C" fn not_executed(_cpu: *mut Cpu) {}
+        let file = memory_fixture();
+        let mut image = Image::load(&file, 0x100000, 65536).unwrap();
+        let mut n = NativeExecutor::new(0x900000, 4096, 16, 16).unwrap();
+        n.register_service(ABORT, Service::Abort).unwrap();
+        action(&mut n, 0x100100, 0);
+        n.blocks.insert(
+            0x100,
+            Block {
+                start: 0x100,
+                bytes: Rc::from(&file[0x100..0x101]),
+                function: not_executed,
+                _library: None,
+            },
+        );
+        let mut state = pending(&image);
+        state.quantum = Some(1);
+        let Execution::QuantumYield(wait) = n
+            .execute_flow(
+                &mut image,
+                0,
+                Arguments::default(),
+                &mut [],
+                Some(state),
+                &mut [],
+            )
+            .unwrap()
+        else {
+            panic!("handler yield");
+        };
+        let pointer = wait.continuation.as_ref().unwrap().stack.as_ptr();
+        drop(wait);
+        assert_eq!(n.abort_faults.borrow().len(), 1);
+        assert_eq!(n.fault_stack.borrow().len(), 1);
+        assert_eq!(n.fault_stack.borrow()[0].1.as_ptr(), pointer);
+        assert!(n.callback_ranges.overlaps(0x900000, 4096));
+        assert!(n.require_running().is_err());
+    }
+    // Dispatcher-state injection tests restoration independently of generated
+    // ARM64 code. Native handler execution has a separate verification gate.
+    #[test]
+    fn handler_owned_quantum_return_restores_cpu_and_live_fuel() {
+        unsafe extern "C" fn not_executed(_cpu: *mut Cpu) {}
+        let file = memory_fixture();
+        let mut image = Image::load(&file, 0x100000, 65536).unwrap();
+        let mut n = NativeExecutor::new(0x900000, 4096, 16, 16).unwrap();
+        n.register_service(ABORT, Service::Abort).unwrap();
+        action(&mut n, 0x100100, crate::guest_abort::SA_RESETHAND);
+        n.blocks.insert(
+            0x100,
+            Block {
+                start: 0x100,
+                bytes: Rc::from(&file[0x100..0x101]),
+                function: not_executed,
+                _library: None,
+            },
+        );
+        let mut state = pending(&image);
+        state.quantum = Some(1);
+        let original = state.cpu.clone();
+        let Execution::QuantumYield(mut wait) = n
+            .execute_flow(
+                &mut image,
+                0,
+                Arguments::default(),
+                &mut [],
+                Some(state),
+                &mut [],
+            )
+            .unwrap()
+        else {
+            panic!("handler dispatch must yield");
+        };
+        assert_eq!(n.signal_actions.snapshot(6).unwrap().handler(), 0);
+        assert_ne!(n.tls.signal_mask(MAIN_GUEST_THREAD).unwrap()[0] & 32, 0);
+        let saved = wait.continuation.as_mut().unwrap();
+        assert_eq!(saved.cpu.registers[7], 6);
+        let frame = saved
+            .callbacks
+            .as_ref()
+            .unwrap()
+            .abort_frames
+            .last()
+            .unwrap();
+        assert!(
+            saved
+                .callbacks
+                .as_ref()
+                .unwrap()
+                .authentic_abort_return(saved.cpu.registers[4], u64::MAX)
+        );
+        assert_eq!(frame.cpu.flags, original.flags);
+        saved.cpu.flags = 0;
+        saved.cpu.mxcsr = 0;
+        saved.cpu.x87_control = 0;
+        saved.cpu.x87_status = 0;
+        saved.cpu.vectors.fill([0; 32]);
+        saved.cpu.registers[7] = 99;
+        saved.cpu.fuel = 9;
+        saved.cpu.stop = 3;
+        let outcome = n
+            .resume_quantum(&mut image, &mut [], &mut wait, &mut [])
+            .unwrap();
+        assert!(matches!(outcome, Execution::SignalTerminated { signal: 6 }));
+        let restored = &n.exit_context.as_ref().unwrap().cpu;
+        assert_eq!(restored.registers, original.registers);
+        assert_eq!(restored.flags, original.flags);
+        assert_eq!(restored.mxcsr, original.mxcsr);
+        assert_eq!(restored.x87_control, original.x87_control);
+        assert_eq!(restored.x87_status, original.x87_status);
+        assert_eq!(restored.vectors, original.vectors);
+        assert_eq!(restored.fuel, 9);
+        assert_eq!(
+            n.tls.signal_mask(MAIN_GUEST_THREAD).unwrap(),
+            crate::guest_abort::abort_mask()
+        );
     }
 }

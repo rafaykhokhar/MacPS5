@@ -36,6 +36,9 @@ struct Worker {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Step {
     ExitRequested(ExitRequest),
+    SignalTerminated {
+        signal: i32,
+    },
     Yielded(u64),
     MutexPending(u64),
     JoinPending(u64),
@@ -57,6 +60,7 @@ pub enum Step {
 pub struct Scheduler {
     blocked_deadline: Option<u128>,
     exit_request: Option<ExitRequest>,
+    signal_termination: Option<i32>,
     next_thread: u64,
     failure: Option<String>,
     owner: Option<Rc<()>>,
@@ -91,6 +95,9 @@ impl Scheduler {
     pub(crate) fn exit_request(&self) -> Option<ExitRequest> {
         self.exit_request
     }
+    pub(crate) fn signal_termination(&self) -> Option<i32> {
+        self.signal_termination
+    }
     pub(crate) fn adopt_parent(
         &mut self,
         native: &NativeExecutor,
@@ -98,6 +105,7 @@ impl Scheduler {
         lease: ImageLease,
     ) -> Result<u64> {
         self.require_owner(native)?;
+        self.require_admission(native)?;
         let pending = request.as_ref().ok_or("Missing parent thread request")?;
         let thread = pending.guest_thread_id().ok_or("Consumed parent request")?;
         if !pending.belongs_to(native)
@@ -412,6 +420,7 @@ impl Scheduler {
         Ok(Self {
             blocked_deadline: None,
             exit_request: None,
+            signal_termination: None,
             next_thread: 2,
             failure: None,
             owner: None,
@@ -432,6 +441,7 @@ impl Scheduler {
         argument: u64,
     ) -> Result<()> {
         self.require_owner(native)?;
+        self.require_admission(native)?;
         if let Some(error) = &self.failure {
             return Err(error.clone());
         }
@@ -584,6 +594,12 @@ impl Scheduler {
             })
             .min()
     }
+    fn require_admission(&self, native: &NativeExecutor) -> Result<()> {
+        if self.signal_termination.is_some() || self.exit_request.is_some() {
+            return Err("Terminated guest prohibits worker admission".into());
+        }
+        native.require_running()
+    }
     fn require_owner(&mut self, native: &NativeExecutor) -> Result<()> {
         let identity = native.execution_identity();
         if let Some(owner) = &self.owner {
@@ -606,6 +622,11 @@ impl Scheduler {
         dependencies: &mut [&mut Image],
         parent_data: &mut [DataRegion<'_>],
     ) -> Result<Step> {
+        self.require_owner(native)?;
+        self.signal_termination = self.signal_termination.or(native.signal_termination());
+        if let Some(signal) = self.signal_termination {
+            return Ok(Step::SignalTerminated { signal });
+        }
         let now = native.sleep_clock_now();
         let realtime =
             if native.semaphores.has_realtime_waits() || native.conditions.has_realtime_waits() {
@@ -671,6 +692,10 @@ impl Scheduler {
         ),
     ) -> Result<Step> {
         self.require_owner(native)?;
+        self.signal_termination = self.signal_termination.or(native.signal_termination());
+        if let Some(signal) = self.signal_termination {
+            return Ok(Step::SignalTerminated { signal });
+        }
         if let Some(request) = self.exit_request {
             return Ok(Step::ExitRequested(request));
         }
@@ -787,6 +812,12 @@ impl Scheduler {
             return Err(error);
         };
         self.remaining_instructions = remaining;
+        if let Ok(Some(Execution::SignalTerminated { signal })) = &outcome {
+            self.signal_termination = Some(*signal);
+            self.workers[index].state =
+                State::Suspended(Execution::SignalTerminated { signal: *signal });
+            return Ok(Step::SignalTerminated { signal: *signal });
+        }
         if let Ok(Some(Execution::ExitRequested(request))) = &outcome {
             self.exit_request = Some(*request);
             self.workers[index].state = State::Suspended(Execution::ExitRequested(*request));
@@ -847,6 +878,44 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn terminated_scheduler_never_dispatches_or_retires_workers() {
+        let mut scheduler = Scheduler::new(1, 10, 10).unwrap();
+        let mut native = NativeExecutor::new(0x900000, 4096, 10, 10).unwrap();
+        let mut image = Image::load(&crate::modules::fixture(), 0x100000, 4096).unwrap();
+        scheduler.workers.push(Worker {
+            lease: None,
+            external: true,
+            thread: 1,
+            detached: false,
+            joiner: None,
+            state: State::ExternalBoundary(Execution::Returned(17)),
+        });
+        scheduler.signal_termination = Some(6);
+        assert!(scheduler.enqueue(&mut native, 2, 0x100100, 0).is_err());
+        for _ in 0..2 {
+            assert_eq!(
+                scheduler
+                    .step(&mut native, &mut image, &mut [], &mut [])
+                    .unwrap(),
+                Step::SignalTerminated { signal: 6 }
+            );
+        }
+        assert_eq!(scheduler.remaining_dispatches, 10);
+        assert_eq!(scheduler.remaining_instructions, 10);
+        assert_eq!(scheduler.workers.len(), 1);
+        assert!(matches!(
+            scheduler.workers[0].state,
+            State::ExternalBoundary(Execution::Returned(17))
+        ));
+        assert_eq!(native.tls.live_threads(), 1);
+        let mut foreign = NativeExecutor::new(0xa00000, 4096, 10, 10).unwrap();
+        assert!(
+            scheduler
+                .step(&mut foreign, &mut image, &mut [], &mut [])
+                .is_err()
+        );
+    }
     #[test]
     fn stale_reaped_external_record_does_not_shadow_live_boundary() {
         let mut scheduler = Scheduler::new(1, 10, 10).unwrap();

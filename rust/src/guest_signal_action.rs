@@ -14,7 +14,7 @@
 //! and explicit blocked-call interruption/restart policy. Merely registering a
 //! handler does not invoke it or validate its executable mapping. No host signal
 //! registration, callback invocation, or fabricated sigreturn frame is used.
-use crate::{guest_memory::Memory, Result};
+use crate::{Result, guest_memory::Memory};
 use std::rc::Rc;
 pub const ACTION_SIZE: usize = 32;
 pub const EINVAL: u32 = 22;
@@ -62,6 +62,60 @@ impl Action {
     }
 }
 
+/// Process/revision-bound disposition snapshot for synchronous delivery setup.
+#[derive(Clone)]
+pub struct Snapshot {
+    owner: Rc<()>,
+    revision: u64,
+    signal: i32,
+    action: Action,
+}
+impl Snapshot {
+    pub fn signal(&self) -> i32 {
+        self.signal
+    }
+    pub fn handler(&self) -> u64 {
+        self.action.handler()
+    }
+    pub fn flags(&self) -> u32 {
+        self.action.flags()
+    }
+    /// libthr installs caught handlers through a SIGINFO trampoline with
+    /// NODEFER cleared and an all-signals kernel mask. kern_sig.c::sigdflt
+    /// changes handler to DFL and clears SIGINFO, retaining other kernel flags.
+    /// This differs from abort's later explicit flags-zero sigaction.
+    pub fn reset_for_delivery(&self) -> Disposition {
+        Disposition {
+            handler: 0,
+            flags: self.flags() & !(0x10 | 0x40),
+            mask: [255; 16],
+        }
+    }
+    pub fn mask(&self) -> [u8; 16] {
+        self.action.0[12..28].try_into().expect("signal mask")
+    }
+}
+#[derive(Clone, Copy)]
+pub struct Disposition {
+    pub handler: u64,
+    pub flags: u32,
+    pub mask: [u8; 16],
+}
+/// All checks precede this exclusive permit. Dropping it changes nothing;
+/// commit cannot allocate or fail, for atomic publication with owned delivery.
+pub struct SnapshotCommit<'a> {
+    store: &'a mut Store,
+    replacement: Option<(usize, Action)>,
+    next: u64,
+}
+impl SnapshotCommit<'_> {
+    pub fn commit(self) {
+        if let Some((index, action)) = self.replacement {
+            self.store.actions[index] = action;
+        }
+        self.store.revision = self.next;
+    }
+}
 pub struct Store {
     owner: Rc<()>,
     actions: [Action; 128],
@@ -102,6 +156,52 @@ impl Plan {
     }
 }
 impl Store {
+    pub fn snapshot(&self, signal: i32) -> Result<Snapshot> {
+        if !(1..=128).contains(&signal) || signal == 32 {
+            return Err("Invalid signal disposition snapshot".into());
+        }
+        Ok(Snapshot {
+            owner: self.owner.clone(),
+            revision: self.revision,
+            signal,
+            action: self.actions[(signal - 1) as usize],
+        })
+    }
+    pub fn prepare_snapshot<'a>(
+        &'a mut self,
+        snapshot: &Snapshot,
+        replacement: Option<Disposition>,
+    ) -> Result<SnapshotCommit<'a>> {
+        if !Rc::ptr_eq(&self.owner, &snapshot.owner) || self.revision != snapshot.revision {
+            return Err("Foreign or stale signal disposition snapshot".into());
+        }
+        let replacement = if let Some(d) = replacement {
+            let mut bytes = [0u8; ACTION_SIZE];
+            bytes[..8].copy_from_slice(&d.handler.to_le_bytes());
+            bytes[8..12].copy_from_slice(&d.flags.to_le_bytes());
+            bytes[12..28].copy_from_slice(&d.mask);
+            Some((
+                (snapshot.signal - 1) as usize,
+                Action(bytes)
+                    .normalize(snapshot.signal)
+                    .map_err(|e| format!("Invalid replacement signal disposition: {e}"))?,
+            ))
+        } else {
+            None
+        };
+        let next = if replacement.is_some() {
+            self.revision
+                .checked_add(1)
+                .ok_or("Signal disposition revision exhausted")?
+        } else {
+            self.revision
+        };
+        Ok(SnapshotCommit {
+            store: self,
+            replacement,
+            next,
+        })
+    }
     fn base(&self) -> Plan {
         Plan {
             owner: self.owner.clone(),

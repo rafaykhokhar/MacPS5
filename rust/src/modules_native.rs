@@ -23,6 +23,7 @@ pub enum StartEvent {
     ThreadRequest { thread: u64 },
     MutexWait { thread: u64, slot: u64 },
     ExitRequested(ExitRequest),
+    SignalTerminated { signal: i32 },
     SysmoduleLoadInternal { arguments: [u64; 6] },
     Dlsym { arguments: [u64; 6] },
     Started,
@@ -35,6 +36,7 @@ pub enum StartOutcome {
     MutexWait { handle: u64, thread: u64, slot: u64 },
     Started,
     ExitRequested(ExitRequest),
+    SignalTerminated { signal: i32 },
 }
 pub enum LoadProgress {
     Child { handle: u64, event: StartEvent },
@@ -87,7 +89,11 @@ impl Modules {
     /// remaining fallible operation. Failed preflight leaves both registrations.
     pub fn unload_native(&mut self, handle: u64, executor: &mut NativeExecutor) -> Result<()> {
         self.validate_unload(handle)?;
-        if let Some(image) = self.modules.get(&handle).and_then(|module| module.image.as_ref()) {
+        if let Some(image) = self
+            .modules
+            .get(&handle)
+            .and_then(|module| module.image.as_ref())
+        {
             executor.validate_image_retirement(image)?;
         }
         let bias = self
@@ -120,7 +126,12 @@ impl Modules {
         });
         self.thread_image_pins = scheduler.live_image_pins();
         let exit = scheduler.exit_request();
+        let signal = scheduler.signal_termination();
         self.thread_scheduler = Some(scheduler);
+        if let Some(signal) = signal {
+            self.signal_termination = Some(signal);
+            return Ok(crate::scheduler::Step::SignalTerminated { signal });
+        }
         if let Some(request) = exit {
             self.exit_request = Some(request);
             return Ok(crate::scheduler::Step::ExitRequested(request));
@@ -218,6 +229,9 @@ impl Modules {
                 if let Some(request) = scheduler.exit_request() {
                     return Ok(Some(Execution::ExitRequested(request)));
                 }
+                if let Some(signal) = scheduler.signal_termination() {
+                    return Ok(Some(Execution::SignalTerminated { signal }));
+                }
                 if let Some(outcome) = scheduler.take_parent_boundary(thread) {
                     return Ok(Some(outcome));
                 }
@@ -231,7 +245,10 @@ impl Modules {
         match result {
             Ok(Some(outcome)) => {
                 state.scheduled_thread = None;
-                if !matches!(outcome, Execution::ExitRequested(_)) {
+                if !matches!(
+                    outcome,
+                    Execution::ExitRequested(_) | Execution::SignalTerminated { .. }
+                ) {
                     if let Err(error) = selected {
                         self.pending_starts.insert(handle, state);
                         return Err(error);
@@ -278,7 +295,17 @@ impl Modules {
     pub fn exit_request(&self) -> Option<ExitRequest> {
         self.exit_request
     }
+    pub fn signal_termination(&self) -> Option<i32> {
+        self.signal_termination
+    }
     fn require_native_running(&mut self, executor: &NativeExecutor) -> Result<()> {
+        self.signal_termination = self.signal_termination.or(executor.signal_termination());
+        if self.signal_termination.is_some() {
+            return Err(
+                "Guest signal termination; module execution prohibited while cleanup is pending"
+                    .into(),
+            );
+        }
         if self.exit_request.is_none() {
             self.exit_request = executor.exit_request();
         }
@@ -503,6 +530,10 @@ impl Modules {
         if let Err(error) =
             self.stop_dynamic_module(caller, child, executor, Arguments { size, pointer })
         {
+            if let Some(signal) = executor.signal_termination() {
+                self.signal_termination = Some(signal);
+                return Ok(StartEvent::SignalTerminated { signal });
+            }
             if let Some(request) = executor.exit_request() {
                 self.exit_request = Some(request);
                 return Ok(StartEvent::ExitRequested(request));
@@ -619,6 +650,12 @@ impl Modules {
                 executor.run_with_data(image, address, arguments, dependencies, data)
             })?;
             match result {
+                Execution::SignalTerminated { signal } => {
+                    self.signal_termination = Some(signal);
+                    return Err(
+                        "Guest signal termination during stop; cleanup remains pending".into(),
+                    );
+                }
                 Execution::ExitRequested(request) => {
                     self.exit_request = Some(request);
                     return Err("Guest exit requested during stop; cleanup remains pending".into());
@@ -665,6 +702,9 @@ impl Modules {
                         thread,
                         slot,
                     });
+                }
+                StartEvent::SignalTerminated { signal } => {
+                    return Ok(StartOutcome::SignalTerminated { signal });
                 }
                 StartEvent::ExitRequested(request) => {
                     return Ok(StartOutcome::ExitRequested(request));
@@ -1165,13 +1205,22 @@ impl Modules {
     /// Discard suspended execution without making the partially initialized image
     /// unloadable or retryable. It remains fault-pinned until process teardown.
     pub fn abandon_native_start(&mut self, handle: u64) -> Result<()> {
+        if self.signal_termination.is_some() || self.exit_request.is_some() {
+            return Err(
+                "Terminated guest retains module-start continuation until process teardown".into(),
+            );
+        }
         self.check_thread_pin(handle)?;
-        if self.pending_starts.get(&handle)
+        if self
+            .pending_starts
+            .get(&handle)
             .and_then(|state| state.thread_request.as_ref())
-            .is_some_and(|request| matches!(
-                request.operation(),
-                crate::module_executor::ThreadOperation::SemaphoreWait { .. }
-            ))
+            .is_some_and(|request| {
+                matches!(
+                    request.operation(),
+                    crate::module_executor::ThreadOperation::SemaphoreWait { .. }
+                )
+            })
         {
             return Err("Pending semaphore wait retains module-start continuation".into());
         }
@@ -1210,6 +1259,11 @@ impl Modules {
                         state.mutex_wait = Some(wait);
                         self.pending_starts.insert(handle, state);
                         return Ok(event);
+                    }
+                    Execution::SignalTerminated { signal } => {
+                        self.signal_termination = Some(signal);
+                        self.pending_starts.insert(handle, state);
+                        return Ok(StartEvent::SignalTerminated { signal });
                     }
                     Execution::ExitRequested(request) => {
                         self.exit_request = Some(request);
@@ -1303,6 +1357,54 @@ mod exit_request_tests {
             sysmodule_request: false,
             stopping: None,
         }
+    }
+    #[test]
+    fn signal_termination_retains_initializer_and_blocks_other_modules() {
+        let mut modules = Modules::new(65536);
+        let parent = modules
+            .load_dynamic("parent.prx", &fixture(), 0x100000, EntryPoints::default())
+            .unwrap();
+        modules.pending_starts.insert(parent, state());
+        let child = modules
+            .load_dynamic("child.prx", &fixture(), 0x200000, EntryPoints::default())
+            .unwrap();
+        modules.modules.get_mut(&child).unwrap().phase = Phase::Faulted;
+        let mut executor = NativeExecutor::new(0x900000, 4096, 10, 10).unwrap();
+        let event = modules
+            .advance_native(
+                child,
+                &mut executor,
+                state(),
+                Some(Execution::SignalTerminated { signal: 6 }),
+            )
+            .unwrap();
+        assert!(matches!(event, StartEvent::SignalTerminated { signal: 6 }));
+        assert_eq!(modules.signal_termination(), Some(6));
+        assert_eq!(modules.exit_request(), None);
+        assert_eq!(modules.phase(child), Some(Phase::Faulted));
+        assert!(modules.pending_starts.contains_key(&child));
+        assert!(modules.abandon_native_start(parent).is_err());
+        assert!(modules.abandon_native_start(child).is_err());
+        assert!(modules.pending_starts.contains_key(&parent));
+        assert!(
+            modules
+                .resume_native(child, &mut executor, 0)
+                .err()
+                .unwrap()
+                .contains("signal termination")
+        );
+        let other = modules
+            .load_dynamic("other.prx", &fixture(), 0x300000, EntryPoints::default())
+            .unwrap();
+        assert!(
+            modules
+                .start_native(other, &mut executor, Arguments::default())
+                .err()
+                .unwrap()
+                .contains("signal termination")
+        );
+        assert_eq!(modules.phase(other), Some(Phase::Loaded));
+        assert!(modules.pending_starts.contains_key(&child));
     }
     #[test]
     fn nested_initializer_exit_never_starts_child_or_resumes_parent() {

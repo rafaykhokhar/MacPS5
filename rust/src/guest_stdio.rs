@@ -43,6 +43,14 @@ impl GuestStdio {
     pub fn configured(&self) -> bool {
         self.capacity.is_some()
     }
+    /// Abort's __cleanup flushes supported streams without closing them. Every
+    /// accepted byte is already captured; validate that invariant before abort.
+    pub fn validate_cleanup(&self, memory: &Memory<'_>) -> Result<()> {
+        if self.configured() {
+            self.validate(memory, FILE_ADDR)?;
+        }
+        Ok(())
+    }
     pub fn take_bytes(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.bytes)
     }
@@ -151,6 +159,22 @@ impl GuestStdio {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cleanup_skips_unconfigured_stderr_and_preserves_capture() {
+        let mut stdio = GuestStdio::default();
+        stdio.validate_cleanup(&Memory::default()).unwrap();
+        stdio.configure_capture(128).unwrap();
+        assert!(stdio.validate_cleanup(&Memory::default()).is_err());
+        stdio.bytes.extend_from_slice(b"already committed");
+        let mut metadata = stderr_file_bytes();
+        let mut memory = Memory::default();
+        memory.add(FILE_ADDR, &mut metadata, true, false).unwrap();
+        stdio.validate_cleanup(&memory).unwrap();
+        assert_eq!(stdio.bytes(), b"already committed");
+        memory.store(FILE_ADDR, 0, 8).unwrap();
+        assert!(stdio.validate_cleanup(&memory).is_err());
+        assert_eq!(stdio.bytes(), b"already committed");
+    }
     #[test]
     fn owned_layout_and_observed_format() {
         let mut file = stderr_file_bytes();

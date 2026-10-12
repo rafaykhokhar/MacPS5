@@ -44,6 +44,9 @@ pub trait Executor {
     fn exit_request(&self) -> Option<crate::module_executor::ExitRequest> {
         None
     }
+    fn signal_termination(&self) -> Option<i32> {
+        None
+    }
     fn call_with_dependencies(
         &mut self,
         image: &mut Image,
@@ -90,6 +93,7 @@ pub struct Modules {
     thread_image_pins: BTreeSet<u64>,
     thread_scheduler: Option<crate::scheduler::Scheduler>,
     exit_request: Option<crate::module_executor::ExitRequest>,
+    signal_termination: Option<i32>,
     native_paths: BTreeMap<String, u64>,
     sysmodules: BTreeMap<u32, (u64, u32)>,
     bootstrap: Option<u64>,
@@ -139,6 +143,7 @@ impl Modules {
             thread_image_pins: BTreeSet::new(),
             thread_scheduler: None,
             exit_request: None,
+            signal_termination: None,
             native_paths: BTreeMap::new(),
             sysmodules: BTreeMap::new(),
             bootstrap: None,
@@ -397,6 +402,13 @@ impl Modules {
         if self.exit_request.is_none() {
             self.exit_request = executor.exit_request();
         }
+        self.signal_termination = self.signal_termination.or(executor.signal_termination());
+        if self.signal_termination.is_some() {
+            return Err(
+                "Guest signal termination; module transitions prohibited while cleanup is pending"
+                    .into(),
+            );
+        }
         if self.exit_request.is_some() {
             return Err(
                 "Guest exit requested; module transitions prohibited while cleanup is pending"
@@ -455,6 +467,7 @@ impl Modules {
                 );
                 if let Err(error) = initialized {
                     self.exit_request = executor.exit_request();
+                    self.signal_termination = executor.signal_termination();
                     return Err(error);
                 }
             }
@@ -482,6 +495,7 @@ impl Modules {
                         );
                         if let Err(error) = finalized {
                             self.exit_request = executor.exit_request();
+                            self.signal_termination = executor.signal_termination();
                             return Err(error);
                         }
                     }
@@ -500,6 +514,7 @@ impl Modules {
             Err(error) => {
                 module.phase = Phase::Faulted;
                 self.exit_request = executor.exit_request();
+                self.signal_termination = executor.signal_termination();
                 Err(error)
             }
         }
@@ -674,6 +689,44 @@ mod tests {
             self.calls.push(address);
             self.result.clone()
         }
+    }
+    #[test]
+    fn generic_executor_signal_failure_latches_process_termination() {
+        struct Terminating {
+            calls: usize,
+        }
+        impl Executor for Terminating {
+            fn call(&mut self, _: &mut Image, _: u64, _: Arguments) -> Result<i32> {
+                self.calls += 1;
+                Err("Guest signal termination".into())
+            }
+            fn signal_termination(&self) -> Option<i32> {
+                (self.calls > 0).then_some(6)
+            }
+        }
+        let mut modules = Modules::new(8192);
+        let first = modules
+            .load("first", &fixture(), 0x10000, &[], entries())
+            .unwrap();
+        let second = modules
+            .load("second", &fixture(), 0x20000, &[], entries())
+            .unwrap();
+        let mut executor = Terminating { calls: 0 };
+        assert!(
+            modules
+                .start(first, &mut executor, Arguments::default())
+                .is_err()
+        );
+        assert_eq!(modules.signal_termination(), Some(6));
+        assert_eq!(modules.exit_request(), None);
+        assert_eq!(modules.phase(first), Some(Phase::Faulted));
+        assert!(
+            modules
+                .start(second, &mut executor, Arguments::default())
+                .is_err()
+        );
+        assert_eq!(executor.calls, 1);
+        assert_eq!(modules.phase(second), Some(Phase::Loaded));
     }
     #[test]
     fn legacy_executor_cannot_silently_ignore_dependency_images() {
@@ -886,22 +939,39 @@ mod tests {
     }
     #[test]
     fn semaphore_wait_prevents_image_retirement_before_phase_or_code_changes() {
-        use crate::{guest_memory::Memory, guest_semaphore::Outcome, module_executor::NativeExecutor};
+        use crate::{
+            guest_memory::Memory, guest_semaphore::Outcome, module_executor::NativeExecutor,
+        };
         let mut file = fixture();
         file[68..72].copy_from_slice(&7u32.to_le_bytes());
         let mut modules = Modules::new(4096);
-        let handle = modules.load("semaphore.prx", &file, 0x10000, &[], entries()).unwrap();
+        let handle = modules
+            .load("semaphore.prx", &file, 0x10000, &[], entries())
+            .unwrap();
         let mut native = NativeExecutor::new(0x900000, 4096, 1000, 1000).unwrap();
         let ticket = {
-            let image = modules.modules.get_mut(&handle).unwrap().image.as_mut().unwrap();
+            let image = modules
+                .modules
+                .get_mut(&handle)
+                .unwrap()
+                .image
+                .as_mut()
+                .unwrap();
             let segment = &mut image.segments[0];
             let mut memory = Memory::default();
-            memory.add(segment.address, &mut segment.bytes, true, false).unwrap();
+            memory
+                .add(segment.address, &mut segment.bytes, true, false)
+                .unwrap();
             let plan = native.semaphores.init(&memory, 0x10180, 0, 0).unwrap();
             native.semaphores.commit(&mut memory, plan).unwrap();
-            let plan = native.semaphores.wait(&memory, 0x10180, 1, 0,
-                || Err("Untimed wait must not read realtime".into())).unwrap();
-            let Outcome::Pending(ticket) = native.semaphores.commit(&mut memory, plan).unwrap() else {
+            let plan = native
+                .semaphores
+                .wait(&memory, 0x10180, 1, 0, || {
+                    Err("Untimed wait must not read realtime".into())
+                })
+                .unwrap();
+            let Outcome::Pending(ticket) = native.semaphores.commit(&mut memory, plan).unwrap()
+            else {
                 panic!("Expected pending semaphore wait");
             };
             ticket
@@ -911,7 +981,11 @@ mod tests {
         assert_eq!(modules.phase(handle), Some(Phase::Loaded));
         assert_eq!(modules.bytes(), bytes);
         modules.modules.get_mut(&handle).unwrap().phase = Phase::Started;
-        assert!(modules.stop(handle, &mut native, Arguments::default()).is_err());
+        assert!(
+            modules
+                .stop(handle, &mut native, Arguments::default())
+                .is_err()
+        );
         assert_eq!(modules.phase(handle), Some(Phase::Started));
         native.semaphores.abandon(&ticket, 1).unwrap();
         modules.modules.get_mut(&handle).unwrap().phase = Phase::Stopped;
