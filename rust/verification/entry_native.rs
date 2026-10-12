@@ -1,4 +1,5 @@
 use native_ps5::{
+    c_locale::Ctype,
     guest_memory::DataRegion,
     loader::Image,
     module_executor::{Execution, NativeExecutor, Service},
@@ -41,6 +42,7 @@ mod wide_strings_native;
 mod narrow_strings_native;
 mod integer_parse_native;
 mod x87_control_native;
+mod c_locale_native;
 mod tiler_native;
 mod tiler_gpu_native;
 mod tls_native;
@@ -87,6 +89,7 @@ fn main() -> Result<(), String> {
     narrow_strings_native::verify(Path::new(&archive), Path::new(&directory))?;
     integer_parse_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     x87_control_native::verify(Path::new(&archive), Path::new(&directory))?;
+    c_locale_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     tiler_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     tiler_gpu_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     user_service_native::verify(Path::new(&archive), Path::new(&directory))?;
@@ -366,6 +369,20 @@ fn main() -> Result<(), String> {
         ("strtoul", Service::Strtoul),
         ("strtoll", Service::Strtoll),
         ("strtoull", Service::Strtoull),
+        ("strncasecmp", Service::Strncasecmp),
+        ("isalpha", Service::Ctype(Ctype::Isalpha)),
+        ("isalnum", Service::Ctype(Ctype::Isalnum)),
+        ("isxdigit", Service::Ctype(Ctype::Isxdigit)),
+        ("ispunct", Service::Ctype(Ctype::Ispunct)),
+        ("isspace", Service::Ctype(Ctype::Isspace)),
+        ("isupper", Service::Ctype(Ctype::Isupper)),
+        ("islower", Service::Ctype(Ctype::Islower)),
+        ("isprint", Service::Ctype(Ctype::Isprint)),
+        ("isgraph", Service::Ctype(Ctype::Isgraph)),
+        ("iscntrl", Service::Ctype(Ctype::Iscntrl)),
+        ("toupper", Service::Ctype(Ctype::Toupper)),
+        ("tolower", Service::Ctype(Ctype::Tolower)),
+        ("isblank", Service::Ctype(Ctype::Isblank)),
     ]
     .into_iter()
     .enumerate()
@@ -1250,10 +1267,11 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 72 libc exports: (72+1)*24=1752 symbol bytes (rounded1760)
-                // and 1+72*12=865 NID bytes (rounded880). Five integer exports
-                // add128+64bytes to16784; retain exact accounting and32KiB cap.
-                || native.bytes_allocated() != 16976
+                // 86 libc exports: (86+1)*24=2088 symbol bytes (rounded2096)
+                // and 1+86*12=1033 NID bytes (rounded1040). Fourteen C-locale
+                // exports add336+160bytes to16976. Resolver still stops at atof
+                // before reaching their GOT slots; retain exact32KiB cap.
+                || native.bytes_allocated() != 17472
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
                     != [b"<118>[crispy-doom.elf] Unable to resolve 'atof'\n".to_vec()]

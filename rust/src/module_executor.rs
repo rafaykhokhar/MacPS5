@@ -463,6 +463,8 @@ pub enum Service {
     Strcmp,
     Strncmp,
     Strlen,
+    Ctype(crate::c_locale::Ctype),
+    Strncasecmp,
 }
 impl Service {
     fn operation(self) -> u64 {
@@ -471,6 +473,8 @@ impl Service {
             | Self::Memcpy
             | Self::Memmove
             | Self::Memcmp
+            | Self::Ctype(_)
+            | Self::Strncasecmp
             | Self::Strdup
             | Self::Memset
             | Self::Setlocale
@@ -3170,6 +3174,18 @@ impl NativeExecutor {
                         )?
                     } else if matches!(service, Service::Strstr) {
                         crate::narrow_strings::strstr(&memory, cpu.registers[7], cpu.registers[6])?
+                    } else if let Service::Ctype(operation) = service {
+                        // C int consumes the low32 bits; EOF is signed -1.
+                        // Out-of-domain values stop explicitly. No errno writes.
+                        crate::c_locale::apply(*operation, cpu.registers[7] as u32 as i32)?
+                            as u32 as u64
+                    } else if matches!(service, Service::Strncasecmp) {
+                        crate::c_locale::strncasecmp(
+                            &memory,
+                            cpu.registers[7],
+                            cpu.registers[6],
+                            cpu.registers[2],
+                        )? as u32 as u64
                     } else if matches!(service, Service::Wcslen) {
                         crate::wide_string::wcslen(&memory, cpu.registers[7])?
                     } else if matches!(service, Service::Wcsstr) {
