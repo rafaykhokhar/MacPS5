@@ -40,11 +40,20 @@ pub enum Step {
     MutexPending(u64),
     JoinPending(u64),
     ThreadService(u64),
-    Completed { thread: u64, value: u64 },
+    /// No runnable worker; host driver may wait until this monotonic deadline.
+    /// Observing this state consumes neither dispatch nor instruction fuel.
+    Sleeping {
+        deadline_ns: u128,
+    },
+    Completed {
+        thread: u64,
+        value: u64,
+    },
     ServiceBoundary(u64),
     Finished,
 }
 pub struct Scheduler {
+    blocked_deadline: Option<u128>,
     exit_request: Option<ExitRequest>,
     next_thread: u64,
     failure: Option<String>,
@@ -223,6 +232,12 @@ impl Scheduler {
         let mut joiner = None;
         let result = (|| -> Result<Option<u64>> {
             match operation {
+                ThreadOperation::Sleep { deadline } => {
+                    if !deadline.ready(native.sleep_clock_now()) {
+                        return Err("Unready sleep selected for dispatch".into());
+                    }
+                    Ok(Some(0))
+                }
                 ThreadOperation::Create {
                     output,
                     entry,
@@ -369,6 +384,7 @@ impl Scheduler {
             return Err("Scheduler budgets must be positive".into());
         }
         Ok(Self {
+            blocked_deadline: None,
             exit_request: None,
             next_thread: 2,
             failure: None,
@@ -444,6 +460,40 @@ impl Scheduler {
     pub fn remaining_instructions(&self) -> u64 {
         self.remaining_instructions
     }
+    /// Set only by a step that found no runnable guest work.
+    pub fn blocked_sleep_deadline(&self) -> Option<u128> {
+        self.blocked_deadline
+    }
+    fn runnable(&self, native: &NativeExecutor, index: usize, now: u128) -> bool {
+        let worker = &self.workers[index];
+        match &worker.state {
+            State::Completed(_) | State::Reaped | State::ExternalBoundary(_) => false,
+            State::Suspended(Execution::ThreadRequest(request)) => match request.operation() {
+                ThreadOperation::Sleep { deadline } => deadline.ready(now),
+                ThreadOperation::Join { thread, .. } => !self.workers.iter().any(|target| {
+                    target.thread == thread
+                        && target.joiner == Some(worker.thread)
+                        && !target.detached
+                        && !matches!(target.state, State::Completed(_) | State::Reaped)
+                }),
+                _ => true,
+            },
+            State::Suspended(Execution::MutexWait(wait)) => wait.pending_owner(native).is_none(),
+            _ => true,
+        }
+    }
+    pub fn next_sleep_deadline(&self) -> Option<u128> {
+        self.workers
+            .iter()
+            .filter_map(|worker| match &worker.state {
+                State::Suspended(Execution::ThreadRequest(request)) => match request.operation() {
+                    ThreadOperation::Sleep { deadline } => Some(deadline.target()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .min()
+    }
     fn require_owner(&mut self, native: &NativeExecutor) -> Result<()> {
         let identity = native.execution_identity();
         if let Some(owner) = &self.owner {
@@ -466,15 +516,11 @@ impl Scheduler {
         dependencies: &mut [&mut Image],
         parent_data: &mut [DataRegion<'_>],
     ) -> Result<Step> {
+        let now = native.sleep_clock_now();
         let len = self.workers.len();
         let bias = (0..len)
             .map(|n| (self.cursor + n) % len)
-            .find(|&i| {
-                !matches!(
-                    self.workers[i].state,
-                    State::Completed(_) | State::Reaped | State::ExternalBoundary(_)
-                )
-            })
+            .find(|&i| self.runnable(native, i, now))
             .and_then(|i| self.workers[i].lease.as_ref().map(|lease| lease.bias));
         if let Some(bias) = bias.filter(|bias| *bias != image.bias) {
             let index = dependencies
@@ -489,9 +535,9 @@ impl Scheduler {
                 .map(|mapped| &mut **mapped)
                 .collect();
             others.push(image);
-            self.step_mapped(native, selected, &mut others, parent_data)
+            self.step_mapped(native, selected, &mut others, parent_data, now)
         } else {
-            self.step_mapped(native, image, dependencies, parent_data)
+            self.step_mapped(native, image, dependencies, parent_data, now)
         }
     }
     fn step_mapped(
@@ -500,6 +546,7 @@ impl Scheduler {
         image: &mut Image,
         dependencies: &mut [&mut Image],
         parent_data: &mut [DataRegion<'_>],
+        now: u128,
     ) -> Result<Step> {
         self.require_owner(native)?;
         if let Some(request) = self.exit_request {
@@ -509,12 +556,24 @@ impl Scheduler {
             return Err(error.clone());
         }
         let len = self.workers.len();
-        let Some(index) = (0..len).map(|n| (self.cursor + n) % len).find(|&i| {
-            !matches!(
-                self.workers[i].state,
-                State::Completed(_) | State::Reaped | State::ExternalBoundary(_)
-            )
-        }) else {
+        self.blocked_deadline = None;
+        let Some(index) = (0..len)
+            .map(|n| (self.cursor + n) % len)
+            .find(|&i| self.runnable(native, i, now))
+        else {
+            if let Some(deadline_ns) = self.next_sleep_deadline() {
+                self.blocked_deadline = Some(deadline_ns);
+                return Ok(Step::Sleeping { deadline_ns });
+            }
+            if self.workers.iter().any(|w| {
+                matches!(
+                    w.state,
+                    State::Suspended(Execution::ThreadRequest(_))
+                        | State::Suspended(Execution::MutexWait(_))
+                )
+            }) {
+                return Err("Guest scheduler deadlock: blocked waits without a runnable worker or sleep deadline".into());
+            }
             return Ok(Step::Finished);
         };
         if self.remaining_dispatches == 0 {

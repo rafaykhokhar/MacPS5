@@ -358,6 +358,7 @@ pub enum Service {
     Strtod,
     Vsscanf,
     Gettimeofday,
+    Nanosleep,
     Malloc,
     Realloc,
     Calloc,
@@ -513,6 +514,7 @@ impl Service {
             | Self::Strtod
             | Self::Vsscanf
             | Self::Gettimeofday
+            | Self::Nanosleep
             | Self::ThreadSigmask
             | Self::ThreadSetCancelType
             | Self::ThreadGetschedparam
@@ -775,6 +777,9 @@ impl MutexWait {
     pub fn guest_thread_id(&self) -> u64 {
         self.ticket.thread_id()
     }
+    pub(crate) fn pending_owner(&self, native: &NativeExecutor) -> Option<u64> {
+        native.mutex.pending_owner(self.ticket)
+    }
     pub fn slot_address(&self) -> u64 {
         self.ticket.slot_address()
     }
@@ -804,6 +809,9 @@ impl QuantumYield {
 }
 #[derive(Clone, Copy, Debug)]
 pub enum ThreadOperation {
+    Sleep {
+        deadline: crate::guest_sleep::Deadline,
+    },
     Completed(u64),
     Create {
         output: u64,
@@ -860,7 +868,11 @@ impl ThreadRequest {
             .mxcsr)
     }
     pub fn x87_environment(&self) -> Result<(u16, u16)> {
-        let cpu = &self.continuation.as_ref().ok_or("Thread request already consumed")?.cpu;
+        let cpu = &self
+            .continuation
+            .as_ref()
+            .ok_or("Thread request already consumed")?
+            .cpu;
         Ok((cpu.x87_control, cpu.x87_status))
     }
 }
@@ -972,6 +984,7 @@ pub struct NativeExecutor {
     network_errno: [u8; 4],
     pub locale: crate::guest_locale::GuestLocale,
     pub guest_time: crate::guest_time::GuestTime,
+    sleep_clock: crate::guest_sleep::Clock,
     pub stdout: crate::captured_stdout::CapturedStdout,
     pub stdio: crate::guest_stdio::GuestStdio,
     stderr_file: [u8; 312],
@@ -1003,6 +1016,15 @@ pub struct NativeExecutor {
     stack_size: usize,
 }
 impl NativeExecutor {
+    pub fn configure_manual_sleep_clock(&mut self, now: u128) -> Result<()> {
+        self.sleep_clock.configure_manual(now)
+    }
+    pub fn advance_sleep_clock(&mut self, now: u128) -> Result<()> {
+        self.sleep_clock.advance_manual(now)
+    }
+    pub fn sleep_clock_now(&self) -> u128 {
+        self.sleep_clock.now()
+    }
     pub(crate) fn with_thread_request_memory<T>(
         &mut self,
         request: &mut ThreadRequest,
@@ -1604,6 +1626,7 @@ impl NativeExecutor {
             network_errno: [0; 4],
             locale: crate::guest_locale::GuestLocale::default(),
             guest_time: crate::guest_time::GuestTime::default(),
+            sleep_clock: crate::guest_sleep::Clock::default(),
             stdout: crate::captured_stdout::CapturedStdout::default(),
             stdio: crate::guest_stdio::GuestStdio::default(),
             stderr_file: crate::guest_stdio::stderr_file_bytes(),
@@ -2415,51 +2438,70 @@ impl NativeExecutor {
                     cpu.registers[4] = sp;
                     cpu.fuel -= 1;
                     self.consumed_instruction_fuel += 1;
+                    let sleep_request = if matches!(service, Service::Nanosleep) {
+                        Some(crate::guest_sleep::Request::decode(
+                            &memory,
+                            cpu.registers[7],
+                        )?)
+                    } else {
+                        None
+                    };
                     if matches!(
                         service,
                         Service::ThreadCreate | Service::ThreadJoin | Service::ThreadDetach
+                    ) || matches!(
+                        sleep_request,
+                        Some(crate::guest_sleep::Request::Delay { .. })
                     ) {
-                        let operation = if matches!(service, Service::ThreadCreate) {
-                            let output = cpu.registers[7];
-                            memory.validate_write(output, 8)?;
-                            if output < sp + 8
-                                && sp < output.checked_add(8).ok_or("Thread output overflow")?
+                        let operation =
+                            if let Some(crate::guest_sleep::Request::Delay { nanoseconds }) =
+                                sleep_request
                             {
-                                return Err("Thread output overlaps return frame".into());
-                            }
-                            let options = self
-                                .thread_attributes
-                                .snapshot(&memory, cpu.registers[6])?
-                                .ok_or("Invalid thread attributes")?;
-                            let entry = cpu.registers[2];
-                            if !memory.executable(entry) {
-                                return Err("Thread entry is not executable".into());
-                            }
-                            ThreadOperation::Create {
-                                output,
-                                entry,
-                                argument: cpu.registers[1],
-                                options,
-                            }
-                        } else if matches!(service, Service::ThreadJoin) {
-                            let output = cpu.registers[6];
-                            if output != 0 {
+                                ThreadOperation::Sleep {
+                                    deadline: self.sleep_clock.deadline(nanoseconds)?,
+                                }
+                            } else if matches!(service, Service::ThreadCreate) {
+                                let output = cpu.registers[7];
                                 memory.validate_write(output, 8)?;
                                 if output < sp + 8
-                                    && sp < output.checked_add(8).ok_or("Join output overflow")?
+                                    && sp < output.checked_add(8).ok_or("Thread output overflow")?
                                 {
-                                    return Err("Join output overlaps return frame".into());
+                                    return Err("Thread output overlaps return frame".into());
                                 }
-                            }
-                            ThreadOperation::Join {
-                                thread: cpu.registers[7],
-                                output,
-                            }
-                        } else {
-                            ThreadOperation::Detach {
-                                thread: cpu.registers[7],
-                            }
-                        };
+                                let options = self
+                                    .thread_attributes
+                                    .snapshot(&memory, cpu.registers[6])?
+                                    .ok_or("Invalid thread attributes")?;
+                                let entry = cpu.registers[2];
+                                if !memory.executable(entry) {
+                                    return Err("Thread entry is not executable".into());
+                                }
+                                ThreadOperation::Create {
+                                    output,
+                                    entry,
+                                    argument: cpu.registers[1],
+                                    options,
+                                }
+                            } else if matches!(service, Service::ThreadJoin) {
+                                let output = cpu.registers[6];
+                                if output != 0 {
+                                    memory.validate_write(output, 8)?;
+                                    if output < sp + 8
+                                        && sp
+                                            < output.checked_add(8).ok_or("Join output overflow")?
+                                    {
+                                        return Err("Join output overlaps return frame".into());
+                                    }
+                                }
+                                ThreadOperation::Join {
+                                    thread: cpu.registers[7],
+                                    output,
+                                }
+                            } else {
+                                ThreadOperation::Detach {
+                                    thread: cpu.registers[7],
+                                }
+                            };
                         if terminal {
                             cpu.stop = 3;
                         } else {
@@ -3157,56 +3199,136 @@ impl NativeExecutor {
                         } else {
                             parsed.bits
                         }
+                    } else if matches!(service, Service::Nanosleep) {
+                        // FreeBSD validates nsec first, then negative seconds and
+                        // zero duration complete immediately. Neither success path
+                        // accesses the optional remaining pointer. No signal/EINTR
+                        // delivery is fabricated by this bounded implementation.
+                        if matches!(
+                            sleep_request,
+                            Some(crate::guest_sleep::Request::InvalidNanoseconds)
+                        ) {
+                            let errno = self
+                                .kernel
+                                .as_ref()
+                                .ok_or("Missing nanosleep errno context")?
+                                .errno_address();
+                            validate_net_output(&memory, errno, 4, sp, ret)?;
+                            memory.validate_write(errno, 4)?;
+                            memory.store(errno, 22, 4)?;
+                            u32::MAX as u64
+                        } else {
+                            0
+                        }
                     } else if matches!(service, Service::Gettimeofday) {
                         let plan = self.guest_time.plan(cpu.registers[7], cpu.registers[6])?;
                         for write in &plan.writes {
-                            validate_net_output(&memory, write.address, write.bytes.len(), sp, ret)?;
+                            validate_net_output(
+                                &memory,
+                                write.address,
+                                write.bytes.len(),
+                                sp,
+                                ret,
+                            )?;
                             memory.validate_write(write.address, write.bytes.len())?;
                         }
                         // Valid aliases observe FreeBSD's timeval-then-timezone
                         // ordering. Invalid mappings stop before any output write.
-                        for write in &plan.writes { memory.write(write.address, &write.bytes)?; }
+                        for write in &plan.writes {
+                            memory.write(write.address, &write.bytes)?;
+                        }
                         0
                     } else if matches!(service, Service::Vsscanf) {
-                        let plan = crate::scan::guest_plan(&memory, cpu.registers[7], cpu.registers[6], cpu.registers[2])?;
+                        let plan = crate::scan::guest_plan_with_rounding(
+                            &memory,
+                            cpu.registers[7],
+                            cpu.registers[6],
+                            cpu.registers[2],
+                            crate::float_service::rounding(&cpu).ok(),
+                        )?;
                         for write in &plan.writes {
-                            validate_net_output(&memory, write.address, write.bytes.len(), sp, ret)?;
+                            validate_net_output(
+                                &memory,
+                                write.address,
+                                write.bytes.len(),
+                                sp,
+                                ret,
+                            )?;
                             memory.validate_write(write.address, write.bytes.len())?;
                         }
                         let errno = if plan.errno.is_some() {
-                            let address = self.kernel.as_ref().ok_or("Missing scanf errno context")?.errno_address();
-                            let end = address.checked_add(4).ok_or("Scanf errno address overflow")?;
-                            for (start, length) in plan.protected_ranges.iter().copied().chain(plan.writes.iter().map(|write| (write.address, write.bytes.len()))) {
-                                let other_end = start.checked_add(length as u64).ok_or("Scanf protected range overflow")?;
+                            let address = self
+                                .kernel
+                                .as_ref()
+                                .ok_or("Missing scanf errno context")?
+                                .errno_address();
+                            let end = address
+                                .checked_add(4)
+                                .ok_or("Scanf errno address overflow")?;
+                            for (start, length) in plan.protected_ranges.iter().copied().chain(
+                                plan.writes
+                                    .iter()
+                                    .map(|write| (write.address, write.bytes.len())),
+                            ) {
+                                let other_end = start
+                                    .checked_add(length as u64)
+                                    .ok_or("Scanf protected range overflow")?;
                                 if address < other_end && start < end {
-                                    return Err("Scanf errno aliases input, arguments or output".into());
+                                    return Err(
+                                        "Scanf errno aliases input, arguments or output".into()
+                                    );
                                 }
                             }
                             validate_net_output(&memory, address, 4, sp, ret)?;
                             memory.validate_write(address, 4)?;
                             Some(address)
-                        } else { None };
+                        } else {
+                            None
+                        };
                         // Ordinary matching failure retains successful assignments
                         // in this plan. Guard failures commit nothing; sequential
                         // output aliases retain the plan's original write order.
-                        for write in &plan.writes { memory.write(write.address, &write.bytes)?; }
-                        if let Some(address) = errno { memory.store(address, plan.errno.expect("Validated errno") as u64, 4)?; }
+                        for write in &plan.writes {
+                            memory.write(write.address, &write.bytes)?;
+                        }
+                        if let Some(address) = errno {
+                            memory.store(
+                                address,
+                                plan.errno.expect("Validated errno") as u64,
+                                4,
+                            )?;
+                        }
+                        cpu.mxcsr |= plan.mxcsr_flags;
                         plan.result as u32 as u64
                     } else if matches!(service, Service::Atof | Service::Strtod) {
                         let rounding = crate::float_service::rounding(&cpu)?;
                         let source = cpu.registers[7];
                         let input = crate::float_service::input(&memory, source)?;
                         let effect = crate::float_parse::effects::parse_effects(&input, rounding)
-                            .map_err(|error| format!("Unsupported float conversion: {error:?}"))?;
+                            .map_err(|error| {
+                            format!("Unsupported float conversion: {error:?}")
+                        })?;
                         let parsed = effect.parsed;
-                        let endptr = if matches!(service, Service::Atof) { 0 } else { cpu.registers[6] };
-                        let end = source.checked_add(parsed.end as u64).ok_or("Float end pointer overflow")?;
+                        let endptr = if matches!(service, Service::Atof) {
+                            0
+                        } else {
+                            cpu.registers[6]
+                        };
+                        let end = source
+                            .checked_add(parsed.end as u64)
+                            .ok_or("Float end pointer overflow")?;
                         let errno = if parsed.errno.is_some() {
-                            let address = self.kernel.as_ref().ok_or("Missing float conversion errno context")?.errno_address();
+                            let address = self
+                                .kernel
+                                .as_ref()
+                                .ok_or("Missing float conversion errno context")?
+                                .errno_address();
                             validate_net_output(&memory, address, 4, sp, ret)?;
                             memory.validate_write(address, 4)?;
                             Some(address)
-                        } else { None };
+                        } else {
+                            None
+                        };
                         if endptr != 0 {
                             validate_net_output(&memory, endptr, 8, sp, ret)?;
                             memory.validate_write(endptr, 8)?;
@@ -3214,9 +3336,15 @@ impl NativeExecutor {
                         // All outputs are guarded before errno/endptr or FP state
                         // changes. Source was snapshotted, so output aliases are safe.
                         if let Some(address) = errno {
-                            memory.store(address, parsed.errno.expect("Validated errno") as u32 as u64, 4)?;
+                            memory.store(
+                                address,
+                                parsed.errno.expect("Validated errno") as u32 as u64,
+                                4,
+                            )?;
                         }
-                        if endptr != 0 { memory.store(endptr, end, 8)?; }
+                        if endptr != 0 {
+                            memory.store(endptr, end, 8)?;
+                        }
                         cpu.mxcsr |= effect.mxcsr_flags;
                         cpu.vectors[0][..8].copy_from_slice(&parsed.bits.to_le_bytes());
                         // SysV binary64 returns in XMM0; RAX is not the result.
@@ -3251,8 +3379,8 @@ impl NativeExecutor {
                     } else if let Service::Ctype(operation) = service {
                         // C int consumes the low32 bits; EOF is signed -1.
                         // Out-of-domain values stop explicitly. No errno writes.
-                        crate::c_locale::apply(*operation, cpu.registers[7] as u32 as i32)?
-                            as u32 as u64
+                        crate::c_locale::apply(*operation, cpu.registers[7] as u32 as i32)? as u32
+                            as u64
                     } else if matches!(service, Service::Strncasecmp) {
                         crate::c_locale::strncasecmp(
                             &memory,

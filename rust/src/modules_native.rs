@@ -70,6 +70,19 @@ pub(super) struct StartState {
     stopping: Option<u64>,
 }
 impl Modules {
+    /// A deadline only after scheduling observed all guest work blocked.
+    pub fn native_blocked_sleep_deadline(&self) -> Option<u128> {
+        self.thread_scheduler
+            .as_ref()
+            .and_then(|s| s.blocked_sleep_deadline())
+    }
+    /// Earliest retained sleeper in the executor's monotonic clock domain.
+    /// The host driver may wait only after scheduling reports no runnable work.
+    pub fn native_sleep_deadline(&self) -> Option<u128> {
+        self.thread_scheduler
+            .as_ref()
+            .and_then(|s| s.next_sleep_deadline())
+    }
     /// Validate first, then revoke native code and remove the image without any
     /// remaining fallible operation. Failed preflight leaves both registrations.
     pub fn unload_native(&mut self, handle: u64, executor: &mut NativeExecutor) -> Result<()> {
@@ -193,9 +206,12 @@ impl Modules {
             }
             for _ in 0..max_steps {
                 self.thread_image_pins = scheduler.live_image_pins();
-                self.with_native_images(handle, |image, dependencies, data| {
+                let step = self.with_native_images(handle, |image, dependencies, data| {
                     scheduler.step(executor, image, dependencies, data)
                 })?;
+                if matches!(step, crate::scheduler::Step::Sleeping { .. }) {
+                    break;
+                }
                 if let Some(request) = scheduler.exit_request() {
                     return Ok(Some(Execution::ExitRequested(request)));
                 }

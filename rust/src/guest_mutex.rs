@@ -206,6 +206,14 @@ impl GuestMutex {
             LockOutcome::Pending(_) => unreachable!(),
         }
     }
+    /// Scheduling hint only; the ticket and guest slot are revalidated on resume.
+    pub(crate) fn pending_owner(&self, ticket: LockTicket) -> Option<u64> {
+        self.mutexes
+            .iter()
+            .find(|m| m.identity == ticket.identity)
+            .and_then(|m| m.owner)
+            .filter(|owner| *owner != ticket.thread)
+    }
     pub fn resume_lock(&mut self, memory: &Memory<'_>, ticket: LockTicket) -> Result<LockOutcome> {
         if memory.load(ticket.slot, 8)? != ticket.identity {
             return Ok(LockOutcome::Status(EINVAL));
