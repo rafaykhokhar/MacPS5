@@ -241,8 +241,17 @@ mod apple {
                 let app = checked(
                     msg!(checked(objc_getClass(c"NSApplication".as_ptr()))?,"sharedApplication"=>Obj),
                 )?;
-                if !msg!(app,"setActivationPolicy:"=>bool,isize=>0) {
-                    return Err("Cannot activate presenter application".into());
+                // LaunchServices may already have configured a regular app.
+                // The setter can return false for that redundant request; its
+                // result does not establish the effective policy or activation.
+                let previous_policy = msg!(app,"activationPolicy"=>isize);
+                let policy_request_succeeded = previous_policy == 0
+                    || msg!(app,"setActivationPolicy:"=>bool,isize=>0);
+                let effective_policy = msg!(app,"activationPolicy"=>isize);
+                if effective_policy != 0 {
+                    return Err(format!(
+                        "Presenter requires regular activation policy: before={previous_policy}, after={effective_policy}, requestSucceeded={policy_request_succeeded}"
+                    ));
                 }
                 msg!(app,"finishLaunching"=>());
                 let device = owned(MTLCreateSystemDefaultDevice())?;
