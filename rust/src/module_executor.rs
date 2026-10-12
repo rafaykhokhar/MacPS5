@@ -670,6 +670,7 @@ struct TranslationSource {
 #[derive(Clone, Copy)]
 pub enum Service {
     Getenv,
+    Getcwd,
     Setenv,
     Wcslen,
     Wcstombs,
@@ -845,6 +846,7 @@ impl Service {
             | Self::ThreadSetName
             | Self::Sigemptyset
             | Self::Sigaddset
+            | Self::Getcwd
             | Self::Setenv
             | Self::Wcslen
             | Self::Wcstombs
@@ -4746,6 +4748,18 @@ impl NativeExecutor {
                             cpu.registers[6],
                             cpu.registers[2],
                         )? as u32 as u64
+                    } else if matches!(service, Service::Getcwd) {
+                        crate::guest_getcwd::call(
+                            &mut memory,
+                            self.kernel
+                                .as_ref()
+                                .ok_or("Missing getcwd kernel context")?,
+                            cpu.registers[7],
+                            cpu.registers[6],
+                            |memory, address, length| {
+                                validate_net_output(memory, address, length, sp, ret)
+                            },
+                        )?
                     } else if matches!(service, Service::Getenv) {
                         crate::environment::getenv(&memory, self.environment, cpu.registers[7])
                             .map_err(|fault| format!("Guest getenv fault {fault:?}"))?

@@ -39,6 +39,7 @@ mod sigaction_native;
 mod wcstombs_native;
 mod sort_search_native;
 mod fgets_native;
+mod getcwd_native;
 mod system_service_native;
 mod threadattr_native;
 mod thread_services_native;
@@ -94,6 +95,7 @@ fn main() -> Result<(), String> {
     wcstombs_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     sort_search_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("sort-search"))?;
     fgets_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("fgets"))?;
+    getcwd_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("getcwd"))?;
     semaphore_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     stdio_file_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     system_service_native::verify(Path::new(&archive), Path::new(&directory))?;
@@ -463,6 +465,7 @@ fn main() -> Result<(), String> {
         ("qsort", Service::Qsort),
         ("bsearch", Service::Bsearch),
         ("fgets", Service::Fgets),
+        ("getcwd", Service::Getcwd),
     ]
     .into_iter()
     .enumerate()
@@ -1389,6 +1392,10 @@ fn main() -> Result<(), String> {
                 (920, native_ps5::stdio_file::STDIN_PTR_ADDR),
                 (928, 0x730740),
                 (936, 0x760010),
+                (944, 0x730750),
+                (952, 0x730000),
+                (960, 0x7300c0),
+                (968, 0x730010),
             ] {
                 if locale_segment.bytes[locale_offset + delta..locale_offset + delta + 8]
                     != expected.to_le_bytes()
@@ -1415,13 +1422,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 123 libc exports: (123+1)*24=2976 symbol bytes
-                // and 1+123*12=1477 NID bytes (rounded1488). Stdin/fgets
-                // exports add48+32bytes to18720; retain the exact32KiB cap.
-                || native.bytes_allocated() != 18800
+                // 124 libc exports: (124+1)*24=3000 symbol bytes (rounded3008)
+                // and 1+124*12=1489 NID bytes (rounded1504). Getcwd
+                // export adds32+16bytes to18800; retain the exact32KiB cap.
+                || native.bytes_allocated() != 18848
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'getcwd'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'mkdir'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1431,7 +1438,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; stdin/fgets imports bound; unresolved getcwd causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; getcwd import bound; unresolved mkdir causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1493,7 +1500,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved getcwd triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved mkdir triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     Ok(())

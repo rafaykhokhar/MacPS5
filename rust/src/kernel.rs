@@ -74,6 +74,10 @@ impl Kernel {
         Ok(())
     }
     /// Explicit virtual cwd; this does not query the host or create directory entries.
+    pub fn working_directory_bytes(&self) -> Option<&[u8]> {
+        self.working_directory.as_deref()
+    }
+    /// Register a canonical absolute guest path, retained with its NUL terminator.
     pub fn register_working_directory(&mut self, path: &[u8]) -> Result<()> {
         if path.is_empty()
             || path.len() > 1023

@@ -101,3 +101,5 @@ pub mod guest_compare;
 pub mod guest_sort;
 pub mod guest_search;
 mod guest_callback;
+
+pub mod guest_getcwd;
