@@ -39,6 +39,7 @@ mod environment_native;
 mod memory_compare_native;
 mod wide_strings_native;
 mod narrow_strings_native;
+mod integer_parse_native;
 mod tiler_native;
 mod tiler_gpu_native;
 mod tls_native;
@@ -83,6 +84,7 @@ fn main() -> Result<(), String> {
     memory_compare_native::verify(Path::new(&archive), Path::new(&directory))?;
     wide_strings_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     narrow_strings_native::verify(Path::new(&archive), Path::new(&directory))?;
+    integer_parse_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     tiler_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     tiler_gpu_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     user_service_native::verify(Path::new(&archive), Path::new(&directory))?;
@@ -357,6 +359,11 @@ fn main() -> Result<(), String> {
         ("strchr", Service::Strchr),
         ("strrchr", Service::Strrchr),
         ("strstr", Service::Strstr),
+        ("atoi", Service::Atoi),
+        ("strtol", Service::Strtol),
+        ("strtoul", Service::Strtoul),
+        ("strtoll", Service::Strtoll),
+        ("strtoull", Service::Strtoull),
     ]
     .into_iter()
     .enumerate()
@@ -1214,6 +1221,7 @@ fn main() -> Result<(), String> {
                 (384, 0x7303b0),
                 (392, 0x7303c0),
                 (400, 0x7303d0),
+                (408, 0x7303e0),
             ] {
                 if locale_segment.bytes[locale_offset + delta..locale_offset + delta + 8]
                     != expected.to_le_bytes()
@@ -1240,13 +1248,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 67 libc exports: (67+1)*24=1632 symbol bytes
-                // and 1+67*12=805 NID bytes (rounded816). Nine string exports
-                // add208+112bytes to16464; retain exact accounting and32KiB cap.
-                || native.bytes_allocated() != 16784
+                // 72 libc exports: (72+1)*24=1752 symbol bytes (rounded1760)
+                // and 1+72*12=865 NID bytes (rounded880). Five integer exports
+                // add128+64bytes to16784; retain exact accounting and32KiB cap.
+                || native.bytes_allocated() != 16976
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'atoi'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'atof'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1256,7 +1264,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; wide and narrow string imports bound; unresolved atoi causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; atoi import bound; unresolved atof causes a captured exit request before later integer bindings; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1318,7 +1326,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved atoi triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved atof triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     Ok(())

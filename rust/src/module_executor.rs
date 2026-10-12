@@ -349,6 +349,11 @@ pub enum Service {
     Strchr,
     Strrchr,
     Strstr,
+    Atoi,
+    Strtol,
+    Strtoul,
+    Strtoll,
+    Strtoull,
     Malloc,
     Realloc,
     Calloc,
@@ -491,6 +496,11 @@ impl Service {
             | Self::Strchr
             | Self::Strrchr
             | Self::Strstr
+            | Self::Atoi
+            | Self::Strtol
+            | Self::Strtoul
+            | Self::Strtoll
+            | Self::Strtoull
             | Self::ThreadSigmask
             | Self::ThreadSetCancelType
             | Self::ThreadGetschedparam
@@ -3065,6 +3075,67 @@ impl NativeExecutor {
                                     });
                                 }
                             }
+                        }
+                    } else if matches!(
+                        service,
+                        Service::Atoi
+                            | Service::Strtol
+                            | Service::Strtoul
+                            | Service::Strtoll
+                            | Service::Strtoull
+                    ) {
+                        // GuestLocale currently admits only C/POSIX. LP64 long
+                        // and long long share the same64-bit parser; atoi follows
+                        // FreeBSD's strtol(base10) then int cast, including errno.
+                        let atoi = matches!(service, Service::Atoi);
+                        let source = cpu.registers[7];
+                        let endptr = if atoi { 0 } else { cpu.registers[6] };
+                        let parsed = crate::integer_parse::parse(
+                            &memory,
+                            source,
+                            if atoi {
+                                10
+                            } else {
+                                cpu.registers[2] as u32 as i32
+                            },
+                            !matches!(service, Service::Strtoul | Service::Strtoull),
+                        )?;
+                        let end = source
+                            .checked_add(parsed.end_offset)
+                            .ok_or("Integer end pointer overflow")?;
+                        // Both outputs are preguarded before either changes. The
+                        // successful write order remains errno then endptr, even
+                        // if their mappings alias, matching FreeBSD11.4.
+                        let errno = if parsed.errno.is_some() {
+                            let address = self
+                                .kernel
+                                .as_ref()
+                                .ok_or("Missing integer conversion errno context")?
+                                .errno_address();
+                            validate_net_output(&memory, address, 4, sp, ret)?;
+                            memory.validate_write(address, 4)?;
+                            Some(address)
+                        } else {
+                            None
+                        };
+                        if endptr != 0 {
+                            validate_net_output(&memory, endptr, 8, sp, ret)?;
+                            memory.validate_write(endptr, 8)?;
+                        }
+                        if let Some(address) = errno {
+                            memory.store(
+                                address,
+                                parsed.errno.expect("Error output validated") as u64,
+                                4,
+                            )?;
+                        }
+                        if endptr != 0 {
+                            memory.store(endptr, end, 8)?;
+                        }
+                        if atoi {
+                            parsed.bits as u32 as u64
+                        } else {
+                            parsed.bits
                         }
                     } else if matches!(service, Service::Strlcpy | Service::Strlcat) {
                         let plan = crate::narrow_strings::copy_plan(
