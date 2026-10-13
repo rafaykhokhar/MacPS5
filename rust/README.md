@@ -1,5 +1,12 @@
 # Rust migration
 
+VEX packed AND/AND-NOT/OR/XOR now support both XMM and YMM, including guarded
+memory operands. The matching build passes 630 library tests, three integration
+tests, strict Clippy, 534,880 native logical checks and 7,257 XOR regressions.
+Discovery reaches 56,452 instructions; startup remains at missing `fscanf`
+before game main. See [CPU evidence](../docs/status/CPU.md). Production readiness
+and retail gameplay remain unverified.
+
 VEX packed sign/zero extension now covers all six widening pairs and XMM/YMM
 destinations. The matching build passes 626 library tests, three integration
 tests, strict Clippy and 50,340 native checks. Discovery reaches 56,149

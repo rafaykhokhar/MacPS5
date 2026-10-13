@@ -37,6 +37,29 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn packed_logical_address_guards() {
+        for opcode in [0xdb, 0xdf, 0xeb, 0xef] {
+            for length in [0, 4] {
+                // Address-size override with no base or index must not become
+                // an accidental 64-bit absolute memory operand.
+                let bytes = [
+                    0x67,
+                    0xc4,
+                    0xe1,
+                    0x71 | length,
+                    opcode,
+                    0x04,
+                    0x25,
+                    0,
+                    0,
+                    0,
+                    0,
+                ];
+                assert!(super::translate_rust_memory_region(&bytes, 0, "address").is_err());
+            }
+        }
+    }
+    #[test]
     fn packed_widening_forms_and_guards() {
         for base in [0x20, 0x30] {
             for opcode in base..base + 6 {
@@ -995,6 +1018,67 @@ impl Emitter {
                     224 + dst * 32, 232 + dst * 32
                 ));
             }
+            M::Vpand | M::Vpandn | M::Vpor | M::Vpxor => {
+                use iced_x86::Code;
+                let (operation, wide) = match i.code() {
+                    Code::VEX_Vpand_xmm_xmm_xmmm128 => (0, false),
+                    Code::VEX_Vpand_ymm_ymm_ymmm256 => (0, true),
+                    Code::VEX_Vpandn_xmm_xmm_xmmm128 => (1, false),
+                    Code::VEX_Vpandn_ymm_ymm_ymmm256 => (1, true),
+                    Code::VEX_Vpor_xmm_xmm_xmmm128 => (2, false),
+                    Code::VEX_Vpor_ymm_ymm_ymmm256 => (2, true),
+                    Code::VEX_Vpxor_xmm_xmm_xmmm128 => (3, false),
+                    Code::VEX_Vpxor_ymm_ymm_ymmm256 => (3, true),
+                    _ => return Err("Only VEX128/256 packed logical forms are implemented".into()),
+                };
+                let dst = vector(i.op0_register())?;
+                let first = vector(i.op1_register())?;
+                if i.op2_kind() == OpKind::Memory {
+                    if i.memory_base() == R::None
+                        && i.memory_index() == R::None
+                        && i.memory_displ_size() != 8
+                    {
+                        return Err("32-bit absolute addressing is not implemented".into());
+                    }
+                    self.address(i)?;
+                    self.emit(format!(
+                        "mov x0, x19\nmov x2, #{dst}\nmov x3, #{first}\nmov x4, #{}\nmov x5, #{operation}\nbl _native_ps5_module_vector_logical_v1",
+                        if wide { 32 } else { 16 }
+                    ));
+                    self.fault();
+                } else {
+                    let second = vector(i.op2_register())?;
+                    let op = match operation {
+                        0 => "and",
+                        1 => "bic",
+                        2 => "orr",
+                        _ => "eor",
+                    };
+                    // BIC complements its second input; x86 AND-NOT complements
+                    // its first. Reverse only that operation's NEON operands.
+                    let (left, right) = if operation == 1 { (1, 0) } else { (0, 1) };
+                    self.emit(format!(
+                        "ldr q0, [x19, #{}]\nldr q1, [x19, #{}]\n{op} v0.16b, v{left}.16b, v{right}.16b",
+                        208 + first * 32, 208 + second * 32
+                    ));
+                    if wide {
+                        self.emit(format!(
+                            "ldr q2, [x19, #{}]\nldr q3, [x19, #{}]\n{op} v2.16b, v{}.16b, v{}.16b",
+                            224 + first * 32,
+                            224 + second * 32,
+                            left + 2,
+                            right + 2
+                        ));
+                    } else {
+                        self.emit("movi v2.16b, #0");
+                    }
+                    self.emit(format!(
+                        "str q0, [x19, #{}]\nstr q2, [x19, #{}]",
+                        208 + dst * 32,
+                        224 + dst * 32
+                    ));
+                }
+            }
             M::Vpaddb
             | M::Vpaddw
             | M::Vpaddd
@@ -1522,24 +1606,13 @@ impl Emitter {
                     self.fault();
                 }
             }
-            M::Vmovaps
-            | M::Vmovups
-            | M::Vmovdqa
-            | M::Vmovdqu
-            | M::Vxorps
-            | M::Vxorpd
-            | M::Vpxor => {
-                // The pinned executable currently requires only VEX128 VPXOR.
-                // Do not inherit wider forms merely because XOR lowering is shared.
-                if m == M::Vpxor && i.code() != iced_x86::Code::VEX_Vpxor_xmm_xmm_xmmm128 {
-                    return Err("Only VEX128 VPXOR is implemented".into());
-                }
+            M::Vmovaps | M::Vmovups | M::Vmovdqa | M::Vmovdqu | M::Vxorps | M::Vxorpd => {
                 if !matches!(i.encoding(), iced_x86::EncodingKind::VEX)
                     || ![128, 256].contains(&width)
                 {
                     return Err("Only VEX128/256 vector forms are implemented".into());
                 }
-                if matches!(m, M::Vxorps | M::Vxorpd | M::Vpxor) {
+                if matches!(m, M::Vxorps | M::Vxorpd) {
                     let dst = vector(i.op_register(0))?;
                     let first = vector(i.op_register(1))?;
                     if i.op_kind(2) == OpKind::Memory {

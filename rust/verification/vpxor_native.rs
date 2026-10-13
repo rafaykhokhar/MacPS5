@@ -36,9 +36,9 @@ pub fn verify(archive: &Path, directory: &Path) -> Result<(), String> {
             &format!("vpxor_{name}"),
         )?);
     }
-    for bytes in [&[0xc5, 0xfd, 0xef, 0xc0][..], &[0x66, 0x0f, 0xef, 0xc0][..]] {
+    for bytes in [&[0x66, 0x0f, 0xef, 0xc0][..]] {
         if native_ps5::aot::translate_rust_memory_region(bytes, 0, "unsupported_vpxor").is_ok() {
-            return Err("Unimplemented VPXOR width/legacy accepted".into());
+            return Err("Unimplemented legacy PXOR accepted".into());
         }
     }
     let asm = directory.join("vpxor.S");

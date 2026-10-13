@@ -743,6 +743,34 @@ pub fn vector_cmpgtd256(
     vectors[destination as usize] = result;
     Ok(())
 }
+/// Apply packed bitwise logic after guarding the complete memory operand.
+/// Operations are AND=0, AND-NOT=1 (~first & memory), OR=2, XOR=3.
+pub fn vector_logical(
+    memory: &Memory<'_>,
+    vectors: &mut [[u8; 32]; 16],
+    address: u64,
+    destination: u64,
+    first: u64,
+    size: u64,
+    operation: u64,
+) -> Result<()> {
+    vector_operand(address, destination, size, 0)?;
+    if first >= 16 || operation > 3 {
+        return Err("Invalid packed logical operand".into());
+    }
+    let source = memory.read(address, size as usize)?;
+    let mut result = [0; 32];
+    for ((out, lhs), rhs) in result.iter_mut().zip(&vectors[first as usize]).zip(source) {
+        *out = match operation {
+            0 => lhs & rhs,
+            1 => !lhs & rhs,
+            2 => lhs | rhs,
+            _ => lhs ^ rhs,
+        };
+    }
+    vectors[destination as usize] = result;
+    Ok(())
+}
 /// Compare packed integer lanes after validating the complete memory operand.
 /// A 128-bit result clears the destination's modeled upper 128 bits.
 pub fn vector_cmpeq(
@@ -994,6 +1022,39 @@ pub mod ffi {
                 destination,
                 first,
                 size,
+            )
+            .is_ok()
+        {
+            return;
+        }
+        cpu.fault = 1;
+    }
+    /// # Safety
+    /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn native_ps5_module_vector_logical_v1(
+        cpu: *mut Cpu,
+        address: u64,
+        destination: u64,
+        first: u64,
+        size: u64,
+        operation: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if cpu.memory != 0
+            && vector_logical(
+                unsafe { &*(cpu.memory as *const Memory<'_>) },
+                &mut cpu.vectors,
+                address,
+                destination,
+                first,
+                size,
+                operation,
             )
             .is_ok()
         {
@@ -1635,6 +1696,126 @@ mod tests {
         unsafe { ffi::native_ps5_module_vector_addsub_v1(&mut cpu, 0x1000, 0, 0, 16, 1, 2) };
         assert_eq!(cpu.fault, 1);
         assert_eq!(cpu.vectors, before);
+    }
+    #[test]
+    fn packed_logical_truth_table_widths_and_aliases() {
+        for size in [16usize, 32] {
+            for operation in 0..4 {
+                for destination in [3usize, 15] {
+                    // Every bit sees all four input combinations, at different lane positions.
+                    let mut vectors = [[0xa5; 32]; 16];
+                    vectors[15] = std::array::from_fn(|i| [0x00, 0xff, 0x55, 0xaa][i % 4]);
+                    let mut data: [u8; 32] =
+                        std::array::from_fn(|i| [0x55, 0xaa, 0xff, 0x00][i % 4]);
+                    let mut expected = [0; 32];
+                    for i in 0..size {
+                        for bit in 0..8 {
+                            let a = vectors[15][i] & (1 << bit) != 0;
+                            let b = data[i] & (1 << bit) != 0;
+                            let value = match operation {
+                                0 => a && b,
+                                1 => !a && b,
+                                2 => a || b,
+                                _ => a != b,
+                            };
+                            expected[i] |= u8::from(value) << bit;
+                        }
+                    }
+                    let mut memory = Memory::default();
+                    memory
+                        .add(0x1_0000_0001, &mut data[..size], false, false)
+                        .unwrap();
+                    let mut all_expected = vectors;
+                    all_expected[destination] = expected;
+                    vector_logical(
+                        &memory,
+                        &mut vectors,
+                        0x1_0000_0001,
+                        destination as u64,
+                        15,
+                        size as u64,
+                        operation,
+                    )
+                    .unwrap();
+                    assert_eq!(vectors, all_expected);
+                }
+            }
+        }
+    }
+    #[test]
+    fn packed_logical_invalid_parameters_and_short_reads_are_atomic() {
+        let original = [[0xa5; 32]; 16];
+        for size in [16u64, 32] {
+            for operation in 0..4 {
+                for length in 0..size as usize {
+                    let mut data = vec![0xa5; length];
+                    let mut memory = Memory::default();
+                    if length != 0 {
+                        memory.add(0x1001, &mut data, false, false).unwrap();
+                    }
+                    let mut vectors = original;
+                    assert!(
+                        vector_logical(&memory, &mut vectors, 0x1001, 0, 0, size, operation)
+                            .is_err()
+                    );
+                    assert_eq!(vectors, original);
+                }
+            }
+        }
+        let mut data = [0xa5; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        for (dst, first, size, operation) in [
+            (16, 0, 16, 0),
+            (u64::MAX, 0, 16, 0),
+            (0, 16, 16, 0),
+            (0, u64::MAX, 16, 0),
+            (0, 0, 0, 0),
+            (0, 0, 8, 0),
+            (0, 0, 64, 0),
+            (0, 0, u64::MAX, 0),
+            (0, 0, 16, 4),
+            (0, 0, 16, u64::MAX),
+        ] {
+            let mut vectors = original;
+            assert!(
+                vector_logical(&memory, &mut vectors, 0x1001, dst, first, size, operation).is_err()
+            );
+            assert_eq!(vectors, original);
+        }
+    }
+    #[test]
+    #[allow(unsafe_code)]
+    fn packed_logical_ffi_guards_faults_and_preserves_flags() {
+        use crate::legacy_cpu::Cpu;
+        unsafe { ffi::native_ps5_module_vector_logical_v1(std::ptr::null_mut(), 0, 0, 0, 16, 0) };
+        let mut cpu = Cpu {
+            vectors: [[0x55; 32]; 16],
+            flags: u64::MAX,
+            ..Cpu::default()
+        };
+        for fault in [0, 2, 13] {
+            cpu.fault = fault;
+            unsafe { ffi::native_ps5_module_vector_logical_v1(&mut cpu, 0x1001, 0, 0, 16, 1) };
+            assert_eq!(cpu.fault, if fault == 0 { 1 } else { fault });
+            assert_eq!(cpu.vectors, [[0x55; 32]; 16]);
+            assert_eq!(cpu.flags, u64::MAX);
+        }
+        let mut data = [0x0f; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        cpu.memory = (&mut memory as *mut Memory<'_>) as u64;
+        cpu.fault = 0;
+        unsafe { ffi::native_ps5_module_vector_logical_v1(&mut cpu, 0x1001, 0, 0, 16, 1) };
+        assert_eq!(cpu.fault, 0);
+        assert_eq!(&cpu.vectors[0][..16], &[0x0a; 16]);
+        assert_eq!(&cpu.vectors[0][16..], &[0; 16]);
+        assert_eq!(cpu.flags, u64::MAX);
+        let before = cpu.vectors;
+        unsafe { ffi::native_ps5_module_vector_logical_v1(&mut cpu, 0x1001, 0, 0, 16, 4) };
+        assert_eq!(cpu.fault, 1);
+        assert_eq!(cpu.vectors, before);
+        assert_eq!(cpu.flags, u64::MAX);
     }
     #[test]
     fn packed_equality_all_widths_and_aliases() {

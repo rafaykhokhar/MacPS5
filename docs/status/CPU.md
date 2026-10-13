@@ -1,5 +1,40 @@
 # CPU completion criteria
 
+## Packed logical operations
+
+VEX VPAND, VPANDN, VPOR and VPXOR now cover both XMM and YMM operands
+(eight exact forms). Register operations lower to ARM64 AND/BIC/ORR/EOR;
+BIC inputs are reversed to implement x86's complement of the first source.
+Both source halves are read before destination stores. Memory operands use a
+guarded 16/32-byte read and commit the result only after the complete read
+succeeds. XMM results clear the upper YMM half; flags and FP state are preserved.
+WIG is accepted; legacy/EVEX and unsupported FS/GS/address32 forms remain rejected.
+
+Reference: AMD APM Volume 4 rev.3.24 pp.285–288, 432–433 and 523–524
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)).
+Architectural alignment-control exceptions and full exception delivery remain
+outside the current guarded-memory model.
+
+The matching build passes 630 library tests, three integration tests, strict
+Clippy and release compilation (`work/packed-logical-native/{tests,clippy,release}.log`,
+process 23347 exit 0). The [native verifier](../../rust/verification/packed_logical_native.rs)
+passes 534,880 independent bit truth-table checks across 96 decoded fixtures,
+including every byte pair, asymmetric AND-NOT inputs, distinct upper lanes,
+source/destination aliases, high registers, WIG, exact-end readonly high/unaligned/
+RIP memory inputs, every short span, flags/FP, fuel and prior faults. The existing
+VPXOR verifier also passes 7,257 regression checks after removing its obsolete
+256-bit rejection (`work/packed-logical-native/native.log`, process 48325 exit 0).
+
+Discovery reaches 56,452 instructions and 12,849 blocks, with 184 unsupported
+sites: 11 former stops are removed and eight later stops become visible.
+These are discovery counts, not CPU coverage percentages. The integrated entry
+runner compiles with warnings denied; its startup-only run still stops at missing
+`fscanf`, with ten accepted dependencies and 20,288 owned dependency bytes.
+Cleanup remains pending and game main has not executed
+(`work/packed-logical-native/entry.log`, process 54077 exit 0). The full GPU suite
+was not run for this CPU change. Retail gameplay and production readiness remain
+unverified.
+
 ## Packed sign and zero extension
 
 VEX VPMOVSX/ZX now support BW/BD/BQ/WD/WQ/DQ widening for XMM and YMM
