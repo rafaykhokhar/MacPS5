@@ -1,5 +1,12 @@
 # Rust migration
 
+A reproducible Rust translation benchmark now measures compilation, incremental
+publication and checked warm execution on Apple Silicon. Five M5 Pro samples
+took 637–675 ms for initial compilation and 613–632 ms for an additional batch;
+the synthetic 30005-instruction loop averaged 172–187 μs per warm invocation.
+This does not establish retail performance or memory fit. See the commands,
+sample table and limitations in [translator readiness](../docs/status/TRANSLATOR_READINESS.md#synthetic-translation-latency-baseline).
+
 VEX signed packed greater-than comparisons now support eight byte/word/dword/
 qword XMM/YMM forms. The matching build passes 682 library tests, three
 integration tests, strict Clippy, 156,352 new native checks, 82,005 compare/shift

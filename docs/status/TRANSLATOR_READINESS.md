@@ -14,7 +14,7 @@ are developed. This document is an acceptance plan, not a completion claim.
 | Faults and recovery | Correct fault classification, delivery, ordering and restart state | Runtime guard stops do not establish architectural exception delivery |
 | Atomics and threading | Required atomic operations and memory ordering under contention | Cooperative execution and aligned LOCK XADD32 are insufficient |
 | Translation lifecycle | Incremental compilation, bounded code ownership, safe publication/retirement and repeatable cache identity | Incremental compilation verified below; no production code cache yet |
-| Performance | Reproducible cold-start, translation latency, steady-state throughput and memory measurements on the target Mac | No native-level performance claim established |
+| Performance | Reproducible cold-start, translation latency, steady-state throughput and memory measurements on the target Mac | Synthetic loop baseline below; representative workloads, process cold-start and RSS still unmeasured |
 | Deployment | Standalone installation, tested macOS execution permissions, diagnostics and failure recovery | Compilation currently depends on xcrun/clang and a matching runtime archive |
 | Integration | Sustained representative CPU workloads with indirect branches, mixed instruction families and thread interactions | Existing native fixtures and partial homebrew startup are narrower evidence |
 
@@ -117,3 +117,47 @@ Existing automatic/explicit translation regressions pass under default limits
 The real homebrew startup-only regression also passes under default limits
 (`work/arm64-prototype/translator-cache-entry.log`, process 74074 exit 0),
 stopping at the existing missing fscanf import. Game main remains unexecuted.
+
+## Synthetic translation latency baseline
+
+`rust/verification/translation_benchmark.rs` measures five fresh executors:
+initial translation/publication, first execution, incremental CALL/RET batch
+publication, and 100 checked executions through that batch. The guest loop sums
+10000 down to 1; every result must equal the independently calculated 50005000.
+Each warm invocation executes 30005 guest instructions, including CALL/RET.
+Every sample verifies complete library retirement and removal of its artifacts.
+The output directory must not exist; existing directories are never removed.
+
+Reproduce from the repository root, with Rust on PATH:
+
+```sh
+cargo build --release --manifest-path rust/Cargo.toml
+rustc --edition=2024 -O -Dwarnings rust/verification/translation_benchmark.rs \
+  --extern native_ps5=rust/target/release/libnative_ps5.rlib \
+  -L dependency=rust/target/release/deps -o /tmp/macps5-translation-benchmark
+NATIVE_PS5_RUNTIME_ARCHIVE="$PWD/rust/target/release/libnative_ps5.a" \
+NATIVE_PS5_AOT_DIRECTORY="$PWD/benchmark-artifacts-new" \
+  /tmp/macps5-translation-benchmark
+```
+
+On 2026-10-13, Apple M5 Pro, arm64 macOS 26.5.1 (25F80), release runtime
+at `ddcf3ed`, strict-warning compilation and the benchmark passed (process
+10421 exit 0; workspace `work/translation-benchmark/confirmed.csv`). Results:
+
+| Sample | Initial compile ms | Extension ms | First run μs | Warm mean μs/run |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 673.414 | 613.356 | 391.792 | 175.083 |
+| 1 | 637.323 | 614.885 | 456.042 | 172.151 |
+| 2 | 651.740 | 614.269 | 368.666 | 186.719 |
+| 3 | 653.516 | 632.075 | 327.666 | 172.757 |
+| 4 | 674.755 | 616.395 | 298.167 | 175.311 |
+
+Each sample retained two libraries charging 4915200 mapped segment bytes.
+These are repeated in-process measurements with warm filesystem/compiler caches,
+not cold OS launches. Compile timings include discovery, assembly emission,
+clang/linking, dylib loading and publication; they do not isolate each stage.
+Warm timings include host dispatch and result checks. First-run timing uses the
+original loop entry, while warm timing includes the additional CALL/RET batch.
+No native reference ratio, game FPS, SIMD/memory workload coverage, peak RSS,
+16 GB fit or production readiness follows from this tiny integer loop. The
+baseline makes compilation overhead measurable before replacing the backend.
