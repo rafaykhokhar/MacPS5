@@ -1,5 +1,39 @@
 # CPU completion criteria
 
+## Per-lane variable shifts
+
+VEX VPSLLVD/Q, VPSRLVD/Q and VPSRAVD now support ten XMM/YMM forms. The
+translator checks each full unsigned 32/64-bit count before selecting a result;
+it does not inherit ARM's masked scalar shift count. Oversized logical shifts
+produce zero, and oversized arithmetic dword shifts produce the sign fill.
+Register results are assembled before either destination half is written,
+preserving source/count/destination aliases. Memory helpers guard the complete
+16/32-byte count operand before committing. XMM results clear the upper half;
+flags and FP state are preserved. Only the exact VEX forms are accepted.
+
+Reference: AMD APM Volume 4 rev.3.24 pp.845–854
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)).
+Architectural alignment-control behavior and full exception delivery remain
+outside the current guard model.
+
+The matching build passes 667 library tests, three integration tests, strict
+Clippy and release compilation (`work/packed-variable-shift-native/{tests,clippy,release}.log`,
+process 37890 exit 0). The [native verifier](../../rust/verification/packed_variable_shift_native.rs)
+passes 124,080 checks across 120 decoded fixtures with an independent widened
+multiply/divide oracle: counts 0–255, 256, every higher bit, maximum counts,
+boundaries, mixed/random lanes, sign extrema, aliases/high registers, readonly
+high/unaligned/RIP operands, every short span, flags/FP/fuel/prior faults
+(`work/packed-variable-shift-native/native.log`, process 42646 exit 0).
+
+Discovery reaches 57,737 instructions and 13,095 blocks with 149 unsupported
+sites: one former stop removed and no new stops. These counts do not measure
+CPU completion. The entry runner compiles with warnings denied and startup-only
+verification passes at the existing missing `fscanf` boundary: ten accepted
+dependencies, 20,288 owned dependency bytes and cleanup pending. Game main has
+not executed (`work/packed-variable-shift-native/entry.log`, process 37955 exit
+0). No full GPU suite was run for this CPU change. Production readiness and
+retail gameplay remain unverified.
+
 ## Packed widening multiply and word multiply-add
 
 VEX VPMADDWD, VPMULUDQ and VPMULDQ now support their six XMM/YMM forms.

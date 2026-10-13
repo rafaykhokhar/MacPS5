@@ -758,6 +758,62 @@ pub fn vector_cmpgtd256(
     vectors[destination as usize] = result;
     Ok(())
 }
+/// Packed variable shifts: 0=left logical, 1=right logical, 2=right arithmetic.
+#[derive(Clone, Copy)]
+pub struct VectorVariableShift {
+    pub destination: u64,
+    pub first: u64,
+    pub size: u64,
+    pub lane_size: u64,
+    pub operation: u64,
+}
+pub fn vector_variable_shift(
+    memory: &Memory<'_>,
+    vectors: &mut [[u8; 32]; 16],
+    address: u64,
+    operation: VectorVariableShift,
+) -> Result<()> {
+    let VectorVariableShift {
+        destination,
+        first,
+        size,
+        lane_size,
+        operation,
+    } = operation;
+    vector_operand(address, destination, size, 0)?;
+    if first >= 16
+        || ![4, 8].contains(&lane_size)
+        || operation > 2
+        || (operation == 2 && lane_size != 4)
+    {
+        return Err("Invalid packed variable shift operand".into());
+    }
+    let counts = memory.read(address, size as usize)?;
+    let width = lane_size as usize;
+    let bits = lane_size * 8;
+    let mut result = [0; 32];
+    for start in (0..size as usize).step_by(width) {
+        let end = start + width;
+        let mut value = [0; 8];
+        let mut count = [0; 8];
+        value[..width].copy_from_slice(&vectors[first as usize][start..end]);
+        count[..width].copy_from_slice(&counts[start..end]);
+        let value = u64::from_le_bytes(value);
+        let count = u64::from_le_bytes(count);
+        let shifted = if operation == 2 {
+            ((value as i32) >> count.min(31)) as u64
+        } else if count >= bits {
+            0
+        } else if operation == 0 {
+            value << count
+        } else {
+            value >> count
+        };
+        result[start..end].copy_from_slice(&shifted.to_le_bytes()[..width]);
+    }
+    vectors[destination as usize] = result;
+    Ok(())
+}
 /// Packed multiply: 0=MADDWD, 1=MULUDQ, 2=MULDQ.
 #[derive(Clone, Copy)]
 pub struct VectorMultiply {
@@ -1354,6 +1410,43 @@ pub mod ffi {
                 destination,
                 first,
                 size,
+            )
+            .is_ok()
+        {
+            return;
+        }
+        cpu.fault = 1;
+    }
+    /// # Safety
+    /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn native_ps5_module_vector_variable_shift_v1(
+        cpu: *mut Cpu,
+        address: u64,
+        destination: u64,
+        first: u64,
+        size: u64,
+        lane_size: u64,
+        operation: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if cpu.memory != 0
+            && vector_variable_shift(
+                unsafe { &*(cpu.memory as *const Memory<'_>) },
+                &mut cpu.vectors,
+                address,
+                VectorVariableShift {
+                    destination,
+                    first,
+                    size,
+                    lane_size,
+                    operation,
+                },
             )
             .is_ok()
         {
@@ -2384,6 +2477,198 @@ mod tests {
         assert_eq!(memory.read(0x1001, 16).unwrap(), &original[15][16..]);
         assert_eq!(cpu.vectors, original);
         assert_eq!(cpu.flags, u64::MAX);
+    }
+    #[test]
+    fn packed_variable_shift_full_counts_and_signed_extrema() {
+        for size in [16usize, 32] {
+            for width in [4usize, 8] {
+                let bits = width * 8;
+                let mask = (1u128 << bits) - 1;
+                let values = [0, 1, mask, 1u128 << (bits - 1), (1u128 << (bits - 1)) - 1];
+                let counts = [
+                    0,
+                    1,
+                    bits as u64 - 1,
+                    bits as u64,
+                    bits as u64 + 1,
+                    255,
+                    256,
+                    1u64 << (bits - 1),
+                    mask as u64,
+                ];
+                for operation in 0..=if width == 4 { 2 } else { 1 } {
+                    for destination in [3usize, 15] {
+                        for &value in &values {
+                            for rotation in 0..counts.len() {
+                                let mut vectors = [[0xa5; 32]; 16];
+                                let mut data = [0; 32];
+                                let mut result = [0; 32];
+                                for (lane, start) in (0..size).step_by(width).enumerate() {
+                                    let count = counts[(lane + rotation) % counts.len()];
+                                    vectors[15][start..start + width]
+                                        .copy_from_slice(&value.to_le_bytes()[..width]);
+                                    data[start..start + width]
+                                        .copy_from_slice(&count.to_le_bytes()[..width]);
+                                    let expected = if operation == 2 {
+                                        let signed = if value >= 1u128 << (bits - 1) {
+                                            value as i128 - (1i128 << bits)
+                                        } else {
+                                            value as i128
+                                        };
+                                        signed.div_euclid(2i128.pow(count.min(32) as u32)) as u128
+                                    } else if count >= bits as u64 {
+                                        0
+                                    } else if operation == 0 {
+                                        value * 2u128.pow(count as u32)
+                                    } else {
+                                        value / 2u128.pow(count as u32)
+                                    };
+                                    result[start..start + width]
+                                        .copy_from_slice(&expected.to_le_bytes()[..width]);
+                                }
+                                let mut expected = vectors;
+                                expected[destination] = result;
+                                let mut memory = Memory::default();
+                                memory
+                                    .add(0x1_0000_0001, &mut data[..size], false, false)
+                                    .unwrap();
+                                vector_variable_shift(
+                                    &memory,
+                                    &mut vectors,
+                                    0x1_0000_0001,
+                                    VectorVariableShift {
+                                        destination: destination as u64,
+                                        first: 15,
+                                        size: size as u64,
+                                        lane_size: width as u64,
+                                        operation,
+                                    },
+                                )
+                                .unwrap();
+                                assert_eq!(vectors, expected);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn packed_variable_shift_rejects_short_counts_and_invalid_operands() {
+        let original = [[0xa5; 32]; 16];
+        for size in [16u64, 32] {
+            for lane_size in [4, 8] {
+                for operation in 0..=if lane_size == 4 { 2 } else { 1 } {
+                    for length in 0..size as usize {
+                        let mut data = vec![0; length];
+                        let mut memory = Memory::default();
+                        if length != 0 {
+                            memory.add(0x1001, &mut data, false, false).unwrap();
+                        }
+                        let mut vectors = original;
+                        assert!(
+                            vector_variable_shift(
+                                &memory,
+                                &mut vectors,
+                                0x1001,
+                                VectorVariableShift {
+                                    destination: 0,
+                                    first: 0,
+                                    size,
+                                    lane_size,
+                                    operation
+                                }
+                            )
+                            .is_err()
+                        );
+                        assert_eq!(vectors, original);
+                    }
+                }
+            }
+        }
+        let mut data = [0; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        for (destination, first, size, lane_size, operation) in [
+            (16, 0, 16, 4, 0),
+            (u64::MAX, 0, 16, 4, 0),
+            (0, 16, 16, 4, 0),
+            (0, u64::MAX, 16, 4, 0),
+            (0, 0, 0, 4, 0),
+            (0, 0, 8, 4, 0),
+            (0, 0, 64, 4, 0),
+            (0, 0, u64::MAX, 4, 0),
+            (0, 0, 16, 0, 0),
+            (0, 0, 16, 1, 0),
+            (0, 0, 16, 2, 0),
+            (0, 0, 16, u64::MAX, 0),
+            (0, 0, 16, 8, 2),
+            (0, 0, 16, 4, 3),
+            (0, 0, 16, 4, u64::MAX),
+        ] {
+            let mut vectors = original;
+            assert!(
+                vector_variable_shift(
+                    &memory,
+                    &mut vectors,
+                    0x1001,
+                    VectorVariableShift {
+                        destination,
+                        first,
+                        size,
+                        lane_size,
+                        operation
+                    }
+                )
+                .is_err()
+            );
+            assert_eq!(vectors, original);
+        }
+    }
+    #[test]
+    #[allow(unsafe_code)]
+    fn packed_variable_shift_ffi_preserves_faults_and_fp_state() {
+        use crate::legacy_cpu::Cpu;
+        unsafe {
+            ffi::native_ps5_module_vector_variable_shift_v1(std::ptr::null_mut(), 0, 0, 0, 16, 4, 0)
+        };
+        let mut cpu = Cpu {
+            vectors: [[0x80; 32]; 16],
+            flags: u64::MAX,
+            mxcsr: 0xffff,
+            x87_control: 0x137f,
+            x87_status: 0x5555,
+            ..Cpu::default()
+        };
+        for fault in [0, 2, 13] {
+            cpu.fault = fault;
+            unsafe {
+                ffi::native_ps5_module_vector_variable_shift_v1(&mut cpu, 0x1001, 0, 0, 16, 4, 2)
+            };
+            assert_eq!(cpu.fault, if fault == 0 { 1 } else { fault });
+            assert_eq!(cpu.vectors, [[0x80; 32]; 16]);
+        }
+        let mut data = [0xff; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        cpu.memory = (&mut memory as *mut Memory<'_>) as u64;
+        cpu.fault = 0;
+        unsafe {
+            ffi::native_ps5_module_vector_variable_shift_v1(&mut cpu, 0x1001, 0, 0, 16, 4, 2)
+        };
+        assert_eq!(cpu.fault, 0);
+        assert_eq!(&cpu.vectors[0][..16], &[0xff; 16]);
+        assert_eq!(&cpu.vectors[0][16..], &[0; 16]);
+        let before = cpu.vectors;
+        unsafe {
+            ffi::native_ps5_module_vector_variable_shift_v1(&mut cpu, 0x1001, 0, 0, 16, 8, 2)
+        };
+        assert_eq!(cpu.fault, 1);
+        assert_eq!(cpu.vectors, before);
+        assert_eq!(
+            (cpu.flags, cpu.mxcsr, cpu.x87_control, cpu.x87_status),
+            (u64::MAX, 0xffff, 0x137f, 0x5555)
+        );
     }
     #[test]
     fn packed_multiply_extrema_ignored_lanes_and_aliases() {

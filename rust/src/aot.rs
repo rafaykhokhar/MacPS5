@@ -37,6 +37,27 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn packed_variable_shift_absolute_address_guard() {
+        for (opcode, w) in [(0x47, 0), (0x47, 0x80), (0x45, 0), (0x45, 0x80), (0x46, 0)] {
+            for length in [0, 4] {
+                let bytes = [
+                    0x67,
+                    0xc4,
+                    0xe2,
+                    0x79 | w | length,
+                    opcode,
+                    0x04,
+                    0x25,
+                    0,
+                    0,
+                    0,
+                    0,
+                ];
+                assert!(super::translate_rust_memory_region(&bytes, 0, "address").is_err());
+            }
+        }
+    }
+    #[test]
     fn packed_multiply_absolute_address_guard() {
         for (map, opcode) in [(1, 0xf5), (1, 0xf4), (2, 0x28)] {
             for length in [0, 4] {
@@ -1840,6 +1861,79 @@ impl Emitter {
                     // Preserve both old sources for every destination alias.
                     self.emit(format!(
                         "str q0, [x19, #{}]\nstr q2, [x19, #{}]",
+                        208 + dst * 32,
+                        224 + dst * 32
+                    ));
+                }
+            }
+            M::Vpsllvd | M::Vpsllvq | M::Vpsrlvd | M::Vpsrlvq | M::Vpsravd => {
+                use iced_x86::Code;
+                let (lane_size, operation, wide) = match i.code() {
+                    Code::VEX_Vpsllvd_xmm_xmm_xmmm128 => (4, 0, false),
+                    Code::VEX_Vpsllvd_ymm_ymm_ymmm256 => (4, 0, true),
+                    Code::VEX_Vpsllvq_xmm_xmm_xmmm128 => (8, 0, false),
+                    Code::VEX_Vpsllvq_ymm_ymm_ymmm256 => (8, 0, true),
+                    Code::VEX_Vpsrlvd_xmm_xmm_xmmm128 => (4, 1, false),
+                    Code::VEX_Vpsrlvd_ymm_ymm_ymmm256 => (4, 1, true),
+                    Code::VEX_Vpsrlvq_xmm_xmm_xmmm128 => (8, 1, false),
+                    Code::VEX_Vpsrlvq_ymm_ymm_ymmm256 => (8, 1, true),
+                    Code::VEX_Vpsravd_xmm_xmm_xmmm128 => (4, 2, false),
+                    Code::VEX_Vpsravd_ymm_ymm_ymmm256 => (4, 2, true),
+                    _ => {
+                        return Err(
+                            "Only VEX128/256 variable dword/qword shifts are implemented".into(),
+                        );
+                    }
+                };
+                let dst = vector(i.op0_register())?;
+                let first = vector(i.op1_register())?;
+                if i.op2_kind() == OpKind::Memory {
+                    if i.memory_base() == R::None
+                        && i.memory_index() == R::None
+                        && i.memory_displ_size() != 8
+                    {
+                        return Err("32-bit absolute addressing is not implemented".into());
+                    }
+                    self.address(i)?;
+                    self.emit(format!("mov x0, x19\nmov x2, #{dst}\nmov x3, #{first}\nmov x4, #{}\nmov x5, #{lane_size}\nmov x6, #{operation}\nbl _native_ps5_module_vector_variable_shift_v1",if wide {32} else {16}));
+                    self.fault();
+                } else {
+                    let counts = vector(i.op2_register())?;
+                    let (register, element) = if lane_size == 4 {
+                        ("w", "s")
+                    } else {
+                        ("x", "d")
+                    };
+                    let shift = match operation {
+                        0 => "lslv",
+                        1 => "lsrv",
+                        _ => "asrv",
+                    };
+                    let bits = lane_size * 8;
+                    for half in 0..if wide { 2 } else { 1 } {
+                        self.emit(format!(
+                            "ldr q0, [x19, #{}]\nldr q1, [x19, #{}]",
+                            208 + first * 32 + half * 16,
+                            208 + counts * 32 + half * 16
+                        ));
+                        for lane in 0..16 / lane_size {
+                            self.emit(format!("umov {register}9, v0.{element}[{lane}]\numov {register}10, v1.{element}[{lane}]\ncmp {register}10, #{bits}\n{shift} {register}11, {register}9, {register}10"));
+                            // ARM variable shifts mask counts; x86 checks the
+                            // entire unsigned lane, including every high bit.
+                            let fallback = if operation == 2 {
+                                self.emit(format!("asr {register}12, {register}9, #{}", bits - 1));
+                                format!("{register}12")
+                            } else {
+                                format!("{register}zr")
+                            };
+                            self.emit(format!("csel {register}11, {register}11, {fallback}, lo\nins v{}.{element}[{lane}], {register}11",4+half));
+                        }
+                    }
+                    if !wide {
+                        self.emit("movi v5.16b, #0");
+                    }
+                    self.emit(format!(
+                        "str q4, [x19, #{}]\nstr q5, [x19, #{}]",
                         208 + dst * 32,
                         224 + dst * 32
                     ));

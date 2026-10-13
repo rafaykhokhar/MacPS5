@@ -1,5 +1,13 @@
 # Rust migration
 
+VEX per-lane variable shifts now support ten XMM/YMM forms with full-width
+unsigned count checks, preserving x86 behavior for oversized counts on ARM64.
+The matching build passes 667 library tests, three integration tests, strict
+Clippy and 124,080 native checks. Discovery reaches 57,737 instructions with
+149 unsupported sites. Startup remains at missing `fscanf`, before game main.
+See [CPU evidence](../docs/status/CPU.md). Production readiness and retail
+gameplay remain unverified.
+
 VEX VPMADDWD/VPMULUDQ/VPMULDQ now support six XMM/YMM forms with native ARM64
 widening arithmetic and guarded memory operands. The matching build passes
 663 library tests, three integration tests, strict Clippy and 19,152 native
