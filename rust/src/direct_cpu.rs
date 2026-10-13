@@ -5,6 +5,19 @@ use crate::{
     decode,
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
+fn full_multiply(i: &Instruction) -> bool {
+    matches!(
+        i.code(),
+        Code::Mul_rm8
+            | Code::Mul_rm16
+            | Code::Mul_rm32
+            | Code::Mul_rm64
+            | Code::Imul_rm8
+            | Code::Imul_rm16
+            | Code::Imul_rm32
+            | Code::Imul_rm64
+    )
+}
 fn truncated_imul(i: &Instruction) -> bool {
     i.mnemonic() == Mnemonic::Imul
         && i.encoding() == iced_x86::EncodingKind::Legacy
@@ -429,6 +442,7 @@ pub(crate) fn translate_span(
             _ if movbe(&i) => {}
             _ if carry_arithmetic(&i) => {}
             _ if truncated_imul(&i) => {}
+            _ if full_multiply(&i) => {}
             Code::VEX_Andn_r32_r32_rm32 | Code::VEX_Andn_r64_r64_rm64 => {}
             Code::VEX_Rorx_r32_rm32_imm8 | Code::VEX_Rorx_r64_rm64_imm8 => {}
             Code::VEX_Mulx_r32_r32_rm32 | Code::VEX_Mulx_r64_r64_rm64 => {}
@@ -912,6 +926,89 @@ pub(crate) fn translate_span(
                     c.context_access(1, 19, 152, true, true)?;
                 }
             }
+            continue;
+        }
+        if full_multiply(i) {
+            let size = if i.op0_kind() == OpKind::Memory {
+                i.memory_size().size()
+            } else {
+                i.op0_register().size()
+            };
+            let bits = size as u32 * 8;
+            let signed = i.mnemonic() == Mnemonic::Imul;
+            if i.op0_kind() == OpKind::Memory {
+                memory_address(&mut c, i)?;
+                c.emit(0xaa1303e0)?;
+                c.load_u64(2, size as u64)?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_load_v1 as *const () as u64,
+                )?;
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+                c.emit(0xaa0003e2)?;
+            } else if size == 1 {
+                c.emit(0x39400262 | (byte_offset(i.op0_register())? << 10))?;
+            } else {
+                let src = register(i.op0_register().full_register(), true)?;
+                if size == 2 {
+                    c.emit(0x79400262 | ((src as u32 * 4) << 10))?;
+                } else {
+                    c.context_access(2, 19, src * 8, size == 8, false)?;
+                }
+            }
+            if size == 1 {
+                c.emit(0x39400261)?;
+            } else if size == 2 {
+                c.emit(0x79400261)?;
+            } else {
+                c.context_access(1, 19, 0, size == 8, false)?;
+            }
+            if signed && size < 8 {
+                c.emit(0x93400021 | ((bits - 1) << 10))?;
+                c.emit(0x93400042 | ((bits - 1) << 10))?;
+            }
+            c.emit(0x9b027c23)?; // mul x3,x1,x2
+            if size == 8 {
+                c.emit(if signed { 0x9b427c29 } else { 0x9bc27c29 })?; // smulh/umulh x9,x1,x2
+            } else {
+                c.emit(0xd340fc69 | (bits << 16))?; // lsr x9,x3,#bits
+            }
+            if size <= 2 {
+                c.emit(0x79000263)?; // AX gets both halves for byte operands
+                if size == 2 {
+                    c.emit(0x79002269)?;
+                }
+            } else {
+                if size == 4 {
+                    c.emit(0x2a0303e3)?;
+                }
+                c.context_access(3, 19, 0, true, true)?;
+                c.context_access(9, 19, 16, true, true)?;
+            }
+            c.context_access(0, 19, 136, true, false)?;
+            if signed {
+                c.load_u64(4, bits as u64)?;
+                c.load_u64(5, 6)?;
+                c.call_absolute(
+                    crate::arithmetic::native_ps5_arithmetic_flags_v1 as *const () as u64,
+                )?;
+                c.context_access(1, 19, 152, true, true)?;
+            } else {
+                c.emit(0xf100013f)?; // cmp x9,#0
+                c.emit(0x9a9f07e9)?; // cset x9,ne
+                c.emit(0xaa092d29)?; // CF and OF
+                c.load_u64(10, 0x801)?;
+                c.emit(0x8a2a0000)?;
+                c.emit(0xaa090000)?;
+            }
+            c.context_access(0, 19, 136, true, true)?;
             continue;
         }
         if truncated_imul(i) {

@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct one-operand MUL/IMUL now writes full products at all four integer widths,
+using native ARM64 multiplication and guarded memory sources. 296960 native
+cases pass, including exhaustive byte products, along with the library/
+integration suites and strict Clippy. See
+[full multiplication evidence](../docs/status/TRANSLATOR_READINESS.md#direct-implicit-full-product-multiplication).
+
 Direct two-/three-operand IMUL now handles 16/32/64-bit registers, guarded-memory
 sources and encoded immediates. 470016 native product/overflow checks pass,
 along with the library/integration suites and strict Clippy. The implicit

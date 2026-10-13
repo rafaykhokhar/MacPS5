@@ -1849,3 +1849,30 @@ tests, strict Clippy and release build. The standalone verifier compiles with
 warnings denied after correcting a spacing error in its initial source. Logs
 are `/tmp/macps5-imul-{tests,clippy,build}.log`. This is instruction coverage,
 not completed CPU translation or PS5 gameplay.
+
+## Direct implicit full-product multiplication
+
+Direct one-operand MUL/IMUL supports 8/16/32/64-bit register and guarded-memory
+sources. The explicit source and implicit accumulator are captured before any
+destination changes, including AH/AL/RAX/RDX and address-base aliases. ARM64 MUL
+computes the low product; UMULH/SMULH computes the high half for qword operands.
+Narrow signed inputs are sign-extended before multiplication. Byte forms write
+AX, word forms DX:AX, dword forms EDX:EAX with zero extension, and qword forms
+RDX:RAX. Unsigned CF/OF indicate a nonzero high half; signed CF/OF indicate that
+the product does not fit the signed input width. Undefined flags are preserved.
+Guarded-read faults preserve both destinations and flags.
+
+`rust/verification/direct_full_multiply_native.rs` uses signed-magnitude
+shift-and-add arithmetic as an independent full-product/overflow oracle.
+Cases cover every register/base encoding, all widths, source/output aliases,
+positive/negative sign boundaries, unaligned/short/unmapped/overflowing reads,
+prior faults and instruction budgets. It compares the full GPR bank, memory,
+flags, RIP and fault/fuel/stop state. A separate native byte sweep exhausts
+all 65536 input pairs for each of MUL and IMUL. Reproduce with the release
+rlib/dependency flags above using `direct_full_multiply_native.rs`.
+
+Validation passes: 296960 native cases, 687 library tests, three integration
+tests, strict Clippy and release build. The standalone verifier compiles with
+warnings denied. Logs are `/tmp/macps5-fullmul-{tests,clippy,build}.log`.
+This closes the direct implicit-product multiplication gap; division and other
+CPU families still need coverage, and PS5 gameplay remains unsupported.
