@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct MOVZX now zero-extends byte/word register or guarded memory sources into
+32/64-bit destinations. 24608 native cases pass; configured startup's next
+unsupported form is an immediate left shift in the block at 0x215e. See
+[MOVZX evidence](../docs/status/TRANSLATOR_READINESS.md#direct-movzx-byte-and-word-sources).
+
 Direct translation now has configurable instruction/attempt limits, independent
 of dylib rebuilds, with a default of 4096 attempts and explicit usage reporting.
 Budget tests run 33 discovered spans and verify exhaustion/cached reuse.

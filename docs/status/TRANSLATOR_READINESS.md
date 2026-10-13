@@ -959,3 +959,27 @@ The final process status is therefore a known incomplete-startup result, not a
 passing startup check; log: `/tmp/macps5-budget-startup.log`. The next CPU gap is
 zero extension from a 16-bit operand. Reproduce the budget verifier with the
 release rlib/dependency flags above, and startup with `--direct-startup`.
+
+## Direct MOVZX byte and word sources
+
+Direct MOVZX now handles byte/word sources and 32/64-bit destinations. Register
+sources use narrow CPU-context loads, including legacy AH/CH/DH/BH and REX low
+bytes, before committing the full zero-extended destination. Memory sources use
+guarded one/two-byte reads; faults preserve destination registers and flags.
+Byte-register offset selection is shared with immediate MOV. Sixteen-bit
+destinations and sign extension remain unsupported in this direct path.
+
+`direct_movzx_native.rs` passes 24608 native cases covering destination/source
+and address-base aliases, selected upper-bit/sign-bit patterns, read-only and
+unaligned memory, boundary failures and legacy high bytes. The byte-immediate
+MOV regression also passes. 687 library tests and three integration tests pass
+(22099 before Clippy); strict Clippy initially requested explicit parentheses
+around an encoding shift. After that readability correction, Clippy, release
+build and both strict-warning native verifiers pass (96277 before startup).
+
+Configured startup still reaches its first real dlsym lookup. It now stops at
+`Translation miss at 0x1000215e (bias 0x10000000): Direct lowering unsupported: Shl_rm32_imm8`.
+The span has moved past MOVZX during translation but has not executed as a whole.
+The startup process exits 1; `/tmp/macps5-movzx-startup.log` records the result.
+Use the preceding standalone build flags for this verifier and the configured
+startup command to reproduce. Bootstrap and gameplay remain incomplete.
