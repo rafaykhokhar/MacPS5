@@ -1078,10 +1078,25 @@ struct TranslationSource {
     archive: std::path::PathBuf,
     directory: std::path::PathBuf,
 }
+/// Per-image direct discovery limits; JitArena independently bounds code bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct DirectTranslationLimits {
+    pub instructions: usize,
+    pub attempts: usize,
+}
+impl Default for DirectTranslationLimits {
+    fn default() -> Self { Self { instructions: 65_536, attempts: 4096 } }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectTranslationUsage {
+    pub instructions: usize,
+    pub attempts: usize,
+}
 struct DirectTranslationSource {
     file: Rc<[u8]>,
     arena: Rc<crate::jit_memory::JitArena>,
     instruction_limit: usize,
+    attempt_limit: usize,
     instructions: usize,
     attempts: usize,
 }
@@ -3222,7 +3237,23 @@ impl NativeExecutor {
         &mut self, image: &Image, instruction_limit: usize,
         arena: Rc<crate::jit_memory::JitArena>,
     ) -> Result<()> {
-        if instruction_limit == 0 || self.direct_sources.contains_key(&image.bias)
+        unsafe { self.register_direct_source_with_limits(image, DirectTranslationLimits {
+            instructions: instruction_limit, ..DirectTranslationLimits::default()
+        }, arena) }
+    }
+    /// Register a direct source with explicit instruction and attempt limits.
+    /// Failed translations consume attempts; cached execution consumes neither.
+    /// # Safety
+    /// Same quiescent execution and JitArena contract as `register_direct_source`.
+    pub unsafe fn register_direct_source_with_limits(
+        &mut self, image: &Image, limits: DirectTranslationLimits,
+        arena: Rc<crate::jit_memory::JitArena>,
+    ) -> Result<()> {
+        if limits.instructions == 0 || limits.instructions > 1_048_576
+            || limits.attempts == 0 || limits.attempts > 65_536 {
+            return Err("Invalid direct translation limits".into());
+        }
+        if self.direct_sources.contains_key(&image.bias)
             || self.translation_sources.contains_key(&image.bias)
             || self.image_blocks.keys().any(|&(bias, _)| bias == image.bias) {
             return Err("Invalid or duplicate direct source".into());
@@ -3237,16 +3268,22 @@ impl NativeExecutor {
         snapshot.extend_from_slice(&image.file);
         self.translation_source_bytes += snapshot.len();
         self.direct_sources.insert(image.bias, DirectTranslationSource {
-            file: snapshot.into(), arena, instruction_limit, instructions: 0, attempts: 0,
+            file: snapshot.into(), arena, instruction_limit: limits.instructions,
+            attempt_limit: limits.attempts, instructions: 0, attempts: 0,
         });
         Ok(())
+    }
+    pub fn direct_translation_usage(&self, bias: u64) -> Option<DirectTranslationUsage> {
+        self.direct_sources.get(&bias).map(|source| DirectTranslationUsage {
+            instructions: source.instructions, attempts: source.attempts,
+        })
     }
     unsafe fn extend_direct_translation(&mut self, image: &Image, target: u64) -> Result<()> {
         let source = self.direct_sources.get_mut(&image.bias).ok_or("Missing direct source")?;
         if source.file.as_ref() != image.file.as_slice() {
             return Err("Direct source image identity differs".into());
         }
-        if source.attempts >= MAX_TRANSLATION_REBUILDS {
+        if source.attempts >= source.attempt_limit {
             return Err("Direct translation attempt budget exhausted".into());
         }
         source.attempts += 1;

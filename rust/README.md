@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct translation now has configurable instruction/attempt limits, independent
+of dylib rebuilds, with a default of 4096 attempts and explicit usage reporting.
+Budget tests run 33 discovered spans and verify exhaustion/cached reuse.
+Configured startup now stops on MOVZX16 at 0x215e. See
+[direct budget evidence](../docs/status/TRANSLATOR_READINESS.md#separate-direct-translation-budgets).
+
 Direct CMP/TEST32/64 now supports memory-first, register-second operands without
 modifying either operand. 81920 native cases pass. Configured startup advances
 to 0x20e9 and reaches the current 16-attempt translation budget. See

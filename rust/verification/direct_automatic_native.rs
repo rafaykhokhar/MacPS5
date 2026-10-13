@@ -81,10 +81,17 @@ fn main() {
         file[0x100..0x102].copy_from_slice(&[0x0f, 0x0b]); // unsupported UD2
         let mut unsupported = Image::load(&file, 0x200000, 4096).unwrap();
         executor
-            .register_direct_source(&unsupported, 100, arena.clone())
+            .register_direct_source_with_limits(
+                &unsupported,
+                native_ps5::module_executor::DirectTranslationLimits {
+                    instructions: 100,
+                    attempts: 16,
+                },
+                arena.clone(),
+            )
             .unwrap();
         let used = arena.used();
-        for _ in 0..native_ps5::module_executor::MAX_TRANSLATION_REBUILDS {
+        for _ in 0..16 {
             let error = executor
                 .run(&mut unsupported, 0x200100, Arguments::default(), &mut [])
                 .err()

@@ -928,3 +928,34 @@ separate bounded direct-translation budget, not pretending startup completed
 or disabling resource limits. Full startup and gameplay remain unverified.
 Reproduce with the preceding standalone verifier flags and configured startup
 command.
+
+## Separate direct translation budgets
+
+`DirectTranslationLimits` separates per-image direct compilation from the dylib
+rebuild budget. Its defaults are 65536 instructions and 4096 attempts; the existing
+registration method retains its caller-supplied instruction limit and uses the
+new default attempt limit. `register_direct_source_with_limits` accepts explicit
+values, requiring positive limits no greater than 1048576 instructions and 65536
+attempts. Limits cannot be changed on a live source. Dylib rebuilds retain their
+16-attempt limit.
+
+Failed translations consume attempts, successfully published spans consume the
+instruction budget, and cached execution consumes neither. Source bytes/counts
+and the append-only JIT arena remain independently bounded. The new read-only
+`direct_translation_usage` reports per-image instructions/attempts; retirement
+removes that source's accounting without reclaiming individual arena allocations.
+
+`direct_budget_native.rs` runs 33 discovered spans (34 guest instructions) to
+return 42. It checks exact budget boundaries, invalid zero/overlarge limits,
+retirement and ten cached runs without allocation or usage growth. The existing
+automatic verifier now supplies its explicit 16-attempt failure-test limit,
+independently of the dylib constant. Both strict-warning native verifiers pass,
+along with 687 library tests, three integration tests, strict Clippy and release
+build (process 86577 before its final startup probe).
+
+Configured startup now passes the former attempt limit at 0x20e9 and exits 1 at
+`Translation miss at 0x1000215e (bias 0x10000000): Direct lowering unsupported: Movzx_r32_rm16`.
+The final process status is therefore a known incomplete-startup result, not a
+passing startup check; log: `/tmp/macps5-budget-startup.log`. The next CPU gap is
+zero extension from a 16-bit operand. Reproduce the budget verifier with the
+release rlib/dependency flags above, and startup with `--direct-startup`.
