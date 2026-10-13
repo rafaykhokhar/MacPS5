@@ -1,5 +1,21 @@
 # CPU completion criteria
 
+## VEX VPBROADCASTD
+
+Exact VEX128/256 `VPBROADCASTD xmm/ymm,xmm/m32` now lowers to ARM64.
+It snapshots the low 32 source bits before committing aliased destinations,
+replicates them across four/eight lanes, and clears upper YMM bits for VEX128.
+Memory inputs use guarded four-byte reads; failed reads preserve destination
+state. Flags and floating-point state remain unchanged.
+
+The matching release passes 65,579 independent native byte-reference checks
+(`work/cpu-inventory/broadcast-release.log`, session88974 exit0): every register
+pair at both widths, 128 patterns per pair, actual pinned RIP-relative encodings,
+unaligned/read-only/exact-end inputs, short/wrapping faults and fuel stops.
+The verifier is registered in the full entry runner. B/W/Q broadcasts, EVEX,
+FS addressing and 32-bit addressing remain unsupported. These checks establish
+the stated forms only, not full vector or CPU compatibility.
+
 ## Observed LZCNT32 boundary
 
 The pinned `f3 0f bd f2` instruction at `0x1b58c3` now lowers to ARM64 leading

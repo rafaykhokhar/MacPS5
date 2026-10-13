@@ -119,5 +119,6 @@ pub mod guest_gdtoa;
 pub mod x87_state;
 pub mod x87_store;
 pub mod guest_strxfrm;
+pub mod guest_wcsxfrm;
 pub mod guest_hdtoa;
 pub mod guest_strftime;

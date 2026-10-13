@@ -1106,6 +1106,7 @@ pub enum Service {
     Strcmp,
     Strcoll,
     Strxfrm,
+    Wcsxfrm,
     Strftime,
     Strncmp,
     Strlen,
@@ -1272,6 +1273,7 @@ impl Service {
             | Self::Vasprintf
             | Self::Strcoll
             | Self::Strxfrm
+            | Self::Wcsxfrm
             | Self::Strftime
             | Self::Errno
             | Self::Getpid
@@ -6253,6 +6255,18 @@ impl NativeExecutor {
                         text.push('\0');
                         memory.update_service_data(ERROR_TEXT, text.as_bytes())?;
                         ERROR_TEXT
+                    } else if matches!(service, Service::Wcsxfrm) {
+                        let plan = crate::guest_wcsxfrm::plan(
+                            &memory,
+                            cpu.registers[7],
+                            cpu.registers[6],
+                            cpu.registers[2],
+                        )?;
+                        if !plan.bytes.is_empty() {
+                            validate_net_output(&memory, plan.destination, plan.bytes.len(), sp, ret)?;
+                        }
+                        plan.commit(&mut memory)?;
+                        plan.value
                     } else if matches!(service, Service::Strxfrm) {
                         let plan = crate::guest_strxfrm::plan(
                             &memory,

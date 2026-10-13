@@ -1,5 +1,16 @@
 # Rust migration
 
+The current release passes 65,579 native ARM64 `VPBROADCASTD` checks and 140
+direct/actual-wrapper C/POSIX `wcsxfrm` checks. Both verifiers are registered in
+the full entry runner. See [CPU evidence](../docs/status/CPU.md) and
+[wide transform evidence](../docs/status/WCSXFRM.md). Startup discovery with the
+new export reaches missing `mbrlen` and retains 19,520 dependency bytes
+(`work/arm64-prototype/wcsxfrm-entry.log`). The updated startup-only runner passes
+its ownership and import-slot assertions (`work/arm64-prototype/wcsxfrm-final.log`,
+72544 exit0). The first assertion update used an incorrect slot offset; the final
+run checks the actual GOT offsets against the registered service addresses.
+No game main or Metal presentation success follows from these component checks.
+
 The compiled `verification/entry_native.rs` runner accepts an optional
 `--startup-only` argument after the ELF path. This keeps the real dependency
 bootstrap and its ownership assertions, while explicitly skipping component

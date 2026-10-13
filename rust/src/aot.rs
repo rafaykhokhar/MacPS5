@@ -37,6 +37,25 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn vpbroadcastd_exact_forms() {
+        for bytes in [
+            &[0xc4, 0xe2, 0x79, 0x58, 0xc0][..],
+            &[0xc4, 0xe2, 0x7d, 0x58, 0x07],
+        ] {
+            assert!(super::translate_rust_memory_region(bytes, 0, "broadcast").is_ok());
+        }
+        for bytes in [
+            &[0xc4, 0xe2, 0x79, 0x59, 0xc0][..],
+            &[0xc4, 0xe2, 0x79, 0x78, 0xc0],
+            &[0xc4, 0xe2, 0x79, 0x79, 0xc0],
+            &[0x62, 0xf2, 0x7d, 0x08, 0x58, 0xc0],
+            &[0x67, 0xc4, 0xe2, 0x79, 0x58, 0x00],
+            &[0x64, 0xc4, 0xe2, 0x79, 0x58, 0x00],
+        ] {
+            assert!(super::translate_rust_memory_region(bytes, 0, "unsupported_broadcast").is_err());
+        }
+    }
+    #[test]
     fn lzcnt32_observed_encoding_and_guarded_variants() {
         for bytes in [
             &[0xf3, 0x0f, 0xbd, 0xf2][..],
@@ -501,6 +520,25 @@ impl Emitter {
                     216 + merge * 32, 208 + dst * 32, 216 + dst * 32,
                     224 + dst * 32, 232 + dst * 32
                 ));
+            }
+            M::Vpbroadcastd => {
+                let wide = match i.code() {
+                    iced_x86::Code::VEX_Vpbroadcastd_xmm_xmmm32 => false,
+                    iced_x86::Code::VEX_Vpbroadcastd_ymm_xmmm32 => true,
+                    _ => return Err("Only VEX VPBROADCASTD XMM/YMM from XMM/m32 is implemented".into()),
+                };
+                let dst = 208 + vector(i.op_register(0))? * 32;
+                if i.op_kind(1) == OpKind::Register {
+                    let src = 208 + vector(i.op_register(1))? * 32;
+                    self.emit(format!("ldr w20, [x19, #{src}]"));
+                } else {
+                    self.read(i, 1, 32, 20)?;
+                }
+                // AMD APM Vol4 VPBROADCASTD: snapshot low32 before aliases,
+                // replicate integer bits without FP effects; read/fault before commit.
+                self.emit(format!("mov w20, w20\norr x20, x20, x20, lsl #32\nstr x20, [x19, #{dst}]\nstr x20, [x19, #{}]", dst + 8));
+                let upper = if wide { "x20" } else { "xzr" };
+                self.emit(format!("str {upper}, [x19, #{}]\nstr {upper}, [x19, #{}]", dst + 16, dst + 24));
             }
             M::Vmovd => {
                 if i.code() != iced_x86::Code::VEX_Vmovd_xmm_rm32 {

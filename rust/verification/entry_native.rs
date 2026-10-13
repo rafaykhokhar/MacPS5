@@ -52,6 +52,8 @@ mod strcoll_native;
 mod strxfrm_native;
 mod wcscoll_native;
 mod lzcnt_native;
+mod wcsxfrm_native;
+mod vpbroadcastd_native;
 mod strftime_native;
 mod strtof_native;
 mod strtold_native;
@@ -136,6 +138,8 @@ fn main() -> Result<(), String> {
         strxfrm_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strxfrm"))?;
         wcscoll_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("wcscoll"))?;
         lzcnt_native::verify(Path::new(&archive), &Path::new(&directory).join("lzcnt"))?;
+        wcsxfrm_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("wcsxfrm"))?;
+        vpbroadcastd_native::verify(Path::new(&archive), &Path::new(&directory).join("vpbroadcastd"))?;
         strftime_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strftime"))?;
         strtof_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtof"))?;
         strtold_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtold"))?;
@@ -539,6 +543,7 @@ fn main() -> Result<(), String> {
         ("strftime", Service::Strftime),
         ("strtof", Service::Strtof),
         ("strtold", Service::Strtold),
+        ("wcsxfrm", Service::Wcsxfrm),
     ]
     .into_iter()
     .enumerate()
@@ -1344,7 +1349,7 @@ fn main() -> Result<(), String> {
                 .iter()
                 .find(|s| {
                     locale_slot >= s.address
-                        && locale_slot + 648 <= s.address + s.bytes.len() as u64
+                        && locale_slot + 1128 <= s.address + s.bytes.len() as u64
                 })
                 .ok_or("Missing locale import slot")?;
             let locale_offset = (locale_slot - locale_segment.address) as usize;
@@ -1484,6 +1489,22 @@ fn main() -> Result<(), String> {
                     return Err(format!("Actual libc import slot {delta} not bound"));
                 }
             }
+            for (delta, name) in [
+                (1080, "strftime"),
+                (1088, "strtof"),
+                (1096, "strtold"),
+                (1104, "strxfrm"),
+                (1112, "wcscoll"),
+                (1120, "wcsxfrm"),
+            ] {
+                let expected = libc_exports.iter().find(|(symbol, _)| *symbol == name)
+                    .ok_or("Missing registered libc service")?.1;
+                if locale_segment.bytes[locale_offset + delta..locale_offset + delta + 8]
+                    != expected.to_le_bytes()
+                {
+                    return Err(format!("Actual libc import {name} not bound"));
+                }
+            }
             let address = bias + 0x590050;
             let segment = image
                 .segments
@@ -1503,13 +1524,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 142 libc exports: (142+1)*24=3432 symbol bytes (rounded3440)
-                // and 1+142*12=1705 NID bytes (rounded1712).
-                // Wcscoll adds48bytes to19440.
-                || native.bytes_allocated() != 19488
+                // 143 libc exports: (143+1)*24=3456 symbol bytes
+                // and 1+143*12=1717 NID bytes (rounded1728).
+                // Wcsxfrm adds32bytes to19488.
+                || native.bytes_allocated() != 19520
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'wcsxfrm'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'mbrlen'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1519,7 +1540,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; wcscoll import bound; unresolved wcsxfrm causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; wcsxfrm import bound; unresolved mbrlen causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1581,7 +1602,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved wcsxfrm triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved mbrlen triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     if let Some(result) = presentation_result {
