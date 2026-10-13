@@ -5,6 +5,21 @@ use crate::{
     decode,
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
+fn byte_arithmetic(i: &Instruction) -> bool {
+    matches!(
+        i.mnemonic(),
+        Mnemonic::Add
+            | Mnemonic::Sub
+            | Mnemonic::Cmp
+            | Mnemonic::And
+            | Mnemonic::Or
+            | Mnemonic::Xor
+            | Mnemonic::Test
+    ) && i.op0_kind() == OpKind::Register
+        && i.op0_register().size() == 1
+        && (i.op1_kind() == OpKind::Immediate8
+            || (i.op1_kind() == OpKind::Register && i.op1_register().size() == 1))
+}
 fn setcc(i: &Instruction) -> bool {
     matches!(
         i.code(),
@@ -159,6 +174,7 @@ pub(crate) fn translate_span(
             _ if setcc(&i) => {}
             Code::Call_rel32_64 | Code::Call_rm64 | Code::Jmp_rm64 => {}
             _ if arithmetic_supported(&i) => {}
+            _ if byte_arithmetic(&i) => {}
             _ if immediate_shift(&i) => {}
             _ => return Err(format!("Direct lowering unsupported: {:?}", i.code())),
         }
@@ -263,6 +279,34 @@ pub(crate) fn translate_span(
         )?;
         c.emit(0xd1000529)?; // sub x9,x9,#1
         c.context_access(9, 19, 160, true, true)?;
+        if byte_arithmetic(i) {
+            let destination = byte_offset(i.op0_register())?;
+            c.emit(0x39400261 | (destination << 10))?; // ldrb w1,[x19,#offset]
+            if i.op1_kind() == OpKind::Register {
+                c.emit(0x39400262 | (byte_offset(i.op1_register())? << 10))?;
+            } else {
+                c.load_u64(2, u64::from(i.immediate8()))?;
+            }
+            let (opcode, operation) = match i.mnemonic() {
+                Mnemonic::Add => (0x0b020023, 1),
+                Mnemonic::Sub | Mnemonic::Cmp => (0x4b020023, 0),
+                Mnemonic::And | Mnemonic::Test => (0x0a020023, 2),
+                Mnemonic::Or => (0x2a020023, 2),
+                Mnemonic::Xor => (0x4a020023, 2),
+                _ => unreachable!(),
+            };
+            c.emit(opcode)?;
+            if !matches!(i.mnemonic(), Mnemonic::Cmp | Mnemonic::Test) {
+                c.emit(0x39000263 | (destination << 10))?; // strb w3,[x19,#offset]
+            }
+            c.context_access(0, 19, 136, true, false)?;
+            c.load_u64(4, 8)?;
+            c.load_u64(5, operation)?;
+            c.call_absolute(crate::arithmetic::native_ps5_arithmetic_flags_v1 as *const () as u64)?;
+            c.context_access(0, 19, 136, true, true)?;
+            c.context_access(1, 19, 152, true, true)?;
+            continue;
+        }
         if setcc(i) {
             let condition = (i.condition_code() as u64)
                 .checked_sub(1)

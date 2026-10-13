@@ -1030,3 +1030,27 @@ accepted during translation, but the complete span has not executed. The next
 CPU gap is byte logical arithmetic; bootstrap and gameplay remain incomplete.
 Use the existing standalone verifier flags and configured startup command to
 reproduce.
+
+## Direct byte register arithmetic
+
+Direct byte-register ADD/SUB/CMP/AND/OR/XOR/TEST now supports register or immediate
+second operands. Narrow CPU-context loads capture both operands before any write;
+one-byte stores preserve surrounding bits, including aliases within one physical
+register. CMP/TEST never write a destination. The existing integer flag helper
+receives width eight, preserving the runtime's chosen undefined-flag policy.
+Memory byte arithmetic and word arithmetic remain unsupported in this path.
+
+Inspection of the real startup span identifies `AND CL,AL` at 0x2cb9.
+`direct_byte_arithmetic_native.rs` passes 143430 native cases with independent
+widened/nibble flag calculations: seven operations, legacy/high-byte and REX
+register combinations, aliasing, selected sign/carry/nibble boundaries and group/
+accumulator immediate forms. 687 library tests, three integration tests, strict
+Clippy, release build and the strict-warning native verifier pass (process 74372
+before its final startup run).
+
+Configured startup advances to a translation miss at image-relative 0x2d2f:
+`Direct lowering unsupported: VEX_Vxorps_xmm_xmm_xmmm128`.
+The final process exits 1; `/tmp/macps5-byte-arith-startup.log` records the first
+real dlsym lookup and this later boundary. The next gap is vector logical lowering,
+not complete bootstrap or gameplay. Reproduce the standalone verifier with the
+release rlib/dependency flags above, and the real-file run with `--direct-startup`.

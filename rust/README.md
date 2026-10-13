@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct byte-register ADD/SUB/CMP/AND/OR/XOR/TEST now preserves surrounding
+register bits and computes byte-width flags. 143430 native cases pass;
+configured startup advances to AVX VXORPS at 0x2d2f. See
+[byte arithmetic evidence](../docs/status/TRANSLATOR_READINESS.md#direct-byte-register-arithmetic).
+
 Direct SETcc now supports all 16 conditions with byte-register and guarded memory
 destinations. 139264 native cases pass. Configured startup's next gap is byte AND
 in the block at 0x2ca0. See
