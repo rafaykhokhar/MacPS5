@@ -266,3 +266,37 @@ rustc --edition=2024 -O -Dwarnings rust/verification/jit_memory_native.rs \
 
 Guest translation still uses dylibs. Direct instruction encoding, relocations,
 helper calls, executor publication integration and correctness gates remain.
+
+## Direct ARM64 branch emission
+
+`rust/src/arm64_code.rs` adds a bounded instruction buffer with local labels and
+final branch fixups: B, BL, B.cond (EQ–LE), CBZ/CBNZ (W/X) and TBZ/TBNZ
+(bits 0–63). Displacements are signed instruction offsets relative to the branch
+itself. Operand validation, duplicate/unresolved labels, targets at the end of
+the buffer, emission budgets and displacement overflow fail before executable
+publication. It has no external relocations or automatic long-branch veneers.
+Raw instruction emission is not a validator; JitArena publication remains unsafe.
+
+Verification: 685 library tests, three integration tests, strict Clippy and
+release compilation pass. The standalone Rust verifier compares 8480 forward/
+backward encodings against xcrun clang's assembled text bytes, covering all
+register encodings, all bit indices and supported conditions. Unit checks cover
+signed displacement bounds and rejection behavior. A generated loop performs
+10000 iterations and returns the independent sum 50005000 on each of 100 native
+runs in the executable arena. Process 66170 exit 0; `work/arm64-code/` logs.
+The native loop covers B.NE execution; other branch forms have assembler-byte
+comparison, not separate native execution coverage. No guest instruction has
+been migrated to this backend by this change.
+
+Reproduce after a release build:
+
+```sh
+rustc --edition=2024 -O -Dwarnings rust/verification/arm64_code_native.rs \
+  --extern native_ps5=rust/target/release/libnative_ps5.rlib \
+  -L dependency=rust/target/release/deps -o /tmp/macps5-arm64-code-check
+/tmp/macps5-arm64-code-check arm64-oracle-new
+```
+
+The oracle output directory must not exist. Clang is used only as the encoding
+oracle here; the tested buffer construction and native loop publication use
+Rust and MAP_JIT directly.

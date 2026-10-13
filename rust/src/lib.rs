@@ -1,4 +1,5 @@
 pub mod aot;
+pub mod arm64_code;
 pub mod jit_memory;
 pub mod arithmetic;
 pub mod atomic_xadd;

@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct ARM64 emission now supports bounded local branch/call fixups. Verification
+matches 8480 encodings against clang and executes a generated loop correctly in
+100 native runs. Guest x86 translation is not connected to this emitter yet.
+See [branch-emission evidence](../docs/status/TRANSLATOR_READINESS.md#direct-arm64-branch-emission).
+
 The direct ARM64 backend now has bounded executable storage with per-thread
 write protection, instruction-cache flushing and code-handle ownership. Native
 verification passes 4098 calls and lifetime/capacity checks on the M5 Pro.
