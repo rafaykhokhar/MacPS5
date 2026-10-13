@@ -1563,3 +1563,31 @@ Logs are `/tmp/macps5-carry-{tests,clippy,build,startup}.log`. This is evidence 
 progress through homebrew startup, not successful bootstrap or PS5 gameplay.
 The startup-only run skips Metal presentation. Memory/immediate comparison is
 the next observed CPU gap.
+
+## Direct memory comparison immediates
+
+Memory-first CMP/TEST lowering now handles 16/32/64-bit operands with a
+register or immediate second operand. CMP supports short sign-extended and
+full-width encoded immediates; qword CMP/TEST sign-extends the encoded dword.
+The load width comes from the decoded memory operand, including word loads.
+Word register sources are captured with ARM64 LDRH. The existing guarded load
+must succeed before arithmetic and flag updates; comparisons never store to
+memory or alter GPRs. TEST retains the existing deterministic policy of clearing
+undefined AF along with CF/OF.
+
+The expanded `rust/verification/direct_memory_compare_native.rs` passes 307200
+native state checks against an independent result/flag oracle. It covers each
+width, short/full immediates at sign boundaries, all source/base register aliases,
+read-only mappings, unaligned reads, short operands and overflowing addresses.
+Checks compare the full GPR bank, flags, mapped bytes and fault/fuel/stop state.
+The shared register/memory arithmetic verifier passes 196608 regression checks.
+Reproduce with the release rlib/dependency flags above using
+`direct_memory_compare_native.rs` and `direct_arithmetic_memory_native.rs`.
+
+The release build, 687 library tests, three integration tests and strict Clippy
+pass; both standalone verifiers compile with warnings denied. Configured
+`--direct-startup` passes the previous span at image-relative 0x501b and exits 1
+at span 0x4b1 with `Direct lowering unsupported: VEX_Vzeroupper`. Logs are
+`/tmp/macps5-cmpimm-{tests,clippy,build,startup}.log`. VZEROUPPER is the next
+observed CPU gap. Bootstrap and PS5 gameplay remain incomplete, and this
+startup-only run skips Metal presentation.

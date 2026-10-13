@@ -224,7 +224,21 @@ fn arithmetic_supported(i: &Instruction) -> bool {
     if i.op0_kind() == OpKind::Memory
         && matches!(
             i.code(),
-            Code::Cmp_rm32_r32 | Code::Cmp_rm64_r64 | Code::Test_rm32_r32 | Code::Test_rm64_r64
+            Code::Cmp_rm16_r16
+                | Code::Cmp_rm32_r32
+                | Code::Cmp_rm64_r64
+                | Code::Test_rm16_r16
+                | Code::Test_rm32_r32
+                | Code::Test_rm64_r64
+                | Code::Cmp_rm16_imm8
+                | Code::Cmp_rm16_imm16
+                | Code::Cmp_rm32_imm8
+                | Code::Cmp_rm32_imm32
+                | Code::Cmp_rm64_imm8
+                | Code::Cmp_rm64_imm32
+                | Code::Test_rm16_imm16
+                | Code::Test_rm32_imm32
+                | Code::Test_rm64_imm32
         )
     {
         return true;
@@ -1308,8 +1322,13 @@ pub(crate) fn translate_span(
         }
         if arithmetic_supported(i) {
             let memory_first = i.op0_kind() == OpKind::Memory;
+            let size = if memory_first {
+                i.memory_size().size()
+            } else {
+                i.op0_register().size()
+            };
             let wide = if memory_first {
-                i.op1_register().size() == 8
+                size == 8
             } else {
                 i.op0_register().size() == 8
             };
@@ -1323,7 +1342,7 @@ pub(crate) fn translate_span(
             } else if memory_first || i.op1_kind() == OpKind::Memory {
                 memory_address(&mut c, i)?;
                 c.emit(0xaa1303e0)?; // mov x0,x19
-                c.load_u64(2, if wide { 8 } else { 4 })?;
+                c.load_u64(2, size as u64)?;
                 c.call_absolute(
                     crate::guest_memory::ffi::native_ps5_module_load_v1 as *const () as u64,
                 )?;
@@ -1338,7 +1357,16 @@ pub(crate) fn translate_span(
                 )?;
                 if memory_first {
                     c.emit(0xaa0003e1)?; // mov x1,x0
-                    c.context_access(2, 19, register(i.op1_register(), wide)? * 8, wide, false)?;
+                    if i.op1_kind() == OpKind::Register {
+                        let src = register(i.op1_register().full_register(), true)?;
+                        if size == 2 {
+                            c.emit(0x79400262 | ((src as u32 * 4) << 10))?;
+                        } else {
+                            c.context_access(2, 19, src * 8, wide, false)?;
+                        }
+                    } else {
+                        c.load_u64(2, i.immediate(1))?;
+                    }
                 } else {
                     c.emit(0xaa0003e2)?; // mov x2,x0
                 }
@@ -1378,7 +1406,7 @@ pub(crate) fn translate_span(
                 )?;
             }
             c.context_access(0, 19, 136, true, false)?;
-            c.load_u64(4, if wide { 64 } else { 32 })?;
+            c.load_u64(4, size as u64 * 8)?;
             c.load_u64(5, operation)?;
             // Valid constant width/operation make this integer-only helper
             // infallible; operands and result were captured before alias writes.

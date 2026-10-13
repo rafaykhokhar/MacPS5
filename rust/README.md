@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct memory-first CMP/TEST now supports register and immediate operands at
+16/32/64 bits, including sign-extended immediates. 307200 native comparison
+checks and 196608 shared arithmetic regression checks pass. Configured startup
+passes the comparison at 0x501b and now rejects VZEROUPPER at span 0x4b1. See
+[comparison evidence](../docs/status/TRANSLATOR_READINESS.md#direct-memory-comparison-immediates).
+
 Direct ADC/SBB now supports 8/16/32/64-bit register and guarded memory forms,
 including incoming carry and precise arithmetic flags. 1116160 native checks
 and 407205 memory-arithmetic regression checks pass. Configured startup passes
