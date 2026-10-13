@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct MULX32/64 now computes both unsigned product halves, preserving flags and
+handling overlapping destinations and guarded memory. 1474560 native cases pass.
+Configured startup passes MULX and reaches NEG32 at 0x3b9c. See
+[MULX evidence](../docs/status/TRANSLATOR_READINESS.md#direct-mulx-full-width-multiplication).
+
 Direct RORX32/64 now emits ARM64 immediate rotation with guarded memory sources
 and flag preservation. 137760 native cases pass. Configured startup passes RORX
 and reaches MULX64 at 0x38ed. See

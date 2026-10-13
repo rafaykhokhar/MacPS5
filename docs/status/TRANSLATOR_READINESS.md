@@ -1472,3 +1472,30 @@ and exits 1 at image-relative 0x38ed with
 `/tmp/macps5-rorx-{tests,clippy,build,startup}.log` and retain the first real dlsym
 lookup. MULX is the next CPU gap. Bootstrap and PS5 gameplay remain incomplete;
 this startup-only run skips Metal presentation.
+
+## Direct MULX full-width multiplication
+
+Direct lowering now accepts VEX MULX32/64 with a register or guarded memory
+explicit source and implicit EDX/RDX input. ARM64 UMULL or MUL/UMULH calculates
+the full unsigned product before either destination changes. Both dword outputs
+zero-extend. The low half is written first and the high half last, so the high
+half remains if the destinations coincide. Inputs may alias either destination
+or the memory address base. Flags are unchanged, and a memory fault preserves
+both destinations. Operand order and the identical-destination rule follow
+[Intel SDM volume 2B, MULX](https://cdrdv2-public.intel.com/868141/253667-089-sdm-vol-2b.pdf).
+
+`rust/verification/direct_mulx_native.rs` passes 1474560 native cases. Its
+independent product oracle sums 16-bit limb products into 128 bits. Cases cover
+all high-destination/low-destination/source GPR triples, EDX/RDX aliases, both
+widths, zero/one/sign-boundary/full-width operands, high-half carry propagation,
+unaligned/short/unmapped reads, address overflow and flag preservation. The full
+GPR bank, mapping and fault/fuel/stop state are compared. The strict-warning
+standalone verifier, 687 library tests, three integration tests, strict Clippy
+and release build pass. Reproduce with the release rlib/dependency flags above
+using `direct_mulx_native.rs`.
+
+Configured `--direct-startup` passes the former block at 0x38ed and exits 1 at
+image-relative 0x3b9c with `Direct lowering unsupported: Neg_rm32`.
+Logs are `/tmp/macps5-mulx-{tests,clippy,build,startup}.log` and retain the first
+real dlsym lookup. NEG is the next CPU gap. Bootstrap and PS5 gameplay remain
+incomplete; this startup-only run skips Metal presentation.

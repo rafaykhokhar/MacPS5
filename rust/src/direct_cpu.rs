@@ -350,6 +350,7 @@ pub(crate) fn translate_span(
             _ if movbe(&i) => {}
             Code::VEX_Andn_r32_r32_rm32 | Code::VEX_Andn_r64_r64_rm64 => {}
             Code::VEX_Rorx_r32_rm32_imm8 | Code::VEX_Rorx_r64_rm64_imm8 => {}
+            Code::VEX_Mulx_r32_r32_rm32 | Code::VEX_Mulx_r64_r64_rm64 => {}
             _ => return Err(format!("Direct lowering unsupported: {:?}", i.code())),
         }
         offset += i.len();
@@ -641,12 +642,15 @@ pub(crate) fn translate_span(
                 | Code::VEX_Andn_r64_r64_rm64
                 | Code::VEX_Rorx_r32_rm32_imm8
                 | Code::VEX_Rorx_r64_rm64_imm8
+                | Code::VEX_Mulx_r32_r32_rm32
+                | Code::VEX_Mulx_r64_r64_rm64
         ) || bmi_shift(i).is_some()
         {
             let wide = i.op0_register().size() == 8;
             let dst = register(i.op0_register(), wide)?;
             let andn = i.mnemonic() == Mnemonic::Andn;
-            let data_operand = if andn { 2 } else { 1 };
+            let mulx = i.mnemonic() == Mnemonic::Mulx;
+            let data_operand = if andn || mulx { 2 } else { 1 };
             let other_operand = if andn { 1 } else { 2 };
             if i.op_kind(data_operand) == OpKind::Memory {
                 memory_address(&mut c, i)?;
@@ -672,6 +676,20 @@ pub(crate) fn translate_span(
                     wide,
                     false,
                 )?;
+            }
+            if mulx {
+                c.context_access(1, 19, 16, wide, false)?; // implicit RDX/EDX input
+                if wide {
+                    c.emit(0x9b017c09)?; // mul x9,x0,x1: low product
+                    c.emit(0x9bc17c0a)?; // umulh x10,x0,x1: high product
+                } else {
+                    c.emit(0x9ba17c09)?; // umull x9,w0,w1
+                    c.emit(0xd360fd2a)?; // lsr x10,x9,#32
+                    c.emit(0x2a0903e9)?; // mov w9,w9: zero-extend low half
+                }
+                c.context_access(9, 19, register(i.op1_register(), wide)? * 8, true, true)?;
+                c.context_access(10, 19, dst * 8, true, true)?; // high half wins for equal destinations
+                continue; // MULX preserves guest flags.
             }
             if i.mnemonic() == Mnemonic::Rorx {
                 let count = u32::from(i.immediate8()) & if wide { 63 } else { 31 };
