@@ -5,6 +5,13 @@ use crate::{
     decode,
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
+fn carry_arithmetic(i: &Instruction) -> bool {
+    matches!(i.mnemonic(), Mnemonic::Adc | Mnemonic::Sbb)
+        && i.encoding() == iced_x86::EncodingKind::Legacy
+        && !i.has_lock_prefix()
+        && i.op0_kind() == OpKind::Register
+        && matches!(i.op0_register().size(), 1 | 2 | 4 | 8)
+}
 fn movbe(i: &Instruction) -> bool {
     matches!(
         i.code(),
@@ -27,7 +34,13 @@ fn bmi_shift(i: &Instruction) -> Option<u32> {
 fn memory_arithmetic(i: &Instruction) -> bool {
     matches!(
         i.mnemonic(),
-        Mnemonic::Add | Mnemonic::Sub | Mnemonic::And | Mnemonic::Or | Mnemonic::Xor
+        Mnemonic::Add
+            | Mnemonic::Sub
+            | Mnemonic::And
+            | Mnemonic::Or
+            | Mnemonic::Xor
+            | Mnemonic::Adc
+            | Mnemonic::Sbb
     ) && !i.has_lock_prefix()
         && i.encoding() == iced_x86::EncodingKind::Legacy
         && i.op0_kind() == OpKind::Memory
@@ -350,6 +363,7 @@ pub(crate) fn translate_span(
             Code::VEX_Bextr_r32_rm32_r32 | Code::VEX_Bextr_r64_rm64_r64 => {}
             _ if bmi_shift(&i).is_some() => {}
             _ if movbe(&i) => {}
+            _ if carry_arithmetic(&i) => {}
             Code::VEX_Andn_r32_r32_rm32 | Code::VEX_Andn_r64_r64_rm64 => {}
             Code::VEX_Rorx_r32_rm32_imm8 | Code::VEX_Rorx_r64_rm64_imm8 => {}
             Code::VEX_Mulx_r32_r32_rm32 | Code::VEX_Mulx_r64_r64_rm64 => {}
@@ -821,6 +835,65 @@ pub(crate) fn translate_span(
             }
             continue;
         }
+        if carry_arithmetic(i) {
+            let size = i.op0_register().size();
+            let dst = register(i.op0_register().full_register(), true)?;
+            if i.op1_kind() == OpKind::Memory {
+                memory_address(&mut c, i)?;
+                c.emit(0xaa1303e0)?;
+                c.load_u64(2, size as u64)?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_load_v1 as *const () as u64,
+                )?;
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+                c.emit(0xaa0003e2)?;
+            } else if i.op1_kind() == OpKind::Register {
+                let src = register(i.op1_register().full_register(), true)?;
+                if size == 1 {
+                    c.emit(0x39400262 | (byte_offset(i.op1_register())? << 10))?;
+                } else if size == 2 {
+                    c.emit(0x79400262 | ((src as u32 * 4) << 10))?;
+                } else {
+                    c.context_access(2, 19, src * 8, size == 8, false)?;
+                }
+            } else {
+                c.load_u64(2, i.immediate(1))?;
+            }
+            if size == 1 {
+                c.emit(0x39400261 | (byte_offset(i.op0_register())? << 10))?;
+            } else if size == 2 {
+                c.emit(0x79400261 | ((dst as u32 * 4) << 10))?;
+            } else {
+                c.context_access(1, 19, dst * 8, size == 8, false)?;
+            }
+            c.context_access(0, 19, 136, true, false)?;
+            c.emit(0xd3400009)?; // ubfx x9,x0,#0,#1: incoming CF
+            let subtract = i.mnemonic() == Mnemonic::Sbb;
+            let width = if size == 8 { 0x80000000 } else { 0 };
+            c.emit((if subtract { 0x4b020023 } else { 0x0b020023 }) | width)?;
+            c.emit((if subtract { 0x4b090063 } else { 0x0b090063 }) | width)?;
+            if size == 1 {
+                c.emit(0x39000263 | (byte_offset(i.op0_register())? << 10))?;
+            } else if size == 2 {
+                c.emit(0x79000263 | ((dst as u32 * 4) << 10))?;
+            } else {
+                c.context_access(3, 19, dst * 8, true, true)?;
+            }
+            c.load_u64(4, size as u64 * 8)?;
+            c.load_u64(5, if subtract { 4 } else { 7 })?;
+            c.call_absolute(crate::arithmetic::native_ps5_arithmetic_flags_v1 as *const () as u64)?;
+            c.context_access(0, 19, 136, true, true)?;
+            c.context_access(1, 19, 152, true, true)?;
+            continue;
+        }
         if memory_arithmetic(i) {
             let size = i.memory_size().size();
             memory_address(&mut c, i)?;
@@ -844,6 +917,8 @@ pub(crate) fn translate_span(
                 4,
                 match i.mnemonic() {
                     Mnemonic::Add => 0,
+                    Mnemonic::Adc => 7,
+                    Mnemonic::Sbb => 8,
                     Mnemonic::Sub => 1,
                     Mnemonic::And => 2,
                     Mnemonic::Or => 3,

@@ -1530,3 +1530,36 @@ but this entire span has not executed. Logs are
 `/tmp/macps5-neg-{tests,clippy,build,startup}.log` and retain the first real dlsym
 lookup. Subtract-with-borrow is the next CPU gap. Bootstrap and PS5 gameplay
 remain incomplete; this startup-only run skips Metal presentation.
+
+## Direct ADC and SBB
+
+Direct lowering accepts unlocked ADC/SBB at 8/16/32/64 bits with register,
+immediate or guarded memory sources and register or memory destinations.
+Register forms capture both operands and incoming guest CF before emitting
+ARM64 addition/subtraction and calling the arithmetic flag helper. Narrow
+register writes preserve surrounding bits, including legacy high-byte aliases;
+dword writes zero-extend. Memory forms use operations 7/8 of the guarded RMW
+helper, committing flags only after the store succeeds. LOCK remains unsupported.
+
+`rust/verification/direct_carry_native.rs` passes 1116160 native state checks.
+An independent widened-integer oracle computes carry, signed overflow, nibble
+carry, sign, zero and parity. The encoding matrix covers all register/base
+encodings, both carry inputs, all widths, register/memory/immediate forms,
+immediate sign extension, partial-register aliases, unaligned and short reads,
+and read-only stores. An additional exhaustive sweep covers every pair of byte
+operands with both carry inputs for both operations. Checks compare the full
+GPR bank, flags, mapped bytes where applicable, and fault/fuel/stop state.
+The shared memory-arithmetic verifier passes 407205 cases; its invalid-operation
+test now uses 9 because operations 7 and 8 implement ADC/SBB.
+
+The release build, 687 library tests, three integration tests and strict Clippy
+pass. Standalone verifiers compile with warnings denied. Reproduce using the
+release rlib/dependency flags above with `direct_carry_native.rs` and
+`direct_memory_arithmetic_native.rs`.
+
+Configured `--direct-startup` passes the previous span at image-relative 0x3b9c
+and exits 1 at span 0x501b with `Direct lowering unsupported: Cmp_rm64_imm8`.
+Logs are `/tmp/macps5-carry-{tests,clippy,build,startup}.log`. This is evidence of
+progress through homebrew startup, not successful bootstrap or PS5 gameplay.
+The startup-only run skips Metal presentation. Memory/immediate comparison is
+the next observed CPU gap.

@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct ADC/SBB now supports 8/16/32/64-bit register and guarded memory forms,
+including incoming carry and precise arithmetic flags. 1116160 native checks
+and 407205 memory-arithmetic regression checks pass. Configured startup passes
+the former SBB block and reaches an unsupported memory/immediate CMP64 at
+0x501b. See [carry evidence](../docs/status/TRANSLATOR_READINESS.md#direct-adc-and-sbb).
+
 Direct NEG now supports all integer widths with guarded memory updates and
 subtraction flags. 255744 native cases plus NOT/memory-arithmetic regressions
 pass. Startup translates past NEG in the block at 0x3b9c but now rejects SBB32;
