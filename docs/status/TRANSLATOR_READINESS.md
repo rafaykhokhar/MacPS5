@@ -2237,3 +2237,31 @@ dependency flags above with `direct_vector_logic_native.rs` and
 `/tmp/macps5-vector-logic-{tests,clippy,build}.log`. Alignment failures are modeled
 guard faults, not delivered architectural exceptions. This adds CPU vector
 coverage without establishing complete SIMD, GPU, or PS5 game support.
+
+## Direct legacy packed moves
+
+Direct MOVUPS/MOVUPD/MOVDQU and MOVAPS/MOVAPD/MOVDQA now support both opcode
+directions for register copies and guarded loads/stores. Legacy register
+writes preserve the destination's upper YMM half; VEX128 continues clearing it.
+The aligned legacy forms require 16-byte alignment, while unaligned forms
+accept any mapped full operand. Failed accesses leave vectors and memory
+unchanged. Guest flags, MXCSR and GPRs are preserved. These semantics follow
+the [Intel instruction reference](https://cdrdv2-public.intel.com/868137/325462-089-sdm-vol-1-2abcd-3abcd-4.pdf).
+
+The expanded `rust/verification/direct_vector_move_native.rs` checks legacy
+SSE128 alongside VEX128/256 for all six opcode families, both directions,
+all register/base pairs, aliases, nonzero upper lanes and read-only versus
+writable mappings. Addresses cover alignment, last-valid spans, short and
+unmapped accesses, and overflow. It compares every modeled vector, GPR,
+memory byte, flags, MXCSR, RIP and fault/fuel/stop state. Every encoding fixture
+also executes with a prior fault and with zero instruction budget, verifying
+that neither accesses memory nor changes architectural state.
+
+Validation passes: 175104 combined native cases (138240 operand/state cases
+and 36864 prior-fault/budget cases), 687 library tests, three integration tests,
+strict Clippy and release build. The standalone verifier compiles with warnings
+denied; reproduce using the release rlib/dependency flags above with
+`direct_vector_move_native.rs`. Logs are
+`/tmp/macps5-legacy-move-{tests,clippy,build}.log`. Alignment faults remain runtime
+guard stops; architectural exception delivery, full SIMD readiness and PS5
+gameplay are not established.

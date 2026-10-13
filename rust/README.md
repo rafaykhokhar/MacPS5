@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct legacy MOVUPS/MOVUPD/MOVDQU and MOVAPS/MOVAPD/MOVDQA now support
+register copies and guarded loads/stores while preserving upper YMM bits.
+The combined SSE/VEX verifier passes 175104 native cases, with library tests
+and strict Clippy also passing. See
+[legacy-move evidence](../docs/status/TRANSLATOR_READINESS.md#direct-legacy-packed-moves).
+
 Direct packed AND/AND-NOT/OR/XOR now covers legacy SSE128 and VEX128/256,
 including integer encodings, guarded memory and upper-lane rules. 811008
 native checks plus 98308 existing XOR regression cases pass, along with

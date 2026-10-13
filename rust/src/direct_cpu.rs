@@ -206,6 +206,18 @@ fn conditional_move(i: &Instruction) -> bool {
 }
 fn vector_move(i: &Instruction) -> Option<(u64, bool)> {
     match i.code() {
+        Code::Movups_xmm_xmmm128
+        | Code::Movups_xmmm128_xmm
+        | Code::Movupd_xmm_xmmm128
+        | Code::Movupd_xmmm128_xmm
+        | Code::Movdqu_xmm_xmmm128
+        | Code::Movdqu_xmmm128_xmm => Some((16, false)),
+        Code::Movaps_xmm_xmmm128
+        | Code::Movaps_xmmm128_xmm
+        | Code::Movapd_xmm_xmmm128
+        | Code::Movapd_xmmm128_xmm
+        | Code::Movdqa_xmm_xmmm128
+        | Code::Movdqa_xmmm128_xmm => Some((16, true)),
         Code::VEX_Vmovups_xmm_xmmm128
         | Code::VEX_Vmovups_xmmm128_xmm
         | Code::VEX_Vmovupd_xmm_xmmm128
@@ -672,6 +684,7 @@ pub(crate) fn translate_span(
             continue;
         }
         if let Some((size, aligned)) = vector_move(i) {
+            let legacy = i.encoding() == iced_x86::EncodingKind::Legacy;
             if i.op0_kind() == OpKind::Register && i.op1_kind() == OpKind::Register {
                 let dst = vector_register(i.op0_register(), size)?;
                 let src = vector_register(i.op1_register(), size)?;
@@ -679,7 +692,7 @@ pub(crate) fn translate_span(
                     c.context_access(9, 19, 208 + src * 32 + offset, true, false)?;
                     c.context_access(9, 19, 208 + dst * 32 + offset, true, true)?;
                 }
-                if size == 16 {
+                if size == 16 && !legacy {
                     c.load_u64(9, 0)?;
                     c.context_access(9, 19, 224 + dst * 32, true, true)?;
                     c.context_access(9, 19, 232 + dst * 32, true, true)?;
@@ -692,7 +705,9 @@ pub(crate) fn translate_span(
                 c.load_u64(2, reg as u64)?;
                 c.load_u64(3, size)?;
                 c.load_u64(4, u64::from(aligned))?;
-                c.call_absolute(if load {
+                c.call_absolute(if load && legacy {
+                    crate::guest_memory::ffi::native_legacy_vector_load as *const () as u64
+                } else if load {
                     crate::guest_memory::ffi::native_ps5_module_vector_load_v1 as *const () as u64
                 } else {
                     crate::guest_memory::ffi::native_ps5_module_vector_store_v1 as *const () as u64
