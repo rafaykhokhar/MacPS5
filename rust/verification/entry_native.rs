@@ -56,6 +56,7 @@ mod wcsxfrm_native;
 mod mbrlen_native;
 mod mbtowc_native;
 mod mb_cur_max_native;
+mod strtok_r_native;
 mod packed_compare_shift_native;
 mod vpbroadcastd_native;
 mod strftime_native;
@@ -146,6 +147,7 @@ fn main() -> Result<(), String> {
         mbrlen_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("mbrlen"))?;
         mbtowc_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("mbtowc"))?;
         mb_cur_max_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("mb-cur-max"))?;
+        strtok_r_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtok-r"))?;
         packed_compare_shift_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-compare-shift"))?;
         vpbroadcastd_native::verify(Path::new(&archive), &Path::new(&directory).join("vpbroadcastd"))?;
         strftime_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strftime"))?;
@@ -555,6 +557,7 @@ fn main() -> Result<(), String> {
         ("wcsxfrm", Service::Wcsxfrm),
         ("mbrlen", Service::Mbrlen),
         ("mbtowc", Service::Mbtowc),
+        ("strtok_r", Service::StrtokR),
     ]
     .into_iter()
     .enumerate()
@@ -1363,7 +1366,7 @@ fn main() -> Result<(), String> {
                 .iter()
                 .find(|s| {
                     locale_slot >= s.address
-                        && locale_slot + 1152 <= s.address + s.bytes.len() as u64
+                        && locale_slot + 1160 <= s.address + s.bytes.len() as u64
                 })
                 .ok_or("Missing locale import slot")?;
             let locale_offset = (locale_slot - locale_segment.address) as usize;
@@ -1513,6 +1516,7 @@ fn main() -> Result<(), String> {
                 (1128, "mbrlen"),
                 (1136, "mbtowc"),
                 (1144, "__mb_cur_max"),
+                (1152, "strtok_r"),
             ] {
                 let expected = libc_exports.iter().find(|(symbol, _)| *symbol == name)
                     .ok_or("Missing registered libc service")?.1;
@@ -1541,13 +1545,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 146 libc exports: (146+1)*24=3528 symbol bytes (rounded3536)
-                // and 1+146*12=1753 NID bytes (rounded1760).
-                // __mb_cur_max adds48bytes to19584.
-                || native.bytes_allocated() != 19632
+                // 147 libc exports: (147+1)*24=3552 symbol bytes
+                // and 1+147*12=1765 NID bytes (rounded1776).
+                // StrtokR adds32bytes to19632.
+                || native.bytes_allocated() != 19664
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'strtok_r'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'printf'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1557,7 +1561,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; __mb_cur_max data import bound; unresolved strtok_r causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; strtok_r import bound; unresolved printf causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1619,7 +1623,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved strtok_r triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved printf triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     if let Some(result) = presentation_result {

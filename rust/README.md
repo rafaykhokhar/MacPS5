@@ -1,5 +1,15 @@
 # Rust migration
 
+`strtok_r` now uses a bounded Rust plan with exact separator/save-pointer writes.
+Direct and actual SDL-wrapper native checks pass, including continuation,
+changing delimiters and memory/frame guards (`work/strtok-native/native.log`).
+The matching release passes 517 library tests, three integration tests and
+strict Clippy. Startup discovery reaches missing `printf` with 19,664 retained
+dependency bytes (`work/arm64-prototype/strtok-entry.log`). See
+the passing startup-only import/ownership check
+(`work/arm64-prototype/strtok-verified.log`, 38168 exit0) and
+[tokenization evidence](../docs/status/STRTOK.md). No game main has executed.
+
 `__mb_cur_max` is now a writable four-byte guest data export, with persistent
 per-executor storage and C/POSIX character-locale transition behavior. Native
 checks execute both real accessors, test writes, isolation and memory bounds.

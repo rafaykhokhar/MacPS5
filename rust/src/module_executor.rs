@@ -950,6 +950,7 @@ pub enum Service {
     Mbrtowc,
     Mbrlen,
     Mbtowc,
+    StrtokR,
     Wcrtomb,
     Mbsrtowcs,
     Qsort,
@@ -1147,6 +1148,7 @@ impl Service {
             | Self::Mbrtowc
             | Self::Mbrlen
             | Self::Mbtowc
+            | Self::StrtokR
             | Self::Wcrtomb
             | Self::Mbsrtowcs
             | Self::Qsort
@@ -5363,6 +5365,15 @@ impl NativeExecutor {
                             sp,
                             ret,
                         )?
+                    } else if matches!(service, Service::StrtokR) {
+                        let plan = crate::guest_strtok::plan(
+                            &memory, cpu.registers[7], cpu.registers[6], cpu.registers[2],
+                        )?;
+                        for (address, length) in plan.write_ranges() {
+                            validate_net_output(&memory, address, length, sp, ret)?;
+                        }
+                        plan.commit(&mut memory)?;
+                        plan.token
                     } else if matches!(service, Service::Wcstombs) {
                         // GuestLocale currently supports C/POSIX only. Conversion
                         // is stateless and uses guest unsigned16 code units.

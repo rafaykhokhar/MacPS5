@@ -106,6 +106,7 @@ pub mod guest_sysctl;
 pub mod guest_signal_action;
 
 pub mod guest_multibyte;
+pub mod guest_strtok;
 pub mod guest_wcstombs;
 
 mod guest_callback;
