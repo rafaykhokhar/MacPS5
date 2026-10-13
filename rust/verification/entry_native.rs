@@ -97,6 +97,7 @@ mod scalar_move_native;
 mod vector_register_native;
 mod vector_sign_test_native;
 mod byte_mask_native;
+mod packed_greater_native;
 mod vector_extract128_native;
 mod strftime_native;
 mod strtof_native;
@@ -228,6 +229,7 @@ fn main() -> Result<(), String> {
         vector_register_native::verify(Path::new(&archive), &Path::new(&directory).join("vector-register"))?;
         vector_sign_test_native::verify(Path::new(&archive), &Path::new(&directory).join("vector-sign-test"))?;
         byte_mask_native::verify(Path::new(&archive), &Path::new(&directory).join("byte-mask"))?;
+        packed_greater_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-greater"))?;
         vector_extract128_native::verify(Path::new(&archive), &Path::new(&directory).join("vector-extract128"))?;
         strftime_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strftime"))?;
         strtof_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtof"))?;

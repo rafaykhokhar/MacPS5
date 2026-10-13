@@ -1,5 +1,13 @@
 # Rust migration
 
+VEX signed packed greater-than comparisons now support eight byte/word/dword/
+qword XMM/YMM forms. The matching build passes 682 library tests, three
+integration tests, strict Clippy, 156,352 new native checks, 82,005 compare/shift
+regressions and 20,088 equality regressions. Discovery reaches 58,052 instructions
+with 139 unsupported sites. Startup remains at missing `fscanf`, before game
+main. See [CPU evidence](../docs/status/CPU.md). Production readiness and retail
+gameplay remain unverified.
+
 VEX VPMOVMSKB now supports four XMM/YMM and r32/r64 forms through the existing
 sign-mask path. The matching build passes 678 library tests, three integration
 tests, strict Clippy, 862,784 new native checks and 86,144 register-operation

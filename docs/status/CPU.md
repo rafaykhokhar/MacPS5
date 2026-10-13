@@ -1,5 +1,42 @@
 # CPU completion criteria
 
+## Signed packed greater-than comparisons
+
+VEX VPCMPGTB/W/D/Q now support eight XMM/YMM forms, extending the earlier
+YMM dword-only implementation. Each signed comparison produces an all-ones
+or zero destination lane. ARM64 lowering uses CMGT for byte/word/dword/qword
+lanes and defers destination stores until all inputs are read. Memory helpers
+guard the complete 16/32-byte operand before committing; XMM results clear
+the upper half. The previous dword helper ABI remains as a wrapper. Flags/FP
+state are preserved. Exact VEX forms are required, and unsupported
+FS/GS/address32 forms remain rejected.
+
+Reference: AMD APM Volume 4 rev.3.24 pp.314–321
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)).
+Architectural alignment-control behavior and full fault delivery remain
+outside the guard model.
+
+The matching build passes 682 library tests, three integration tests, strict
+Clippy and release compilation (`work/packed-greater-native/{tests,clippy,release}.log`,
+process 77764 exit 0). The former XMM dword rejection assertion now checks
+support. The [native verifier](../../rust/verification/packed_greater_native.rs)
+passes 156,352 checks across 96 decoded fixtures using independent i128 signed
+ordering: all byte pairs, wider signed extrema/equality/off-by-one cases,
+unsigned-order traps, random lanes, aliases/high registers/WIG, readonly
+high/unaligned/RIP operands, every short span, flags/FP/fuel/prior faults.
+The existing compare/shift suite passes 82,005 checks, and the equality suite
+passes 20,088 checks (`work/packed-greater-native/{native,regression,equality}.log`,
+process 89704 exit 0).
+
+Discovery reaches 58,052 instructions and 13,152 blocks with 139 unsupported
+sites: one old stop removed and one later stop exposed. These counts do not
+establish CPU completion. The entry runner compiles with warnings denied;
+startup-only verification passes at missing `fscanf`, with ten accepted
+dependencies, 20,288 owned dependency bytes and pending cleanup. Game main has
+not executed (`work/packed-greater-native/entry.log`, process 27192 exit 0).
+No full GPU suite was run for this CPU change. Production readiness and retail
+gameplay remain unverified.
+
 ## Byte sign-mask extraction
 
 VEX VPMOVMSKB now supports four XMM/YMM and r32/r64 decoded forms through

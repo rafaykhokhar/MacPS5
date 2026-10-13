@@ -37,6 +37,27 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn packed_greater_absolute_address_guard() {
+        for (map, opcode) in [(1, 0x64), (1, 0x65), (1, 0x66), (2, 0x37)] {
+            for length in [0, 4] {
+                let bytes = [
+                    0x67,
+                    0xc4,
+                    0xe0 | map,
+                    0x79 | length,
+                    opcode,
+                    0x04,
+                    0x25,
+                    0,
+                    0,
+                    0,
+                    0,
+                ];
+                assert!(super::translate_rust_memory_region(&bytes, 0, "address").is_err());
+            }
+        }
+    }
+    #[test]
     fn vector_sign_test_absolute_address_guard() {
         for opcode in [0x0e, 0x0f] {
             for length in [0, 4] {
@@ -697,14 +718,14 @@ mod rust_memory_tests {
     fn packed_compare_shift_exact_forms() {
         for bytes in [
             &[0xc5, 0xfd, 0x66, 0xc1][..],
+            &[0xc5, 0xf9, 0x66, 0xc1],
             &[0xc5, 0xfd, 0x66, 0x07],
             &[0xc5, 0xfd, 0x72, 0xd0, 0x1f],
         ] {
             assert!(super::translate_rust_memory_region(bytes, 0, "packed").is_ok());
         }
         for bytes in [
-            &[0xc5, 0xf9, 0x66, 0xc1][..],
-            &[0xc5, 0xfd, 0xd2, 0xc1],
+            &[0xc5, 0xfd, 0xd2, 0xc1][..],
             &[0x66, 0x0f, 0x66, 0xc1],
             &[0x67, 0xc5, 0xfd, 0x66, 0x07],
         ] {
@@ -2167,19 +2188,41 @@ impl Emitter {
                     ));
                 }
             }
-            M::Vpcmpeqb | M::Vpcmpeqw | M::Vpcmpeqd | M::Vpcmpeqq => {
+            M::Vpcmpeqb
+            | M::Vpcmpeqw
+            | M::Vpcmpeqd
+            | M::Vpcmpeqq
+            | M::Vpcmpgtb
+            | M::Vpcmpgtw
+            | M::Vpcmpgtd
+            | M::Vpcmpgtq => {
                 use iced_x86::Code;
-                let (lane_size, wide, lanes) = match i.code() {
-                    Code::VEX_Vpcmpeqb_xmm_xmm_xmmm128 => (1, false, "16b"),
-                    Code::VEX_Vpcmpeqb_ymm_ymm_ymmm256 => (1, true, "16b"),
-                    Code::VEX_Vpcmpeqw_xmm_xmm_xmmm128 => (2, false, "8h"),
-                    Code::VEX_Vpcmpeqw_ymm_ymm_ymmm256 => (2, true, "8h"),
-                    Code::VEX_Vpcmpeqd_xmm_xmm_xmmm128 => (4, false, "4s"),
-                    Code::VEX_Vpcmpeqd_ymm_ymm_ymmm256 => (4, true, "4s"),
-                    Code::VEX_Vpcmpeqq_xmm_xmm_xmmm128 => (8, false, "2d"),
-                    Code::VEX_Vpcmpeqq_ymm_ymm_ymmm256 => (8, true, "2d"),
-                    _ => return Err("Only VEX packed integer equality is implemented".into()),
-                };
+                let greater = matches!(m, M::Vpcmpgtb | M::Vpcmpgtw | M::Vpcmpgtd | M::Vpcmpgtq);
+                let operation = if greater { "cmgt" } else { "cmeq" };
+                let helper = if greater { "cmpgt" } else { "cmpeq" };
+                let (lane_size, wide, lanes) =
+                    match i.code() {
+                        Code::VEX_Vpcmpeqb_xmm_xmm_xmmm128 => (1, false, "16b"),
+                        Code::VEX_Vpcmpeqb_ymm_ymm_ymmm256 => (1, true, "16b"),
+                        Code::VEX_Vpcmpeqw_xmm_xmm_xmmm128 => (2, false, "8h"),
+                        Code::VEX_Vpcmpeqw_ymm_ymm_ymmm256 => (2, true, "8h"),
+                        Code::VEX_Vpcmpeqd_xmm_xmm_xmmm128 => (4, false, "4s"),
+                        Code::VEX_Vpcmpeqd_ymm_ymm_ymmm256 => (4, true, "4s"),
+                        Code::VEX_Vpcmpeqq_xmm_xmm_xmmm128 => (8, false, "2d"),
+                        Code::VEX_Vpcmpeqq_ymm_ymm_ymmm256 => (8, true, "2d"),
+                        Code::VEX_Vpcmpgtb_xmm_xmm_xmmm128 => (1, false, "16b"),
+                        Code::VEX_Vpcmpgtb_ymm_ymm_ymmm256 => (1, true, "16b"),
+                        Code::VEX_Vpcmpgtw_xmm_xmm_xmmm128 => (2, false, "8h"),
+                        Code::VEX_Vpcmpgtw_ymm_ymm_ymmm256 => (2, true, "8h"),
+                        Code::VEX_Vpcmpgtd_xmm_xmm_xmmm128 => (4, false, "4s"),
+                        Code::VEX_Vpcmpgtd_ymm_ymm_ymmm256 => (4, true, "4s"),
+                        Code::VEX_Vpcmpgtq_xmm_xmm_xmmm128 => (8, false, "2d"),
+                        Code::VEX_Vpcmpgtq_ymm_ymm_ymmm256 => (8, true, "2d"),
+                        _ => return Err(
+                            "Only VEX packed integer equality/greater comparisons are implemented"
+                                .into(),
+                        ),
+                    };
                 let dst = vector(i.op0_register())?;
                 let first = vector(i.op1_register())?;
                 if i.op2_kind() == OpKind::Memory {
@@ -2191,19 +2234,19 @@ impl Emitter {
                     }
                     self.address(i)?;
                     self.emit(format!(
-                        "mov x0, x19\nmov x2, #{dst}\nmov x3, #{first}\nmov x4, #{}\nmov x5, #{lane_size}\nbl _native_ps5_module_vector_cmpeq_v1",
+                        "mov x0, x19\nmov x2, #{dst}\nmov x3, #{first}\nmov x4, #{}\nmov x5, #{lane_size}\nbl _native_ps5_module_vector_{helper}_v1",
                         if wide { 32 } else { 16 }
                     ));
                     self.fault();
                 } else {
                     let second = vector(i.op2_register())?;
                     self.emit(format!(
-                        "ldr q0, [x19, #{}]\nldr q1, [x19, #{}]\ncmeq v0.{lanes}, v0.{lanes}, v1.{lanes}",
+                        "ldr q0, [x19, #{}]\nldr q1, [x19, #{}]\n{operation} v0.{lanes}, v0.{lanes}, v1.{lanes}",
                         208 + first * 32, 208 + second * 32
                     ));
                     if wide {
                         self.emit(format!(
-                            "ldr q2, [x19, #{}]\nldr q3, [x19, #{}]\ncmeq v2.{lanes}, v2.{lanes}, v3.{lanes}",
+                            "ldr q2, [x19, #{}]\nldr q3, [x19, #{}]\n{operation} v2.{lanes}, v2.{lanes}, v3.{lanes}",
                             224 + first * 32, 224 + second * 32
                         ));
                     } else {
@@ -2215,21 +2258,6 @@ impl Emitter {
                         208 + dst * 32,
                         224 + dst * 32
                     ));
-                }
-            }
-            M::Vpcmpgtd => {
-                if i.code() != iced_x86::Code::VEX_Vpcmpgtd_ymm_ymm_ymmm256 {
-                    return Err("Only VEX256 VPCMPGTD is implemented".into());
-                }
-                let dst = vector(i.op_register(0))?;
-                let first = vector(i.op_register(1))?;
-                if i.op_kind(2) == OpKind::Memory {
-                    self.address(i)?;
-                    self.emit(format!("mov x0, x19\nmov x2, #{dst}\nmov x3, #{first}\nbl _native_ps5_module_vector_cmpgtd256_v1"));
-                    self.fault();
-                } else {
-                    let second = vector(i.op_register(2))?;
-                    self.emit(format!("ldr q0, [x19, #{}]\nldr q1, [x19, #{}]\nldr q2, [x19, #{}]\nldr q3, [x19, #{}]\ncmgt v0.4s, v0.4s, v1.4s\ncmgt v2.4s, v2.4s, v3.4s\nstr q0, [x19, #{}]\nstr q2, [x19, #{}]",208+first*32,208+second*32,224+first*32,224+second*32,208+dst*32,224+dst*32));
                 }
             }
             M::Vpsllw

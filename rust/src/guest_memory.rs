@@ -739,21 +739,34 @@ pub fn vector_cmpgtd256(
     destination: u64,
     first: u64,
 ) -> Result<()> {
-    vector_operand(address, destination, 32, 0)?;
-    if first >= 16 {
-        return Err("Invalid source vector register".into());
+    vector_cmpgt(memory, vectors, address, destination, first, 32, 4)
+}
+/// Signed packed greater-than comparison after guarding the complete source.
+pub fn vector_cmpgt(
+    memory: &Memory<'_>,
+    vectors: &mut [[u8; 32]; 16],
+    address: u64,
+    destination: u64,
+    first: u64,
+    size: u64,
+    lane_size: u64,
+) -> Result<()> {
+    vector_operand(address, destination, size, 0)?;
+    if first >= 16 || ![1, 2, 4, 8].contains(&lane_size) {
+        return Err("Invalid signed packed comparison operand".into());
     }
-    let source = memory.read(address, 32)?;
+    let source = memory.read(address, size as usize)?;
     let mut result = [0; 32];
-    for lane in 0..8 {
-        let start = lane * 4;
-        let lhs = i32::from_le_bytes(
-            vectors[first as usize][start..start + 4]
-                .try_into()
-                .unwrap(),
-        );
-        let rhs = i32::from_le_bytes(source[start..start + 4].try_into().unwrap());
-        result[start..start + 4].fill(if lhs > rhs { 0xff } else { 0 });
+    let width = lane_size as usize;
+    let sign_bias = 1u64 << (width * 8 - 1);
+    for start in (0..size as usize).step_by(width) {
+        let end = start + width;
+        let mut lhs = [0; 8];
+        let mut rhs = [0; 8];
+        lhs[..width].copy_from_slice(&vectors[first as usize][start..end]);
+        rhs[..width].copy_from_slice(&source[start..end]);
+        let greater = (u64::from_le_bytes(lhs) ^ sign_bias) > (u64::from_le_bytes(rhs) ^ sign_bias);
+        result[start..end].fill(if greater { 0xff } else { 0 });
     }
     vectors[destination as usize] = result;
     Ok(())
@@ -2048,6 +2061,39 @@ pub mod ffi {
     /// # Safety
     /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
     #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn native_ps5_module_vector_cmpgt_v1(
+        cpu: *mut Cpu,
+        address: u64,
+        destination: u64,
+        first: u64,
+        size: u64,
+        lane_size: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if cpu.memory != 0
+            && vector_cmpgt(
+                unsafe { &*(cpu.memory as *const Memory<'_>) },
+                &mut cpu.vectors,
+                address,
+                destination,
+                first,
+                size,
+                lane_size,
+            )
+            .is_ok()
+        {
+            return;
+        }
+        cpu.fault = 1;
+    }
+    /// # Safety
+    /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
+    #[unsafe(no_mangle)]
     pub unsafe extern "C" fn native_ps5_module_vector_cmpgtd256_v1(
         cpu: *mut Cpu,
         address: u64,
@@ -2629,6 +2675,144 @@ mod tests {
         assert_eq!(memory.read(0x1001, 16).unwrap(), &original[15][16..]);
         assert_eq!(cpu.vectors, original);
         assert_eq!(cpu.flags, u64::MAX);
+    }
+    #[test]
+    fn packed_cmpgt_exhaustive_bytes_and_wide_extrema() {
+        for a in 0..=255u8 {
+            for b in 0..=255u8 {
+                let mut vectors = [[a; 32]; 16];
+                let mut data = [b; 32];
+                let mut memory = Memory::default();
+                memory.add(0x1001, &mut data, false, false).unwrap();
+                vector_cmpgt(&memory, &mut vectors, 0x1001, 15, 15, 32, 1).unwrap();
+                assert_eq!(
+                    vectors[15],
+                    [if (a as i8) > (b as i8) { 255 } else { 0 }; 32]
+                );
+            }
+        }
+        for size in [16usize, 32] {
+            for width in [1usize, 2, 4, 8] {
+                let sign = 1i128 << (width * 8 - 1);
+                let values = [-sign, -sign + 1, -1, 0, 1, sign - 2, sign - 1];
+                for a in values {
+                    for b in values {
+                        for destination in [3usize, 15] {
+                            let mut vectors = [[0xa5; 32]; 16];
+                            let mut data = [0; 32];
+                            let mut result = [0; 32];
+                            for (lane, start) in (0..size).step_by(width).enumerate() {
+                                let (left, right) = if lane % 2 == 0 { (a, b) } else { (b, a) };
+                                vectors[15][start..start + width]
+                                    .copy_from_slice(&left.to_le_bytes()[..width]);
+                                data[start..start + width]
+                                    .copy_from_slice(&right.to_le_bytes()[..width]);
+                                result[start..start + width].fill(if left > right {
+                                    255
+                                } else {
+                                    0
+                                });
+                            }
+                            let mut expected = vectors;
+                            expected[destination] = result;
+                            let mut memory = Memory::default();
+                            memory
+                                .add(0x1_0000_0001, &mut data[..size], false, false)
+                                .unwrap();
+                            vector_cmpgt(
+                                &memory,
+                                &mut vectors,
+                                0x1_0000_0001,
+                                destination as u64,
+                                15,
+                                size as u64,
+                                width as u64,
+                            )
+                            .unwrap();
+                            assert_eq!(vectors, expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn packed_cmpgt_full_span_and_invalid_operands_are_atomic() {
+        let original = [[0xa5; 32]; 16];
+        for size in [16u64, 32] {
+            for lane_size in [1, 2, 4, 8] {
+                for length in 0..size as usize {
+                    let mut data = vec![0; length];
+                    let mut memory = Memory::default();
+                    if length != 0 {
+                        memory.add(0x1001, &mut data, false, false).unwrap();
+                    }
+                    let mut vectors = original;
+                    assert!(
+                        vector_cmpgt(&memory, &mut vectors, 0x1001, 0, 0, size, lane_size).is_err()
+                    );
+                    assert_eq!(vectors, original);
+                }
+            }
+        }
+        let mut data = [0; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        for (dst, first, size, lane) in [
+            (16, 0, 16, 1),
+            (u64::MAX, 0, 16, 1),
+            (0, 16, 16, 1),
+            (0, u64::MAX, 16, 1),
+            (0, 0, 0, 1),
+            (0, 0, 8, 1),
+            (0, 0, 64, 1),
+            (0, 0, u64::MAX, 1),
+            (0, 0, 16, 0),
+            (0, 0, 16, 3),
+            (0, 0, 16, 16),
+            (0, 0, 16, u64::MAX),
+        ] {
+            let mut vectors = original;
+            assert!(vector_cmpgt(&memory, &mut vectors, 0x1001, dst, first, size, lane).is_err());
+            assert_eq!(vectors, original);
+        }
+    }
+    #[test]
+    #[allow(unsafe_code)]
+    fn packed_cmpgt_ffi_faults_and_fp_preservation() {
+        use crate::legacy_cpu::Cpu;
+        unsafe { ffi::native_ps5_module_vector_cmpgt_v1(std::ptr::null_mut(), 0, 0, 0, 16, 1) };
+        let mut cpu = Cpu {
+            vectors: [[0; 32]; 16],
+            flags: u64::MAX,
+            mxcsr: 0xffff,
+            x87_control: 0x137f,
+            x87_status: 0x5555,
+            ..Cpu::default()
+        };
+        for fault in [0, 2, 13] {
+            cpu.fault = fault;
+            unsafe { ffi::native_ps5_module_vector_cmpgt_v1(&mut cpu, 0x1001, 0, 0, 16, 8) };
+            assert_eq!(cpu.fault, if fault == 0 { 1 } else { fault });
+            assert_eq!(cpu.vectors, [[0; 32]; 16]);
+        }
+        let mut data = [0xff; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        cpu.memory = (&mut memory as *mut Memory<'_>) as u64;
+        cpu.fault = 0;
+        unsafe { ffi::native_ps5_module_vector_cmpgt_v1(&mut cpu, 0x1001, 0, 0, 16, 8) };
+        assert_eq!(cpu.fault, 0);
+        assert_eq!(&cpu.vectors[0][..16], &[255; 16]);
+        assert_eq!(&cpu.vectors[0][16..], &[0; 16]);
+        let before = cpu.vectors;
+        unsafe { ffi::native_ps5_module_vector_cmpgt_v1(&mut cpu, 0x1001, 0, 0, 16, 3) };
+        assert_eq!(cpu.fault, 1);
+        assert_eq!(cpu.vectors, before);
+        assert_eq!(
+            (cpu.flags, cpu.mxcsr, cpu.x87_control, cpu.x87_status),
+            (u64::MAX, 0xffff, 0x137f, 0x5555)
+        );
     }
     #[test]
     fn vector_sign_test_exhaustive_sign_masks_ignore_other_bits() {
