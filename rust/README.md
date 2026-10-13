@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct CMOVcc now supports all 16 conditions at 16/32/64 bits, including guarded
+memory reads on false conditions. 2359300 native state checks pass. Configured
+startup translates past CMOVL in the block at 0x31e8 but now rejects MOVSXD;
+that whole block has not executed. See
+[conditional move evidence](../docs/status/TRANSLATOR_READINESS.md#direct-conditional-moves).
+
 Direct VEX packed moves now support 128/256-bit register copies and guarded
 loads/stores for VMOVUPS/UPD/APS/APD/DQA/DQU. 92160 native state checks pass.
 Configured startup proceeds beyond the block at 0x2d2f and stops on CMOVL32 at

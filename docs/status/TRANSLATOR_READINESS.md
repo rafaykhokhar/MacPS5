@@ -1121,3 +1121,39 @@ image-relative 0x2d2f and exits 1 at 0x31e8 with
 dlsym lookup. Logs are `/tmp/macps5-vector-move-{tests,clippy,build,startup}.log`.
 The next observed CPU gap is conditional moves; complete bootstrap and PS5
 gameplay remain unverified. This startup-only run skips Metal presentation.
+
+## Direct conditional moves
+
+The direct backend explicitly accepts all 48 legacy CMOVcc encodings (16
+conditions at 16/32/64 bits) with register or guarded memory sources. Source
+resolution happens before condition evaluation; a false condition does not
+suppress a memory fault. A 16-byte aligned host stack slot preserves the resolved
+source across the existing condition helper. ARM64 CSEL selects the value;
+16-bit stores preserve surrounding bits, while 32-bit results zero the upper
+half even when the condition is false. Guest RFLAGS are unchanged. Fault paths
+exit before the temporary host stack slot is allocated or the destination changes.
+
+These rules follow the CMOVcc operation in
+[Intel SDM volume 2A, page 3-159](https://cdrdv2-public.intel.com/868140/253666-089-sdm-vol-2a.pdf#page=277).
+The implementation rejects other encodings rather than treating newer APX
+conditionally faulting instructions as ordinary CMOVcc.
+
+`rust/verification/direct_cmov_native.rs` passes 2359300 native state checks.
+It uses independent fixed truth tables for all 32 CF/PF/ZF/SF/OF combinations,
+all GPR source/destination pairs at all three widths, aliases and memory-address
+aliases, unaligned reads, exact-end/short/unmapped operands and wrapping
+addresses. Expected state includes false-condition memory faults and CMOV32
+zero-extension. Prior faults and exhausted fuel preserve destination state;
+FS/GS and 32-bit addressing are rejected. The strict-warning verifier, 687
+library tests, three integration tests, strict Clippy and release build pass.
+An initial verifier parsing error in cast/shift expressions was corrected before
+the native run. Reproduce with the standalone release rlib/dependency flags
+above, substituting `direct_cmov_native.rs`.
+
+Configured `--direct-startup` still reaches the first real dlsym lookup and exits
+1 at image-relative 0x31e8, now with
+`Direct lowering unsupported: Movsxd_r64_rm32`. CMOVL is accepted during
+translation, but this entire block has not executed. Logs are
+`/tmp/macps5-cmov-{tests,clippy,build,startup}.log`. Sign-extending move lowering is
+the next observed CPU gap. Complete bootstrap and PS5 gameplay remain unproven;
+this startup-only run skips Metal presentation.

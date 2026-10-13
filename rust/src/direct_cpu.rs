@@ -5,6 +5,59 @@ use crate::{
     decode,
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
+fn conditional_move(i: &Instruction) -> bool {
+    matches!(
+        i.code(),
+        Code::Cmovo_r16_rm16
+            | Code::Cmovo_r32_rm32
+            | Code::Cmovo_r64_rm64
+            | Code::Cmovno_r16_rm16
+            | Code::Cmovno_r32_rm32
+            | Code::Cmovno_r64_rm64
+            | Code::Cmovb_r16_rm16
+            | Code::Cmovb_r32_rm32
+            | Code::Cmovb_r64_rm64
+            | Code::Cmovae_r16_rm16
+            | Code::Cmovae_r32_rm32
+            | Code::Cmovae_r64_rm64
+            | Code::Cmove_r16_rm16
+            | Code::Cmove_r32_rm32
+            | Code::Cmove_r64_rm64
+            | Code::Cmovne_r16_rm16
+            | Code::Cmovne_r32_rm32
+            | Code::Cmovne_r64_rm64
+            | Code::Cmovbe_r16_rm16
+            | Code::Cmovbe_r32_rm32
+            | Code::Cmovbe_r64_rm64
+            | Code::Cmova_r16_rm16
+            | Code::Cmova_r32_rm32
+            | Code::Cmova_r64_rm64
+            | Code::Cmovs_r16_rm16
+            | Code::Cmovs_r32_rm32
+            | Code::Cmovs_r64_rm64
+            | Code::Cmovns_r16_rm16
+            | Code::Cmovns_r32_rm32
+            | Code::Cmovns_r64_rm64
+            | Code::Cmovp_r16_rm16
+            | Code::Cmovp_r32_rm32
+            | Code::Cmovp_r64_rm64
+            | Code::Cmovnp_r16_rm16
+            | Code::Cmovnp_r32_rm32
+            | Code::Cmovnp_r64_rm64
+            | Code::Cmovl_r16_rm16
+            | Code::Cmovl_r32_rm32
+            | Code::Cmovl_r64_rm64
+            | Code::Cmovge_r16_rm16
+            | Code::Cmovge_r32_rm32
+            | Code::Cmovge_r64_rm64
+            | Code::Cmovle_r16_rm16
+            | Code::Cmovle_r32_rm32
+            | Code::Cmovle_r64_rm64
+            | Code::Cmovg_r16_rm16
+            | Code::Cmovg_r32_rm32
+            | Code::Cmovg_r64_rm64
+    )
+}
 fn vector_move(i: &Instruction) -> Option<(u64, bool)> {
     match i.code() {
         Code::VEX_Vmovups_xmm_xmmm128
@@ -225,6 +278,7 @@ pub(crate) fn translate_span(
             _ if immediate_shift(&i) => {}
             _ if vector_xor(&i).is_some() => {}
             _ if vector_move(&i).is_some() => {}
+            _ if conditional_move(&i) => {}
             _ => return Err(format!("Direct lowering unsupported: {:?}", i.code())),
         }
         offset += i.len();
@@ -432,6 +486,51 @@ pub(crate) fn translate_span(
             c.call_absolute(crate::arithmetic::native_ps5_arithmetic_flags_v1 as *const () as u64)?;
             c.context_access(0, 19, 136, true, true)?;
             c.context_access(1, 19, 152, true, true)?;
+            continue;
+        }
+        if conditional_move(i) {
+            let size = i.op0_register().size();
+            let dst = register(i.op0_register().full_register(), true)?;
+            if i.op1_kind() == OpKind::Memory {
+                // CMOV reads its source even when the condition is false.
+                memory_address(&mut c, i)?;
+                c.emit(0xaa1303e0)?;
+                c.load_u64(2, size as u64)?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_load_v1 as *const () as u64,
+                )?;
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+            } else {
+                let src = register(i.op1_register().full_register(), true)?;
+                if size == 2 {
+                    c.emit(0x79400260 | ((src as u32 * 4) << 10))?; // ldrh w0
+                } else {
+                    c.context_access(0, 19, src * 8, size == 8, false)?;
+                }
+            }
+            // Preserve the source across the condition helper on an aligned host frame.
+            c.emit(0xa9bf7fe0)?; // stp x0,xzr,[sp,#-16]!
+            c.emit(0xaa1303e0)?;
+            c.load_u64(1, i.condition_code() as u64 - 1)?;
+            c.call_absolute(crate::condition::ffi::native_ps5_condition_v1 as *const () as u64)?;
+            c.emit(0xf100001f)?; // cmp x0,#0
+            c.emit(0xa8c17fe9)?; // ldp x9,xzr,[sp],#16
+            c.context_access(10, 19, dst * 8, size == 8, false)?;
+            c.emit(0x9a8a1129)?; // csel x9,x9,x10,ne
+            if size == 2 {
+                c.emit(0x79000269 | ((dst as u32 * 4) << 10))?; // strh w9
+            } else {
+                // CMOV32 clears the upper half even when the condition is false.
+                c.context_access(9, 19, dst * 8, true, true)?;
+            }
             continue;
         }
         if setcc(i) {
