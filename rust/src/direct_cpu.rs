@@ -285,11 +285,12 @@ fn arithmetic_supported(i: &Instruction) -> bool {
             | Mnemonic::Xor
             | Mnemonic::Test
     ) && i.op0_kind() == OpKind::Register
-        && matches!(i.op0_register().size(), 4 | 8)
+        && matches!(i.op0_register().size(), 2 | 4 | 8)
         && match i.op1_kind() {
             OpKind::Memory => true,
             OpKind::Register => i.op0_register().size() == i.op1_register().size(),
             OpKind::Immediate32 | OpKind::Immediate8to32 => i.op0_register().size() == 4,
+            OpKind::Immediate16 | OpKind::Immediate8to16 => i.op0_register().size() == 2,
             OpKind::Immediate32to64 | OpKind::Immediate8to64 => i.op0_register().size() == 8,
             _ => false,
         }
@@ -1461,7 +1462,7 @@ pub(crate) fn translate_span(
             let destination = if memory_first {
                 None
             } else {
-                Some(register(i.op0_register(), wide)?)
+                Some(register(i.op0_register().full_register(), true)?)
             };
             if matches!(i.mnemonic(), Mnemonic::Inc | Mnemonic::Dec) {
                 c.load_u64(2, 1)?;
@@ -1497,9 +1498,16 @@ pub(crate) fn translate_span(
                     c.emit(0xaa0003e2)?; // mov x2,x0
                 }
             } else if i.op1_kind() == OpKind::Register {
-                c.context_access(2, 19, register(i.op1_register(), wide)? * 8, wide, false)?;
+                let src = register(i.op1_register().full_register(), true)?;
+                if size == 2 {
+                    c.emit(0x79400262 | ((src as u32 * 4) << 10))?;
+                } else {
+                    c.context_access(2, 19, src * 8, wide, false)?;
+                }
             } else {
                 let immediate = match i.op1_kind() {
+                    OpKind::Immediate16 => u64::from(i.immediate16()),
+                    OpKind::Immediate8to16 => u64::from(i.immediate8to16() as u16),
                     OpKind::Immediate32 => u64::from(i.immediate32()),
                     OpKind::Immediate8to32 => u64::from(i.immediate8to32() as u32),
                     OpKind::Immediate32to64 => i.immediate32to64() as u64,
@@ -1509,7 +1517,11 @@ pub(crate) fn translate_span(
                 c.load_u64(2, immediate)?;
             }
             if let Some(destination) = destination {
-                c.context_access(1, 19, destination * 8, wide, false)?;
+                if size == 2 {
+                    c.emit(0x79400261 | ((destination as u32 * 4) << 10))?;
+                } else {
+                    c.context_access(1, 19, destination * 8, wide, false)?;
+                }
             }
             let (opcode, operation) = match i.mnemonic() {
                 Mnemonic::Add => (0x0b020023, 1),
@@ -1523,13 +1535,22 @@ pub(crate) fn translate_span(
             };
             c.emit(opcode | if wide { 0x80000000 } else { 0 })?;
             if !matches!(i.mnemonic(), Mnemonic::Cmp | Mnemonic::Test) {
-                c.context_access(
-                    3,
-                    19,
-                    destination.ok_or("Direct arithmetic needs destination")? * 8,
-                    true,
-                    true,
-                )?;
+                if size == 2 {
+                    c.emit(
+                        0x79000263
+                            | ((destination.ok_or("Direct arithmetic needs destination")? as u32
+                                * 4)
+                                << 10),
+                    )?;
+                } else {
+                    c.context_access(
+                        3,
+                        19,
+                        destination.ok_or("Direct arithmetic needs destination")? * 8,
+                        true,
+                        true,
+                    )?;
+                }
             }
             c.context_access(0, 19, 136, true, false)?;
             c.load_u64(4, size as u64 * 8)?;

@@ -3,12 +3,12 @@ fn main() {
     unsafe {
         let arena = JitArena::new(4 * 1024 * 1024).unwrap();
         let mut checks = 0;
-        for wide in [false, true] {
-            let bits = if wide { 64 } else { 32 };
+        for size in [2u64, 4, 8] {
+            let wide = size == 8;
+            let bits = size * 8;
             let modulus = 1u128 << bits;
             let mask = (modulus - 1) as u64;
             let sign = 1u64 << (bits - 1);
-            let size = if wide { 8 } else { 4 };
             for (op, opcode) in [0x03, 0x2b, 0x3b, 0x23, 0x0b, 0x33].into_iter().enumerate() {
                 for dst in 0..16u8 {
                     for base in 0..16u8 {
@@ -17,6 +17,9 @@ fn main() {
                             opcode,
                             0x40 | ((dst & 7) << 3) | (base & 7),
                         ];
+                        if size == 2 {
+                            bytes.insert(0, 0x66);
+                        }
                         if base & 7 == 4 {
                             bytes.push(0x24);
                         }
@@ -111,7 +114,11 @@ fn main() {
                                             flags |= 2048;
                                         }
                                         if op != 2 {
-                                            expected[dst as usize] = result;
+                                            expected[dst as usize] = if size == 2 {
+                                                (expected[dst as usize] & !mask) | result
+                                            } else {
+                                                result
+                                            };
                                         }
                                     }
                                     run(&mut cpu);

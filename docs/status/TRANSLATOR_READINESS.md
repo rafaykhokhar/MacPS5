@@ -1776,3 +1776,26 @@ release rlib/dependency flags above using `direct_rotate_carry_native.rs` and
 `direct_memory_arithmetic_native.rs`. Logs are
 `/tmp/macps5-rotatecarry-{tests,clippy,build}.log`. This adds instruction coverage;
 it does not establish complete CPU translation or PS5 gameplay.
+
+## Direct word arithmetic and comparisons
+
+Direct register-destination ADD/SUB/CMP/AND/OR/XOR/TEST now accepts 16-bit
+operands alongside the existing dword/qword forms. Word register loads capture
+operands before aliasing writes, and word stores preserve the upper 48 bits.
+Immediate16 and sign-extended Immediate8to16 inputs feed the same 16-bit flag
+calculation. Guarded memory inputs load only two bytes and fault before any
+register or flag update. CMP/TEST leave the destination unchanged.
+
+`rust/verification/direct_word_arithmetic_native.rs` checks all destination/
+source register combinations, short/full immediates, signed and nibble
+boundaries, register aliases and surrounding register-bit preservation against
+independent widened-integer/Boolean result and flag rules. The existing
+`direct_arithmetic_memory_native.rs` now tests word inputs as well as dword and
+qword inputs, preserving its guarded-read and alias checks. Reproduce both with
+the release rlib/dependency flags above.
+
+Validation passes: 1142784 native word-arithmetic cases and 294912 mixed-width
+memory-input cases, plus 687 library tests, three integration tests, strict
+Clippy and release build. The standalone verifiers compile with warnings denied.
+Logs are `/tmp/macps5-wordarith-{tests,clippy,build}.log`. This expands CPU
+coverage; the homebrew library boundary and lack of PS5 gameplay remain.

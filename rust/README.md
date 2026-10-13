@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct 16-bit ADD/SUB/CMP/AND/OR/XOR/TEST now supports register destinations
+with register, immediate and guarded-memory inputs. 1142784 native word cases
+and 294912 mixed-width memory-input cases pass. Upper register bits and failed-
+read state are preserved. See
+[word arithmetic evidence](../docs/status/TRANSLATOR_READINESS.md#direct-word-arithmetic-and-comparisons).
+
 Direct RCL/RCR now supports registers and guarded memory at all four widths,
 with immediate, implicit-one and CL counts. 6894720 native cases and 262144
 exhaustive byte-model checks pass, plus shared memory-arithmetic regressions.
