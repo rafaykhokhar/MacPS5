@@ -1,5 +1,44 @@
 # Stdout integration gaps
 
+## Owned byte-output checkpoint
+
+The Rust executor now owns a writable stdout FILE at `0x7fff00001400` and
+writable pointer cell at `0x7fff00001600`, plus a separate state model. This is
+an explicit unbuffered fd1 capture profile, not a claim to reproduce default
+terminal-dependent buffering. Redirected streams, buffered/callback state,
+wide orientation and general FILE locking remain unsupported.
+
+`Fputc`, `Putchar` and `Swbuf` services produce unsigned-byte return values and
+share capture ordering with Puts. Swbuf accepts the legitimate inline `_w=-1`
+entry state. Byte output updates orientation and the one-byte buffer; bulk Puts
+preserves buffer content. Flush validates the quiescent unbuffered state, and
+abort includes stdout cleanup validation when capture is configured.
+
+An exclusive validated `Memory::borrow_write` lends the actual guest FILE bytes
+to an owner/revision-checked commit permit. Captured output either fails without
+changing bytes or succeeds before an infallible metadata/model commit. Ordinary
+write protection and runtime-owner barriers apply. Capture-capacity/allocation
+failures remain diagnostics; backend errno is not invented from policy limits.
+
+Matching-release native checks pass direct byte calls, the pinned banner's
+actual inline decrement/Swbuf byte sequence, Puts ordering, metadata, flush,
+writable-pointer persistence and explicit redirected-stream rejection, corrupt
+metadata guards and capture-capacity atomicity
+(`work/stdout-byte-native/native.log`, session48634 exit0). Existing native Puts
+and abort regressions pass (`work/stdout-byte-native/regressions.log`, 55154
+exit0). The build passes 527 library tests, three integration tests, strict
+Clippy and release compilation (`work/stdout-byte-build-fixed.log`, 20946 exit0).
+An initial Clippy failure used an API newer than the declared MSRV; it was
+replaced before this passing build. The compiler used is still Rust1.99, not
+an actual Rust1.85 build.
+
+The full entry runner includes the byte verifier. The native startup export
+table has not yet enabled these new stdout imports; formatted output remains
+unfinished and the last verified startup boundary is missing `printf`. No
+gameplay or new Metal presentation result is established by this checkpoint.
+
+## Remaining formatted-stream integration
+
 Startup currently encounters the missing `printf` import. Existing captured
 stdout and stderr-only formatting do not yet provide the complete stdout FILE
 ABI needed by the pinned executable.

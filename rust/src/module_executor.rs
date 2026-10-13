@@ -349,6 +349,40 @@ fn multibyte_service(
     }
     Ok(plan.value)
 }
+fn stdout_snapshot(memory: &Memory<'_>) -> Result<([u8; crate::stdout_file::FILE_SIZE], [u8; 8])> {
+    Ok((memory.read(crate::stdout_file::FILE_ADDR, crate::stdout_file::FILE_SIZE)?.try_into().unwrap(),
+        memory.read(crate::stdout_file::STDOUT_PTR_ADDR, 8)?.try_into().unwrap()))
+}
+fn stdout_flush(model: &crate::stdout_file::StdoutFile, memory: &Memory<'_>) -> Result<()> {
+    let (file, pointer) = stdout_snapshot(memory)?;
+    model.validate_flush(&file, &pointer).map_err(|e| format!("Stdout flush: {e:?}"))
+}
+#[allow(clippy::too_many_arguments)]
+fn stdout_commit(
+    model: &mut crate::stdout_file::StdoutFile,
+    capture: &mut crate::captured_stdout::CapturedStdout,
+    memory: &mut Memory<'_>,
+    pointer: &[u8; 8],
+    plan: crate::stdout_file::Plan,
+    bytes: &[u8],
+    sp: u64,
+    ret: u64,
+) -> Result<u64> {
+    if memory.load(sp, 8)? != ret { return Err("Stdout return frame changed".into()); }
+    if plan.errno().is_some() { return Err("Unexpected backend failure in capture-only stdout".into()); }
+    for (address, size) in plan.write_ranges() {
+        validate_net_output(memory, address, size, sp, ret)?;
+    }
+    let result = plan.result() as u32 as u64;
+    let storage = memory.borrow_write::<{ crate::stdout_file::FILE_SIZE }>(crate::stdout_file::FILE_ADDR)?;
+    let commit = model.prepare_commit(storage, pointer, plan)
+        .map_err(|e| format!("Stdout commit: {e:?}"))?;
+    // Capture append either fails without output, or completes. The exclusive
+    // storage borrow makes the following metadata/model commit infallible.
+    capture.write_bytes(bytes)?;
+    commit.commit();
+    Ok(result)
+}
 fn callback_stack_slot(
     sp: u64,
     stack_address: u64,
@@ -951,6 +985,9 @@ pub enum Service {
     Mbrlen,
     Mbtowc,
     StrtokR,
+    Fputc,
+    Putchar,
+    Swbuf,
     Wcrtomb,
     Mbsrtowcs,
     Qsort,
@@ -1149,6 +1186,9 @@ impl Service {
             | Self::Mbrlen
             | Self::Mbtowc
             | Self::StrtokR
+            | Self::Fputc
+            | Self::Putchar
+            | Self::Swbuf
             | Self::Wcrtomb
             | Self::Mbsrtowcs
             | Self::Qsort
@@ -1746,6 +1786,9 @@ pub struct NativeExecutor {
     pub semaphores: crate::guest_semaphore::GuestSemaphore,
     sleep_clock: crate::guest_sleep::Clock,
     pub stdout: crate::captured_stdout::CapturedStdout,
+    stdout_file: crate::stdout_file::StdoutFile,
+    stdout_metadata: [u8; crate::stdout_file::FILE_SIZE],
+    stdout_pointer: [u8; 8],
     pub stdio: crate::guest_stdio::GuestStdio,
     file_streams: crate::stdio_file::Store,
     file_metadata: Vec<u8>,
@@ -2482,6 +2525,8 @@ impl NativeExecutor {
             bytes: &mut self.mb_cur_max,
             writable: true,
         });
+        mapped_data.push(DataRegion { address: crate::stdout_file::FILE_ADDR, bytes: &mut self.stdout_metadata, writable: true });
+        mapped_data.push(DataRegion { address: crate::stdout_file::STDOUT_PTR_ADDR, bytes: &mut self.stdout_pointer, writable: true });
         if self.services.values().any(|service| {
             matches!(
                 service,
@@ -2846,7 +2891,13 @@ impl NativeExecutor {
         }
         let mut tls = crate::guest_tls::GuestTls::default();
         tls.register_thread(MAIN_GUEST_THREAD)?;
+        let stdout_file = crate::stdout_file::StdoutFile::new(
+            crate::stdout_file::FILE_ADDR, crate::stdout_file::STDOUT_PTR_ADDR,
+        ).map_err(|e| format!("Stdout initialization: {e:?}"))?;
         Ok(Self {
+            stdout_metadata: stdout_file.file_bytes(),
+            stdout_pointer: stdout_file.pointer_bytes(),
+            stdout_file,
             callback_ranges: crate::guest_callback::Registry::default(),
             callback_faults: Rc::new(RefCell::new(Vec::new())),
             abort_faults: Rc::new(RefCell::new(Vec::new())),
@@ -3571,6 +3622,8 @@ impl NativeExecutor {
             memory.add_service_data(LOCALE_NAME, &mut self.locale_name)?;
         }
         memory.add(crate::guest_locale::MB_CUR_MAX_ADDR, &mut self.mb_cur_max, true, false)?;
+        memory.add(crate::stdout_file::FILE_ADDR, &mut self.stdout_metadata, true, false)?;
+        memory.add(crate::stdout_file::STDOUT_PTR_ADDR, &mut self.stdout_pointer, true, false)?;
         if self.services.values().any(|service| {
             matches!(
                 service,
@@ -3909,6 +3962,7 @@ impl NativeExecutor {
                         // Cleanup is a metadata-checked flush of supported unbuffered
                         // FILEs. No host exit, atexit, fclose or fake resource teardown.
                         self.stdio.validate_cleanup(&memory)?;
+                        if self.stdout.configured() { stdout_flush(&self.stdout_file, &memory)?; }
                         self.file_streams.validate_cleanup(&memory)?;
                         self.tls.signal_mask(guest_thread)?;
                         let mut abort = crate::guest_abort::Abort::new(guest_thread)?;
@@ -4973,6 +5027,19 @@ impl NativeExecutor {
                             )? as u32 as u64,
                             _ => unreachable!(),
                         }
+                    } else if matches!(service, Service::Fputc | Service::Putchar | Service::Swbuf) {
+                        let stream = if matches!(service, Service::Putchar) {
+                            memory.load(crate::stdout_file::STDOUT_PTR_ADDR, 8)?
+                        } else { cpu.registers[6] };
+                        if stream != crate::stdout_file::FILE_ADDR {
+                            return Err("Byte output currently requires the owned stdout FILE".into());
+                        }
+                        let (file, pointer) = stdout_snapshot(&memory)?;
+                        let entry = if matches!(service, Service::Swbuf) { crate::stdout_file::Entry::Swbuf } else { crate::stdout_file::Entry::Fputc };
+                        let plan = self.stdout_file.prepare_byte(&file, &pointer, entry, cpu.registers[7] as i32, crate::stdout_file::Delivery::Success)
+                            .map_err(|e| format!("Stdout byte preparation: {e:?}"))?;
+                        let byte = plan.emitted_byte().ok_or("Missing stdout byte")?;
+                        stdout_commit(&mut self.stdout_file, &mut self.stdout, &mut memory, &pointer, plan, &[byte], sp, ret)?
                     } else if matches!(service, Service::Fprintf | Service::Fflush) {
                         // Validate the live return frame before a sink commit;
                         // return-PC translation was already checked above.
@@ -4981,12 +5048,15 @@ impl NativeExecutor {
                         }
                         if matches!(service, Service::Fflush) {
                             let stream = cpu.registers[7];
+                            if stream == crate::stdout_file::FILE_ADDR || (stream == 0 && self.stdout.configured()) {
+                                stdout_flush(&self.stdout_file, &memory)?;
+                            }
                             if stream == crate::guest_stdio::FILE_ADDR
                                 || (stream == 0 && self.stdio.configured())
                             {
                                 self.stdio.fflush(&memory, stream)?;
                             }
-                            if stream != crate::guest_stdio::FILE_ADDR {
+                            if stream != crate::guest_stdio::FILE_ADDR && stream != crate::stdout_file::FILE_ADDR {
                                 if let Some(kernel) = &self.kernel {
                                     self.file_streams.flush(
                                         &kernel.descriptors,
@@ -5037,7 +5107,11 @@ impl NativeExecutor {
                         if memory.load(sp, 8)? != ret {
                             return Err("Puts return frame changed before output".into());
                         }
-                        self.stdout.puts(&memory, cpu.registers[7])? as u32 as u64
+                        let line = self.stdout.prepare_puts(&memory, cpu.registers[7])?;
+                        let (file, pointer) = stdout_snapshot(&memory)?;
+                        let plan = self.stdout_file.prepare_bulk(&file, &pointer, 10, crate::stdout_file::Delivery::Success)
+                            .map_err(|e| format!("Stdout puts preparation: {e:?}"))?;
+                        stdout_commit(&mut self.stdout_file, &mut self.stdout, &mut memory, &pointer, plan, &line, sp, ret)?
                     } else if matches!(service, Service::Setlocale) {
                         let (accepted, ctype_changed) = self.locale.setlocale_with_ctype_transition(
                             &memory,

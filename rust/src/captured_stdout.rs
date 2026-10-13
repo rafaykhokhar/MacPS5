@@ -25,12 +25,35 @@ impl CapturedStdout {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+    pub fn configured(&self) -> bool { self.capacity.is_some() }
     pub fn take_bytes(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.bytes)
     }
+    /// Append one prepared output batch. Policy/allocation failures leave the
+    /// captured bytes unchanged; they are runtime diagnostics, not FILE errno.
+    pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        let capacity = self.capacity.ok_or("Stdout capture is not configured")?;
+        let length = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .ok_or("Stdout capture size overflow")?;
+        if length > capacity {
+            return Err("Stdout capture capacity exhausted; no output committed".into());
+        }
+        self.bytes
+            .try_reserve(bytes.len())
+            .map_err(|_| "Cannot allocate stdout capture storage")?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
     pub fn puts(&mut self, memory: &Memory<'_>, source: u64) -> Result<i32> {
-        let capacity = self
-            .capacity
+        let line = self.prepare_puts(memory, source)?;
+        self.write_bytes(&line)?;
+        Ok(10)
+    }
+    pub fn prepare_puts(&self, memory: &Memory<'_>, source: u64) -> Result<Vec<u8>> {
+        self.capacity
             .ok_or("Unsupported puts: stdout capture is not configured")?;
         if source == 0 {
             return Err("Null puts source".into());
@@ -45,19 +68,7 @@ impl CapturedStdout {
                 .map_err(|_| "Cannot allocate bounded puts snapshot")?;
             if byte == 0 {
                 line.push(b'\n');
-                let length = self
-                    .bytes
-                    .len()
-                    .checked_add(line.len())
-                    .ok_or("Stdout capture size overflow")?;
-                if length > capacity {
-                    return Err("Stdout capture capacity exhausted; no output committed".into());
-                }
-                self.bytes
-                    .try_reserve(line.len())
-                    .map_err(|_| "Cannot allocate stdout capture storage")?;
-                self.bytes.extend_from_slice(&line);
-                return Ok(10);
+                return Ok(line);
             }
             line.push(byte);
         }
@@ -67,6 +78,22 @@ impl CapturedStdout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn byte_batches_and_puts_share_order_and_capacity() {
+        let mut output = CapturedStdout::default();
+        assert!(output.write_bytes(b"x").is_err());
+        output.configure_capture(5).unwrap();
+        output.write_bytes(&[0, 255]).unwrap();
+        let mut source = *b"ok\0";
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut source, false, false).unwrap();
+        output.puts(&memory, 0x1000).unwrap();
+        assert_eq!(output.bytes(), &[0, 255, b'o', b'k', b'\n']);
+        assert!(output.write_bytes(b"!").is_err());
+        assert_eq!(output.take_bytes(), &[0, 255, b'o', b'k', b'\n']);
+        output.write_bytes(b"next").unwrap();
+        assert_eq!(output.bytes(), b"next");
+    }
     #[test]
     fn explicit_capture_appends_bytes_and_newline_exactly_once() {
         let mut source = *b"abc\0\0\xff\n\0";

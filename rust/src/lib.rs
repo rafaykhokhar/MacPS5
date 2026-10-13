@@ -27,6 +27,7 @@ pub type Result<T> = std::result::Result<T, String>;
 pub mod audio_out;
 pub mod audio_queue;
 pub mod captured_stdout;
+pub mod stdout_file;
 pub mod direct_memory;
 pub mod environment;
 pub mod equeue;

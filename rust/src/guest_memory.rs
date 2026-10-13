@@ -571,6 +571,20 @@ impl<'a> Memory<'a> {
         r.bytes[p..p + bytes.len()].copy_from_slice(bytes);
         Ok(())
     }
+    /// Exclusive, validated fixed-size guest storage for an infallible commit.
+    /// The borrow prevents mapping/permission changes until the caller releases
+    /// it. All ordinary write barriers and runtime-owner checks still apply.
+    pub(crate) fn borrow_write<const N: usize>(&mut self, address: u64) -> Result<&mut [u8; N]> {
+        if N == 0 {
+            return Err("Empty guest write borrow".into());
+        }
+        self.validate_write(address, N)?;
+        let index = self.region(address, N)?;
+        let region = &mut self.regions[index];
+        let offset = (address - region.address) as usize;
+        (&mut region.bytes[offset..offset + N]).try_into()
+            .map_err(|_| "Guest write borrow size mismatch".into())
+    }
     /// Bounded libc memcpy. Validate both full ranges before committing output;
     /// overlapping ranges are explicitly unsupported (use memmove semantics separately).
     pub fn memcpy(&mut self, destination: u64, source: u64, count: u64) -> Result<u64> {

@@ -57,6 +57,7 @@ mod mbrlen_native;
 mod mbtowc_native;
 mod mb_cur_max_native;
 mod strtok_r_native;
+mod stdout_byte_native;
 mod packed_compare_shift_native;
 mod vpbroadcastd_native;
 mod strftime_native;
@@ -148,6 +149,7 @@ fn main() -> Result<(), String> {
         mbtowc_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("mbtowc"))?;
         mb_cur_max_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("mb-cur-max"))?;
         strtok_r_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtok-r"))?;
+        stdout_byte_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("stdout-byte"))?;
         packed_compare_shift_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-compare-shift"))?;
         vpbroadcastd_native::verify(Path::new(&archive), &Path::new(&directory).join("vpbroadcastd"))?;
         strftime_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strftime"))?;
