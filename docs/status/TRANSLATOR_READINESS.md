@@ -1925,3 +1925,34 @@ three integration tests, strict Clippy and release build. The standalone
 verifier compiles with warnings denied. Logs are
 `/tmp/macps5-accumext-{tests,clippy,build}.log`. These checks establish scoped
 CPU behavior; full translator readiness and PS5 gameplay remain incomplete.
+
+## Paired accumulator extension backend check
+
+A source review initially suspected the older AOT CWDE path sign-extended into
+all of RAX. Native verification disproved that suspicion: the source and emitted
+assembly use `ldrsh w20`, followed by a 64-bit context store, so upper bits are
+correctly zeroed. No runtime fix was necessary.
+
+`rust/verification/aot_accumulator_extend_native.rs` now generates the actual AOT
+assembly for all six accumulator-extension forms, assembles it with the Apple
+ARM64 assembler, links it into a Rust driver, and executes it alongside the
+direct JIT on identical CPU states. Both backends are checked against explicit
+signed-width conversion rules. All 131406 paired cases pass, including every
+byte input for CBW, every word input for CWDE/CWD, nonzero upper bits and sign
+boundaries. Full GPR banks, flags and fault state are compared. Control-stop
+states differ because AOT ends at a region boundary while the direct fixture
+stops on its instruction budget, so this test makes no equivalence claim about
+those control states.
+
+Build the standalone verifier with the release rlib/dependency flags above,
+then run it with the absolute release rlib path and an output directory:
+
+```sh
+/tmp/macps5-aot-accumext "$PWD/rust/target/release/libnative_ps5.rlib" /tmp/macps5-aot-accumext-paired
+```
+
+The verifier and generated Rust driver compile with warnings denied. The final
+log is `/tmp/macps5-aot-accumext-paired.log`. The initial global-assembly attempt
+was replaced with the repository's existing `xcrun clang` object-file workflow
+to handle Mach-O local labels correctly. No runtime source changed, so this is
+additional backend validation, not expanded instruction support or gameplay.

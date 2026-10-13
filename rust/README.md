@@ -1,5 +1,10 @@
 # Rust migration
 
+An independent native comparison now checks accumulator extension in both the
+older AOT backend and the direct JIT. All 131406 paired cases pass. The suspected
+CWDE discrepancy was a source-reading mistake; runtime lowering needed no fix.
+See [paired backend evidence](../docs/status/TRANSLATOR_READINESS.md#paired-accumulator-extension-backend-check).
+
 Direct CBW/CWDE/CDQE and CWD/CDQ/CQO now provide accumulator sign extension
 with correct partial-register and zero-extension rules. 525736 native state
 and division-composition checks pass, along with library/integration tests and
