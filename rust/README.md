@@ -1,5 +1,21 @@
 # Rust migration
 
+The compiled `verification/entry_native.rs` runner accepts an optional
+`--startup-only` argument after the ELF path. This keeps the real dependency
+bootstrap and its ownership assertions, while explicitly skipping component
+regressions and Metal presentation. Its output labels those checks as skipped;
+a passing startup-only result cannot establish GPU or component verification.
+Omitting the argument retains the full suite and its presentation-failure gate.
+
+The matching release now passes 24,614 native `LZCNT32` cases and 32 actual
+`wcscoll_l`/direct C/POSIX cases, plus 502 library tests, three integration tests
+and strict Clippy. Startup discovery resolves `wcscoll` and reaches missing
+`wcsxfrm`, with 19,488 dependency bytes (`wcscoll-startup.log`, 81115); the
+updated boundary assertion rerun is pending. The prior `strxfrm` startup-only
+check passed its ownership assertions (76410). Startup-only checks explicitly
+exclude component regressions and Metal; the last full presentation check still
+failed. No game main has executed.
+
 ## Current parallel integration
 
 `strtold` now returns raw extended80 through the owned x87 stack. The actual pinned wrapper passes 96 recorded cases in four rounding modes and twelve consecutive call/store pairs, using translated `FSTP m80` (`work/strtold-native/native.log`). Source conversion passes 5,872 decimal and 8,136 complete adapter comparisons. The matching release passes 497 library tests, three integration tests and strict Clippy. Integrated startup binds `strtold` and reaches missing `strxfrm`, retaining 19,424 dependency bytes (`strtold-entry-integrated.log`, 39802). Startup assertions pass; the overall run still fails three dropped Metal presentations. No game main has executed. See [extended conversion status](../docs/status/STRTOLD.md).

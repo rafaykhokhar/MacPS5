@@ -954,6 +954,7 @@ pub enum Service {
     Bsearch,
     Wcsstr,
     Wcscmp,
+    Wcscoll,
     Wcsncmp,
     Strlcpy,
     Strlcat,
@@ -1147,6 +1148,7 @@ impl Service {
             | Self::Bsearch
             | Self::Wcsstr
             | Self::Wcscmp
+            | Self::Wcscoll
             | Self::Wcsncmp
             | Self::Strlcpy
             | Self::Strlcat
@@ -5776,7 +5778,9 @@ impl NativeExecutor {
                         crate::wide_string::wcslen(&memory, cpu.registers[7])?
                     } else if matches!(service, Service::Wcsstr) {
                         crate::wide_string::wcsstr(&memory, cpu.registers[7], cpu.registers[6])?
-                    } else if matches!(service, Service::Wcscmp) {
+                    } else if matches!(service, Service::Wcscmp | Service::Wcscoll) {
+                        // C/POSIX wcscoll delegates to wcscmp. Use the guest's
+                        // unsigned16 wchar profile, not host FreeBSD wchar32.
                         crate::wide_string::wcscmp(&memory, cpu.registers[7], cpu.registers[6])?
                             as u32 as u64
                     } else if matches!(service, Service::Wcsncmp) {

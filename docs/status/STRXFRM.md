@@ -21,5 +21,8 @@ the pinned `strxfrm_l` wrapper at `0x116210`, GOT `0x26faf0`. Its matching-relea
 run passes 140 cases for direct and actual-wrapper calls in C/POSIX locales,
 including truncation, high bytes, zero capacity, full returned lengths and
 guarded outputs (`work/strxfrm-native/native.log`, 23957 exit0).
-The service and verifier are registered for the next startup probe; that probe
-has not yet established the next unresolved import.
+Startup now binds the import and reaches missing `wcscoll`, retaining 19,440
+dependency bytes before normal failure exit. The startup-only assertions pass
+(`work/arm64-prototype/strxfrm-startup.log`, 76410 exit0). Component and Metal
+checks were explicitly skipped in that probe; it does not resolve the separate
+presentation failure or prove game main execution.

@@ -49,6 +49,9 @@ mod movdqu_native;
 mod vasprintf_native;
 mod vasprintf_hex_native;
 mod strcoll_native;
+mod strxfrm_native;
+mod wcscoll_native;
+mod lzcnt_native;
 mod strftime_native;
 mod strtof_native;
 mod strtold_native;
@@ -88,6 +91,11 @@ mod vmovsd_native;
 mod vmulsd_native;
 mod worker_native;
 fn main() -> Result<(), String> {
+    let startup_only = match std::env::args_os().nth(2).as_deref() {
+        None => false,
+        Some(value) if value == "--startup-only" => true,
+        Some(_) => return Err("Expected optional --startup-only".into()),
+    };
     let file = std::fs::read(
         std::env::args_os()
             .nth(1)
@@ -98,92 +106,101 @@ fn main() -> Result<(), String> {
         std::env::var_os("NATIVE_PS5_RUNTIME_ARCHIVE").ok_or("Missing runtime archive")?;
     let directory =
         std::env::var_os("NATIVE_PS5_AOT_DIRECTORY").ok_or("Missing compiler output directory")?;
-    stat_native::verify(Path::new(&archive), Path::new(&directory))?;
-    stdio_native::verify(Path::new(&archive), Path::new(&directory))?;
-    file_syscalls_native::verify(Path::new(&archive), Path::new(&directory))?;
-    fstat_native::verify(Path::new(&archive), Path::new(&directory))?;
-    stat_service_native::verify(Path::new(&archive), Path::new(&directory))?;
-    atomic_xadd_native::verify(Path::new(&archive), Path::new(&directory))?;
-    adc_native::verify(Path::new(&archive), Path::new(&directory))?;
-    sysconf_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
-    sysctl_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
-    sigaction_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
-    wcstombs_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
-    sort_search_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("sort-search"))?;
-    fgets_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("fgets"))?;
-    getcwd_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("getcwd"))?;
-    strdup_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strdup"))?;
-    mkdir_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("mkdir"))?;
-    cond_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("condition"))?;
-    multibyte_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("multibyte"))?;
-    abort_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("abort"))?;
-    movdqu_native::verify(Path::new(&archive), &Path::new(&directory).join("movdqu"))?;
-    vasprintf_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("vasprintf"))?;
-    vasprintf_hex_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("vasprintf-hex"))?;
-    strcoll_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strcoll"))?;
-    strftime_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strftime"))?;
-    strtof_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtof"))?;
-    strtold_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtold"))?;
-    vmovd_native::verify(Path::new(&archive), &Path::new(&directory).join("vmovd"))?;
-    cvtsi2sd_native::verify(Path::new(&archive), &Path::new(&directory).join("cvtsi2sd"))?;
-    vpxor_native::verify(Path::new(&archive), &Path::new(&directory).join("vpxor"))?;
-    semaphore_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
-    stdio_file_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
-    system_service_native::verify(Path::new(&archive), Path::new(&directory))?;
-    tls_native::verify(Path::new(&archive), Path::new(&directory))?;
-    threadattr_native::verify(Path::new(&archive), Path::new(&directory))?;
-    vmovsd_native::verify(Path::new(&archive), Path::new(&directory))?;
-    worker_native::verify(Path::new(&archive), Path::new(&directory))?;
-    quantum_native::verify(Path::new(&archive), Path::new(&directory))?;
-    truncate_native::verify(Path::new(&archive), Path::new(&directory))?;
-    scheduler_native::verify(Path::new(&archive), Path::new(&directory))?;
-    vmulsd_native::verify(Path::new(&archive), Path::new(&directory))?;
-    fma213_native::verify(Path::new(&archive), Path::new(&directory))?;
-    thread_services_native::verify(Path::new(&archive), Path::new(&directory))?;
-    thread_module_native::verify(Path::new(&archive), Path::new(&directory))?;
-    thread_name_native::verify(Path::new(&archive), Path::new(&directory))?;
-    thread_pins_native::verify(Path::new(&archive), Path::new(&directory))?;
-    signal_set_native::verify(Path::new(&archive), Path::new(&directory))?;
-    signal_mask_native::verify(Path::new(&archive), Path::new(&directory))?;
-    cancel_type_native::verify(Path::new(&archive), Path::new(&directory))?;
-    scheduling_native::verify(Path::new(&archive), Path::new(&directory))?;
-    sdl_scheduling_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
-    environment_native::verify(Path::new(&archive), Path::new(&directory))?;
-    memory_compare_native::verify(Path::new(&archive), Path::new(&directory))?;
-    wide_strings_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
-    narrow_strings_native::verify(Path::new(&archive), Path::new(&directory))?;
-    integer_parse_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
-    x87_control_native::verify(Path::new(&archive), Path::new(&directory))?;
-    x87_store_native::verify(Path::new(&archive), Path::new(&directory))?;
-    c_locale_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
-    float_parse_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
-    scan_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
-    imul_implicit_native::verify(Path::new(&archive), Path::new(&directory))?;
-    guest_time_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
-    sleep_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
-    tiler_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
-    // The presenter closes before returning. Preserve its failure while checking
-    // independent startup behavior; do not turn a presentation failure into PASS.
-    let presentation_result =
-        tiler_gpu_native::verify(&file, Path::new(&archive), Path::new(&directory));
-    if let Err(error) = &presentation_result {
-        eprintln!("PRESENTATION FAILED (retained until final result): {error}");
-    }
-    user_service_native::verify(Path::new(&archive), Path::new(&directory))?;
-    pad_native::verify(Path::new(&archive), Path::new(&directory))?;
-    puts_native::verify(Path::new(&archive), Path::new(&directory))?;
-    realloc_native::verify(Path::new(&archive), Path::new(&directory))?;
-    mutex_native::verify(Path::new(&archive), Path::new(&directory))?;
-    audio_native::verify(Path::new(&archive), Path::new(&directory))?;
-    direct_memory_native::verify(Path::new(&archive), Path::new(&directory))?;
-    equeue_native::verify(Path::new(&archive), Path::new(&directory))?;
-    exit_native::verify(Path::new(&archive), Path::new(&directory))?;
-    keyboard_native::verify(Path::new(&archive), Path::new(&directory))?;
-    libc_memory_native::verify(Path::new(&archive), Path::new(&directory))?;
-    locale_native::verify(Path::new(&archive), Path::new(&directory))?;
-    ime_native::verify(Path::new(&archive), Path::new(&directory))?;
-    net_native::verify(Path::new(&archive), Path::new(&directory))?;
-    sprx_symbol_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+    let presentation_result = if startup_only {
+        println!("STARTUP-ONLY: component regressions and Metal presentation are SKIPPED; this run cannot establish their success");
+        None
+    } else {
+        stat_native::verify(Path::new(&archive), Path::new(&directory))?;
+        stdio_native::verify(Path::new(&archive), Path::new(&directory))?;
+        file_syscalls_native::verify(Path::new(&archive), Path::new(&directory))?;
+        fstat_native::verify(Path::new(&archive), Path::new(&directory))?;
+        stat_service_native::verify(Path::new(&archive), Path::new(&directory))?;
+        atomic_xadd_native::verify(Path::new(&archive), Path::new(&directory))?;
+        adc_native::verify(Path::new(&archive), Path::new(&directory))?;
+        sysconf_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+        sysctl_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+        sigaction_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+        wcstombs_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+        sort_search_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("sort-search"))?;
+        fgets_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("fgets"))?;
+        getcwd_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("getcwd"))?;
+        strdup_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strdup"))?;
+        mkdir_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("mkdir"))?;
+        cond_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("condition"))?;
+        multibyte_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("multibyte"))?;
+        abort_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("abort"))?;
+        movdqu_native::verify(Path::new(&archive), &Path::new(&directory).join("movdqu"))?;
+        vasprintf_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("vasprintf"))?;
+        vasprintf_hex_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("vasprintf-hex"))?;
+        strcoll_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strcoll"))?;
+        strxfrm_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strxfrm"))?;
+        wcscoll_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("wcscoll"))?;
+        lzcnt_native::verify(Path::new(&archive), &Path::new(&directory).join("lzcnt"))?;
+        strftime_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strftime"))?;
+        strtof_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtof"))?;
+        strtold_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtold"))?;
+        vmovd_native::verify(Path::new(&archive), &Path::new(&directory).join("vmovd"))?;
+        cvtsi2sd_native::verify(Path::new(&archive), &Path::new(&directory).join("cvtsi2sd"))?;
+        vpxor_native::verify(Path::new(&archive), &Path::new(&directory).join("vpxor"))?;
+        semaphore_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+        stdio_file_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+        system_service_native::verify(Path::new(&archive), Path::new(&directory))?;
+        tls_native::verify(Path::new(&archive), Path::new(&directory))?;
+        threadattr_native::verify(Path::new(&archive), Path::new(&directory))?;
+        vmovsd_native::verify(Path::new(&archive), Path::new(&directory))?;
+        worker_native::verify(Path::new(&archive), Path::new(&directory))?;
+        quantum_native::verify(Path::new(&archive), Path::new(&directory))?;
+        truncate_native::verify(Path::new(&archive), Path::new(&directory))?;
+        scheduler_native::verify(Path::new(&archive), Path::new(&directory))?;
+        vmulsd_native::verify(Path::new(&archive), Path::new(&directory))?;
+        fma213_native::verify(Path::new(&archive), Path::new(&directory))?;
+        thread_services_native::verify(Path::new(&archive), Path::new(&directory))?;
+        thread_module_native::verify(Path::new(&archive), Path::new(&directory))?;
+        thread_name_native::verify(Path::new(&archive), Path::new(&directory))?;
+        thread_pins_native::verify(Path::new(&archive), Path::new(&directory))?;
+        signal_set_native::verify(Path::new(&archive), Path::new(&directory))?;
+        signal_mask_native::verify(Path::new(&archive), Path::new(&directory))?;
+        cancel_type_native::verify(Path::new(&archive), Path::new(&directory))?;
+        scheduling_native::verify(Path::new(&archive), Path::new(&directory))?;
+        sdl_scheduling_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+        environment_native::verify(Path::new(&archive), Path::new(&directory))?;
+        memory_compare_native::verify(Path::new(&archive), Path::new(&directory))?;
+        wide_strings_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+        narrow_strings_native::verify(Path::new(&archive), Path::new(&directory))?;
+        integer_parse_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+        x87_control_native::verify(Path::new(&archive), Path::new(&directory))?;
+        x87_store_native::verify(Path::new(&archive), Path::new(&directory))?;
+        c_locale_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+        float_parse_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+        scan_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+        imul_implicit_native::verify(Path::new(&archive), Path::new(&directory))?;
+        guest_time_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+        sleep_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+        tiler_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+        // The presenter closes before returning. Preserve its failure while checking
+        // independent startup behavior; do not turn a presentation failure into PASS.
+        let presentation_result =
+            tiler_gpu_native::verify(&file, Path::new(&archive), Path::new(&directory));
+        if let Err(error) = &presentation_result {
+            eprintln!("PRESENTATION FAILED (retained until final result): {error}");
+        }
+        user_service_native::verify(Path::new(&archive), Path::new(&directory))?;
+        pad_native::verify(Path::new(&archive), Path::new(&directory))?;
+        puts_native::verify(Path::new(&archive), Path::new(&directory))?;
+        realloc_native::verify(Path::new(&archive), Path::new(&directory))?;
+        mutex_native::verify(Path::new(&archive), Path::new(&directory))?;
+        audio_native::verify(Path::new(&archive), Path::new(&directory))?;
+        direct_memory_native::verify(Path::new(&archive), Path::new(&directory))?;
+        equeue_native::verify(Path::new(&archive), Path::new(&directory))?;
+        exit_native::verify(Path::new(&archive), Path::new(&directory))?;
+        keyboard_native::verify(Path::new(&archive), Path::new(&directory))?;
+        libc_memory_native::verify(Path::new(&archive), Path::new(&directory))?;
+        locale_native::verify(Path::new(&archive), Path::new(&directory))?;
+        ime_native::verify(Path::new(&archive), Path::new(&directory))?;
+        net_native::verify(Path::new(&archive), Path::new(&directory))?;
+        sprx_symbol_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
+        Some(presentation_result)
+    };
     let bias = 0x10000000;
     let mut image = Image::load(&file, bias, 64 * 1024 * 1024)?;
     image.relocate(|_| None)?;
@@ -517,6 +534,8 @@ fn main() -> Result<(), String> {
         ("abort", Service::Abort),
         ("vasprintf", Service::Vasprintf),
         ("strcoll", Service::Strcoll),
+        ("strxfrm", Service::Strxfrm),
+        ("wcscoll", Service::Wcscoll),
         ("strftime", Service::Strftime),
         ("strtof", Service::Strtof),
         ("strtold", Service::Strtold),
@@ -1484,13 +1503,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 140 libc exports: (140+1)*24=3384 symbol bytes (rounded3392)
-                // and 1+140*12=1681 NID bytes (rounded1696).
-                // Strtold adds48bytes to19376.
-                || native.bytes_allocated() != 19424
+                // 142 libc exports: (142+1)*24=3432 symbol bytes (rounded3440)
+                // and 1+142*12=1705 NID bytes (rounded1712).
+                // Wcscoll adds48bytes to19440.
+                || native.bytes_allocated() != 19488
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'strxfrm'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'wcsxfrm'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1500,7 +1519,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; strtold import bound; unresolved strxfrm causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; wcscoll import bound; unresolved wcsxfrm causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1562,10 +1581,12 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved strtold triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved wcsxfrm triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
-    presentation_result?;
+    if let Some(result) = presentation_result {
+        result?;
+    }
     Ok(())
 }
 

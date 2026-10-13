@@ -1,5 +1,21 @@
 # CPU completion criteria
 
+## Observed LZCNT32 boundary
+
+The pinned `f3 0f bd f2` instruction at `0x1b58c3` now lowers to ARM64 leading
+zero count for the exact `LZCNT r32,r/m32` form. It clears the destination's upper
+32 bits, sets CF for zero input and ZF for zero result. Other arithmetic flags
+are architecturally undefined and are preserved as a deterministic policy.
+The [AMD APM Volume3, pp.227–228](https://kib.kiev.ua/x86docs/AMD/AMD64/24594_APM_v3-r3.31.pdf)
+defines these semantics. Memory faults occur before destination/flag changes.
+
+The matching release passes 24,614 native cases covering bit positions, random
+inputs, flag set/clear, aliases/high registers, unaligned and RIP-relative reads,
+short/wrapping addresses, FP-state preservation and fuel stops
+(`work/lzcnt-native/release.log`, 75425 exit0). A focused form acceptance/rejection
+test and strict Clippy pass. This does not implement LZCNT16/64, BSR, complete
+ABM support or target feature discovery.
+
 ## x87 context integration
 
 ### Extended store consumption

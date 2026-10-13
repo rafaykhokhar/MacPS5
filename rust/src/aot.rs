@@ -37,6 +37,30 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn lzcnt32_observed_encoding_and_guarded_variants() {
+        for bytes in [
+            &[0xf3, 0x0f, 0xbd, 0xf2][..],
+            &[0xf3, 0x0f, 0xbd, 0xc0],
+            &[0xf3, 0x45, 0x0f, 0xbd, 0xf7],
+            &[0xf3, 0x0f, 0xbd, 0x36],
+        ] {
+            assert!(super::translate_rust_memory_region(bytes, 0x1b58c3, "lzcnt").is_ok());
+        }
+        for bytes in [
+            &[0xf3, 0x66, 0x0f, 0xbd, 0xc0][..],
+            &[0xf3, 0x48, 0x0f, 0xbd, 0xc0],
+            &[0x0f, 0xbd, 0xc0],
+            &[0xf0, 0xf3, 0x0f, 0xbd, 0x00],
+            &[0x67, 0xf3, 0x0f, 0xbd, 0x00],
+            &[0x64, 0xf3, 0x0f, 0xbd, 0x00],
+        ] {
+            assert!(
+                super::translate_rust_memory_region(bytes, 0, "unsupported_lzcnt").is_err(),
+                "{bytes:x?}"
+            );
+        }
+    }
+    #[test]
     fn memory_contexts_cannot_fall_back_to_legacy_helpers() {
         let assembly =
             super::translate_rust_memory(&[0x50, 0x58, 0xc3], 0x100, "rust_stack").unwrap();
@@ -243,7 +267,11 @@ impl Emitter {
             && i.op1_kind() == OpKind::Register
             && bits(i, 0) == 32
             && i.op1_register().size() == 4;
-        if (i.has_lock_prefix() && !locked_xadd32) || i.has_rep_prefix() || i.has_repne_prefix() {
+        let lzcnt32 = i.code() == iced_x86::Code::Lzcnt_r32_rm32;
+        if (i.has_lock_prefix() && !locked_xadd32)
+            || (i.has_rep_prefix() && !lzcnt32)
+            || i.has_repne_prefix()
+        {
             return Err("LOCK/REP prefixes are not implemented".into());
         }
         if locked_xadd32 {
@@ -337,6 +365,18 @@ impl Emitter {
             return Ok(());
         }
         match m {
+            M::Lzcnt => {
+                if !lzcnt32 {
+                    return Err("Only LZCNT r32,r/m32 is implemented".into());
+                }
+                // AMD APM Vol3 LZCNT: CF=input zero; ZF=count zero. Other
+                // arithmetic flags are undefined; preserve them deterministically.
+                // Read/fault before either architectural destination is changed.
+                self.read(i, 1, 32, 20)?;
+                self.emit("clz w21, w20\ncmp w20, #0\ncset x10, eq\ncmp w21, #0\ncset x11, eq\nlsl x11, x11, #6\nldr x9, [x19, #136]\nmov x12, #65\nbic x9, x9, x12\norr x9, x9, x10\norr x9, x9, x11");
+                self.write(i, 0, 32, 21)?;
+                self.emit("str x9, [x19, #136]");
+            }
             M::Fstp => {
                 if i.code() != iced_x86::Code::Fstp_m80fp {
                     return Err("Only FSTP m80fp is implemented".into());
