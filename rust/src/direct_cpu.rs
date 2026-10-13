@@ -5,6 +5,24 @@ use crate::{
     decode,
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
+fn vector_xor(i: &Instruction) -> Option<u64> {
+    match i.code() {
+        Code::VEX_Vxorps_xmm_xmm_xmmm128 | Code::VEX_Vxorpd_xmm_xmm_xmmm128 => Some(16),
+        Code::VEX_Vxorps_ymm_ymm_ymmm256 | Code::VEX_Vxorpd_ymm_ymm_ymmm256 => Some(32),
+        _ => None,
+    }
+}
+fn vector_register(r: Register, size: u64) -> Result<usize> {
+    let base = if size == 16 {
+        Register::XMM0
+    } else {
+        Register::YMM0
+    };
+    (r as usize)
+        .checked_sub(base as usize)
+        .filter(|n| *n < 16)
+        .ok_or_else(|| "Invalid direct vector register".into())
+}
 fn byte_arithmetic(i: &Instruction) -> bool {
     matches!(
         i.mnemonic(),
@@ -176,6 +194,7 @@ pub(crate) fn translate_span(
             _ if arithmetic_supported(&i) => {}
             _ if byte_arithmetic(&i) => {}
             _ if immediate_shift(&i) => {}
+            _ if vector_xor(&i).is_some() => {}
             _ => return Err(format!("Direct lowering unsupported: {:?}", i.code())),
         }
         offset += i.len();
@@ -279,6 +298,46 @@ pub(crate) fn translate_span(
         )?;
         c.emit(0xd1000529)?; // sub x9,x9,#1
         c.context_access(9, 19, 160, true, true)?;
+        if let Some(size) = vector_xor(i) {
+            let dst = vector_register(i.op0_register(), size)?;
+            let first = vector_register(i.op1_register(), size)?;
+            if i.op2_kind() == OpKind::Memory {
+                memory_address(&mut c, i)?;
+                c.emit(0xaa1303e0)?; // mov x0,x19
+                c.load_u64(2, dst as u64)?;
+                c.load_u64(3, first as u64)?;
+                c.load_u64(4, size)?;
+                c.load_u64(5, 3)?; // XOR, full guarded operand before commit
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_vector_logical_v1 as *const ()
+                        as u64,
+                )?;
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+            } else {
+                let second = vector_register(i.op2_register(), size)?;
+                // Each 64-bit piece is independent, including when dst aliases a source.
+                for offset in (0..size as usize).step_by(8) {
+                    c.context_access(9, 19, 208 + first * 32 + offset, true, false)?;
+                    c.context_access(10, 19, 208 + second * 32 + offset, true, false)?;
+                    c.emit(0xca0a0129)?; // eor x9,x9,x10
+                    c.context_access(9, 19, 208 + dst * 32 + offset, true, true)?;
+                }
+                if size == 16 {
+                    c.load_u64(9, 0)?;
+                    c.context_access(9, 19, 224 + dst * 32, true, true)?;
+                    c.context_access(9, 19, 232 + dst * 32, true, true)?;
+                }
+            }
+            continue;
+        }
         if byte_arithmetic(i) {
             let destination = byte_offset(i.op0_register())?;
             c.emit(0x39400261 | (destination << 10))?; // ldrb w1,[x19,#offset]

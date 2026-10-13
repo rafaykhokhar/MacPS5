@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct VEX VXORPS/VXORPD now handles 128/256-bit register and guarded memory
+operands, including aliases and upper-lane clearing. 98308 native state checks
+pass. Configured startup's block at 0x2d2f now translates past XOR and rejects
+VMOVUPS; the full block has not executed. See
+[vector XOR evidence](../docs/status/TRANSLATOR_READINESS.md#direct-vex-vector-xor).
+
 Direct byte-register ADD/SUB/CMP/AND/OR/XOR/TEST now preserves surrounding
 register bits and computes byte-width flags. 143430 native cases pass;
 configured startup advances to AVX VXORPS at 0x2d2f. See

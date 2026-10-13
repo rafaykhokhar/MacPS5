@@ -1054,3 +1054,42 @@ The final process exits 1; `/tmp/macps5-byte-arith-startup.log` records the firs
 real dlsym lookup and this later boundary. The next gap is vector logical lowering,
 not complete bootstrap or gameplay. Reproduce the standalone verifier with the
 release rlib/dependency flags above, and the real-file run with `--direct-startup`.
+
+## Direct VEX vector XOR
+
+The direct backend accepts exactly the VEX128/256 VXORPS and VXORPD forms.
+Register operands lower to independent ARM64 64-bit EOR pieces; each piece reads
+both inputs before writing its destination, preserving all source/destination
+aliases. VEX128 clears the destination's modeled upper 128 bits. Memory operands
+use the existing Rust guarded vector-logical helper, which validates and reads
+the entire operand before committing any destination byte. Flags and MXCSR are
+unchanged. Legacy SSE and EVEX XOR forms remain outside this direct support.
+
+`rust/verification/direct_vector_xor_native.rs` passes 98308 native state checks:
+all 16x16x16 register combinations for both instructions and widths, every GPR
+memory base, displacement/SIB decoding, unaligned reads, exact end boundaries,
+short reads and address wraparound, aliasing, upper clearing, prior faults and
+fuel exhaustion. Expected XOR values use per-bit Boolean comparisons. Memory is
+read-only and verified unchanged. FS/GS and 32-bit memory addressing are rejected.
+The strict-warning standalone verifier, 687 library tests, three integration
+tests, strict Clippy and release build pass. An initial compile caught an offset
+type mismatch; using usize for vector context offsets fixed it before these runs.
+
+Configured `--direct-startup` still reaches the first real dlsym lookup and then
+exits 1 at the explicit translation boundary in the block at image-relative
+0x2d2f: `Direct lowering unsupported: VEX_Vmovups_xmmm128_xmm`.
+VXORPS is accepted during translation, but this whole block has not executed.
+Bootstrap, GPU gameplay and PS5 game compatibility remain unproven.
+Logs: `/tmp/macps5-vector-xor-{tests,clippy,build,startup}.log`.
+
+Reproduce the independent native check after building the release library:
+
+```sh
+rustc --edition=2024 -O -Dwarnings rust/verification/direct_vector_xor_native.rs \
+  --extern native_ps5=rust/target/release/libnative_ps5.rlib \
+  -L dependency=rust/target/release/deps -o /tmp/macps5-direct-vector-xor
+/tmp/macps5-direct-vector-xor
+```
+
+The configured startup command is unchanged; the next direct CPU gap is vector
+move lowering with guarded reads/writes and VEX register semantics.
