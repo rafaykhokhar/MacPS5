@@ -4,6 +4,7 @@ use crate::{Result, descriptors::Descriptors, guest_memory::Memory};
 #[path = "guest_files.rs"]
 mod guest_files;
 pub(crate) use guest_files::{FileBacking, Quota};
+pub use guest_files::{DirectoryEntry, DirectoryToken};
 pub use guest_files::{Files, MkdirPlan, RenamePlan, NamespaceProfile, STAT_SIZE, StatRequest, StatTrace};
 
 struct Region {
@@ -332,6 +333,12 @@ impl Kernel {
             3 | 4 | 5 | 6 | 73 | 105 | 188 | 189 | 326 | 477 | 478 | 480 | 601 | 602 | 616 | 649
         ) {
             return Err(format!("Unsupported Rust kernel syscall {number}"));
+        }
+        if matches!(number, 3 | 4 | 189 | 478 | 480)
+            && self.descriptors.kind(args[0] as u32 as u64)
+                == Some(crate::descriptors::DescriptorKind::Directory)
+        {
+            return Err(format!("Directory descriptor syscall {number} is not implemented"));
         }
         let open_options = if number == 5 {
             let flags = args[1] as u32;
@@ -1296,6 +1303,22 @@ mod tests {
 mod directory_bridge_tests {
     use super::*;
     use crate::descriptors::OpenOptions;
+    #[test]
+    fn internal_directory_syscalls_stop_before_guest_side_effects() {
+        let mut kernel = Kernel::new(0, 0x1000).unwrap();
+        let token = kernel.descriptors.open_directory(&kernel.files, b"/", None).unwrap().unwrap();
+        let mut errno = 77u32.to_le_bytes();
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut errno, true, false).unwrap();
+        for number in [3, 4, 189, 478, 480] {
+            let error = kernel.syscall(&mut memory, number, [token.descriptor().into(), 0, 0, 0, 0, 0]).unwrap_err();
+            assert!(error.contains("Directory descriptor syscall"));
+            assert_eq!(memory.load(0x1000, 4).unwrap(), 77);
+            assert!(kernel.descriptors.directory_backing(&token).is_ok());
+        }
+        assert_eq!(kernel.syscall(&mut memory, 6, [token.descriptor().into(), 0, 0, 0, 0, 0]).unwrap(), (0, false));
+        assert!(kernel.descriptors.directory_backing(&token).is_err());
+    }
     #[test]
     fn rename_moves_cwd_atomically_and_keeps_relative_file_access() {
         let mut kernel = Kernel::new(0, 0x1000).unwrap();

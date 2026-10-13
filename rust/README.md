@@ -1,5 +1,10 @@
 # Rust migration
 
+Directory identities and internal descriptor ownership now survive rename and
+reject stale/reused handles. The integrated build passes 579 library tests,
+three integration tests and strict Clippy. Guest directory streams still need
+buffer/cursor/lifecycle integration; `opendir` remains unresolved.
+
 Directory-stream groundwork now enumerates the owned namespace and encodes
 guest directory entries, with 572 library tests, three integration tests and
 strict Clippy passing. `opendir` still needs descriptor and stream integration;

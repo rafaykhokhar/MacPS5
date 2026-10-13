@@ -23,6 +23,18 @@ impl FileToken {
         self.descriptor
     }
 }
+/// Internal directory handle identity. Not yet a guest open/read/seek ABI.
+#[derive(Clone, Debug)]
+pub struct DirectoryDescriptorToken {
+    descriptor: u32,
+    identity: u64,
+    owner: Rc<()>,
+}
+impl DirectoryDescriptorToken {
+    pub fn descriptor(&self) -> u32 {
+        self.descriptor
+    }
+}
 pub struct FileReadPlan {
     bytes: Vec<u8>,
     token: FileToken,
@@ -248,6 +260,7 @@ impl FileWritePlan {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DescriptorKind {
+    Directory,
     RegisteredFile,
     Pipe,
     Control,
@@ -262,6 +275,10 @@ struct OpenFile {
 
 enum Endpoint {
     File(OpenFile),
+    Directory {
+        backing: crate::kernel::DirectoryToken,
+        identity: u64,
+    },
     Control {
         target: Rc<Cell<u64>>,
         selector: bool,
@@ -295,7 +312,7 @@ impl Default for Descriptors {
     }
 }
 impl Descriptors {
-    /// A table may rebind a host namespace only after all its file endpoints close.
+    /// A table may rebind a namespace only after all regular/directory endpoints close.
     pub fn registered_file_bytes(&self) -> usize {
         self.file_quota.as_ref().map_or(0, |quota| quota.used.get())
     }
@@ -305,7 +322,7 @@ impl Descriptors {
                 .endpoints
                 .iter()
                 .chain(std::iter::once(&self.stdin))
-                .any(|e| matches!(e, Some(Endpoint::File(_))))
+                .any(|e| matches!(e, Some(Endpoint::File(_) | Endpoint::Directory { .. })))
                 && !Rc::ptr_eq(quota, &files.quota())
             {
                 return Err(
@@ -315,6 +332,74 @@ impl Descriptors {
             }
         }
         Ok(())
+    }
+    /// Install an internal read-authorized directory handle. This intentionally
+    /// does not route open_file_options through a regular-file token. Raw guest
+    /// directory read/seek/stat remain separate, unsupported integration work.
+    pub fn open_directory(
+        &mut self,
+        files: &crate::kernel::Files,
+        path: &[u8],
+        cwd: Option<&[u8]>,
+    ) -> Result<std::result::Result<DirectoryDescriptorToken, u32>> {
+        self.validate_file_namespace(files)?;
+        if !path.is_empty() && path[0] != b'/' && cwd.is_none() {
+            return Err(
+                "Guest working directory is not configured for relative directory open".into(),
+            );
+        }
+        let Some(index) = self.endpoints.iter().position(Option::is_none) else {
+            return Ok(Err(24));
+        };
+        let identity = self.next_file;
+        let Some(next) = identity.checked_add(1) else {
+            return Ok(Err(24));
+        };
+        let backing = match files.open_directory(path, cwd) {
+            Ok(backing) => backing,
+            Err(errno) => return Ok(Err(errno)),
+        };
+        self.file_quota = Some(files.quota());
+        self.endpoints[index] = Some(Endpoint::Directory { backing, identity });
+        self.next_file = next;
+        Ok(Ok(DirectoryDescriptorToken {
+            descriptor: index as u32 + 3,
+            identity,
+            owner: self.owner.clone(),
+        }))
+    }
+    pub fn directory_token(
+        &self,
+        descriptor: u64,
+    ) -> std::result::Result<DirectoryDescriptorToken, u32> {
+        let Some(Endpoint::Directory { identity, .. }) = self.endpoint(descriptor) else {
+            return Err(9);
+        };
+        Ok(DirectoryDescriptorToken {
+            descriptor: descriptor as u32,
+            identity: *identity,
+            owner: self.owner.clone(),
+        })
+    }
+    pub fn directory_backing(
+        &self,
+        token: &DirectoryDescriptorToken,
+    ) -> std::result::Result<&crate::kernel::DirectoryToken, u32> {
+        if !Rc::ptr_eq(&self.owner, &token.owner) {
+            return Err(9);
+        }
+        match self.endpoint(token.descriptor.into()) {
+            Some(Endpoint::Directory { backing, identity }) if *identity == token.identity => {
+                Ok(backing)
+            }
+            _ => Err(9),
+        }
+    }
+    pub fn close_directory(&mut self, token: &DirectoryDescriptorToken) -> u32 {
+        if self.directory_backing(token).is_err() {
+            return 9;
+        }
+        self.close(token.descriptor.into())
     }
     pub fn open_file(
         &mut self,
@@ -585,6 +670,7 @@ impl Descriptors {
     pub fn kind(&self, descriptor: u64) -> Option<DescriptorKind> {
         self.endpoint(descriptor).map(|endpoint| match endpoint {
             Endpoint::File(_) => DescriptorKind::RegisteredFile,
+            Endpoint::Directory { .. } => DescriptorKind::Directory,
             Endpoint::Pipe { .. } => DescriptorKind::Pipe,
             Endpoint::Control { .. } => DescriptorKind::Control,
         })
@@ -1461,5 +1547,149 @@ mod tests {
             d.set_socket_option(&user, &mut kernel, [s.into(), 41, 46, 0x1000, 19]),
             22
         );
+    }
+}
+
+#[cfg(test)]
+mod directory_descriptor_tests {
+    use super::*;
+    use crate::kernel::Files;
+    #[test]
+    fn table_owner_generation_and_regular_file_reuse_are_independent() {
+        let mut files = Files::default();
+        files.allow_create_directory(b"/dir").unwrap();
+        files.register(b"/dir/file", vec![1]).unwrap();
+        let mut table = Descriptors::default();
+        let token = table
+            .open_directory(&files, b"/dir", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            table.kind(token.descriptor().into()),
+            Some(DescriptorKind::Directory)
+        );
+        assert!(table.file_token(token.descriptor().into()).is_err());
+        let mut foreign = Descriptors::default();
+        let foreign_token = foreign
+            .open_directory(&files, b"/dir", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(foreign.close_directory(&token), 9);
+        assert_eq!(table.close_directory(&foreign_token), 9);
+        let retained = table.directory_backing(&token).unwrap().clone();
+        assert_eq!(table.close_directory(&token), 0);
+        let file = table.open_file(&files, b"/dir/file").unwrap();
+        assert_eq!(file.descriptor(), token.descriptor());
+        assert_eq!(table.close_directory(&token), 9);
+        assert_eq!(table.close_file(&file), 0);
+        let replacement = table
+            .open_directory(&files, b"/dir", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement.descriptor(), token.descriptor());
+        assert_eq!(table.close_directory(&token), 9);
+        assert_eq!(
+            table.directory_backing(&replacement).unwrap().inode(),
+            retained.inode()
+        );
+        assert!(files.owns_directory_token(&retained));
+    }
+    #[test]
+    fn directories_hold_namespace_binding_and_share_all_descriptor_slots() {
+        let mut files = Files::default();
+        files.allow_create_directory(b"/dir").unwrap();
+        files.register(b"/file", vec![1]).unwrap();
+        let mut other = Files::default();
+        other.allow_create_directory(b"/dir").unwrap();
+        other.register(b"/file", vec![2]).unwrap();
+        let mut table = Descriptors::default();
+        let directory = table
+            .open_directory(&files, b"/dir", None)
+            .unwrap()
+            .unwrap();
+        assert!(!other.owns_directory_token(table.directory_backing(&directory).unwrap()));
+        assert!(table.open_file(&other, b"/file").is_err());
+        assert!(table.open_directory(&other, b"/dir", None).is_err());
+        for _ in 1..LIMIT {
+            table.open_file(&files, b"/file").unwrap();
+        }
+        assert!(matches!(
+            table.open_directory(&files, b"/dir", None),
+            Ok(Err(24))
+        ));
+        assert_eq!(table.close_directory(&directory), 0);
+        assert!(table.open_directory(&other, b"/dir", None).is_err());
+        for descriptor in 4..LIMIT as u64 + 3 {
+            assert_eq!(table.close(descriptor), 0);
+        }
+        assert!(table.open_directory(&other, b"/dir", None).unwrap().is_ok());
+    }
+    #[test]
+    fn directory_identity_follows_rename_and_detached_handle_keeps_namespace() {
+        let mut files = Files::default();
+        files.allow_create_directory(b"/save").unwrap();
+        files.allow_create_directory(b"/save/dir").unwrap();
+        files
+            .register_writable(b"/save/dir/child", vec![1])
+            .unwrap();
+        let mut table = Descriptors::default();
+        let token = table
+            .open_directory(&files, b"/save/dir", None)
+            .unwrap()
+            .unwrap();
+        let inode = table.directory_backing(&token).unwrap().inode();
+        let plan = files
+            .plan_rename(b"/save/dir", b"/save/moved", None)
+            .unwrap();
+        files.commit_rename(plan).unwrap();
+        assert_eq!(table.directory_backing(&token).unwrap().inode(), inode);
+        assert!(
+            files
+                .directory_entries_for_token(table.directory_backing(&token).unwrap())
+                .unwrap()
+                .iter()
+                .any(|entry| entry.name == b"child")
+        );
+        files.remove(b"/save/moved/child", None).unwrap();
+        files.remove(b"/save/moved", None).unwrap();
+        assert!(
+            files
+                .directory_entries_for_token(table.directory_backing(&token).unwrap())
+                .is_err()
+        );
+        let mut other = Files::default();
+        other.allow_create_directory(b"/dir").unwrap();
+        assert!(table.open_directory(&other, b"/dir", None).is_err());
+        assert_eq!(table.close_directory(&token), 0);
+        assert!(table.open_directory(&other, b"/dir", None).unwrap().is_ok());
+    }
+    #[test]
+    fn failed_open_does_not_consume_slot_or_generation() {
+        let mut files = Files::default();
+        files.allow_create_directory(b"/dir").unwrap();
+        files.register(b"/file", vec![1]).unwrap();
+        let mut table = Descriptors::default();
+        assert!(matches!(
+            table.open_directory(&files, b"/missing", None),
+            Ok(Err(2))
+        ));
+        assert!(matches!(
+            table.open_directory(&files, b"/file", None),
+            Ok(Err(20))
+        ));
+        assert!(table.open_directory(&files, b"dir", None).is_err());
+        assert_eq!(table.next_file, 1);
+        let token = table
+            .open_directory(&files, b"/dir", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(token.descriptor(), 3);
+        assert_eq!(table.close_directory(&token), 0);
+        table.next_file = u64::MAX;
+        assert!(matches!(
+            table.open_directory(&files, b"/dir", None),
+            Ok(Err(24))
+        ));
+        assert!(table.endpoints.iter().all(Option::is_none));
     }
 }

@@ -20,15 +20,116 @@ pub const STAT_SIZE: usize = 120;
 mod directory_entry_tests {
     use super::*;
     #[test]
+    fn retained_directory_follows_move_and_preserves_open_access() {
+        let mut files = Files::default();
+        files.register_directory(b"/save", 0o777, false).unwrap();
+        files
+            .register_directory(b"/save/source", 0o777, false)
+            .unwrap();
+        files.register(b"/save/source/item", vec![]).unwrap();
+        let token = files.open_directory(b"/save/source", None).unwrap();
+        let before = files.stat_record(b"/save").unwrap();
+        {
+            let _discarded = files
+                .plan_rename(b"/save/source", b"/save/moved", None)
+                .unwrap();
+            assert_eq!(files.stat_record(b"/save").unwrap(), before);
+        }
+        let stale = files
+            .plan_rename(b"/save/source", b"/save/moved", None)
+            .unwrap();
+        files.register(b"/save/other", vec![]).unwrap();
+        assert_eq!(files.commit_rename(stale), Err(22));
+        assert_eq!(files.stat_record(b"/save").unwrap(), before);
+        assert_eq!(
+            files.directory_entries_for_token(&token).unwrap(),
+            files.directory_entries(b"/save/source", None).unwrap()
+        );
+        let plan = files
+            .plan_rename(b"/save/source", b"/save/moved", None)
+            .unwrap();
+        assert_eq!(
+            files.directory_entries_for_token(&token).unwrap()[0].inode,
+            token.inode()
+        );
+        assert_eq!(files.directory_entries(b"/save/moved", None), Err(2));
+        files.commit_rename(plan).unwrap();
+        files.register_directory(b"/save/moved", 0, false).unwrap();
+        assert_eq!(files.directory_entries(b"/save/moved", None), Err(13));
+        let entries = files.directory_entries_for_token(&token).unwrap();
+        assert_eq!(entries[0].inode, token.inode());
+        assert_eq!(entries[2].name, b"item");
+        let foreign = Files::default();
+        assert!(!foreign.owns_directory_token(&token));
+        assert!(
+            foreign
+                .directory_entries_for_token(&token)
+                .unwrap_err()
+                .contains("another namespace")
+        );
+    }
+    #[test]
+    fn replaced_and_removed_tokens_never_retarget_new_nodes() {
+        let mut files = Files::default();
+        files.register_directory(b"/save", 0o777, false).unwrap();
+        files.register_directory(b"/save/a", 0o777, false).unwrap();
+        files.register_directory(b"/save/b", 0o777, false).unwrap();
+        let source = files.open_directory(b"/save/a", None).unwrap();
+        let victim = files.open_directory(b"/save/b", None).unwrap();
+        let plan = files.plan_rename(b"/save/a", b"/save/b", None).unwrap();
+        assert_eq!(
+            files.directory_entries_for_token(&victim).unwrap()[0].inode,
+            victim.inode()
+        );
+        files.commit_rename(plan).unwrap();
+        assert!(
+            files
+                .directory_entries_for_token(&victim)
+                .unwrap_err()
+                .contains("detached")
+        );
+        assert_eq!(
+            files.directory_entries_for_token(&source).unwrap()[0].inode,
+            source.inode()
+        );
+        files.remove(b"/save/b", None).unwrap();
+        files.register_directory(b"/save/b", 0o777, false).unwrap();
+        let fresh = files.open_directory(b"/save/b", None).unwrap();
+        assert_ne!(fresh.inode(), source.inode());
+        assert!(files.owns_directory_token(&source));
+        assert!(
+            files
+                .directory_entries_for_token(&source)
+                .unwrap_err()
+                .contains("detached")
+        );
+        assert_eq!(
+            files.directory_entries_for_token(&fresh).unwrap()[0].inode,
+            fresh.inode()
+        );
+    }
+    #[test]
     fn listing_is_immediate_ordered_and_preserves_inode_identity() {
         let mut files = Files::default();
         files.register(b"/data/z", vec![]).unwrap();
         files.register(b"/data/sub/nested", vec![]).unwrap();
         files.register(b"/data/a", vec![]).unwrap();
         let listing = files.directory_entries(b"./data/", Some(b"/\0")).unwrap();
-        assert_eq!(listing.iter().map(|e| e.name.as_slice()).collect::<Vec<_>>(), [b".".as_slice(), b"..", b"a", b"sub", b"z"]);
-        assert_eq!(listing.iter().map(|e| e.directory).collect::<Vec<_>>(), [true, true, false, true, false]);
-        assert_eq!(listing[0].inode, files.directories[b"/data".as_slice()].inode);
+        assert_eq!(
+            listing
+                .iter()
+                .map(|e| e.name.as_slice())
+                .collect::<Vec<_>>(),
+            [b".".as_slice(), b"..", b"a", b"sub", b"z"]
+        );
+        assert_eq!(
+            listing.iter().map(|e| e.directory).collect::<Vec<_>>(),
+            [true, true, false, true, false]
+        );
+        assert_eq!(
+            listing[0].inode,
+            files.directories[b"/data".as_slice()].inode
+        );
         assert_eq!(listing[1].inode, 1);
         assert_eq!(listing[2].inode, files.files[b"/data/a".as_slice()].inode);
         let root = files.directory_entries(b"/", None).unwrap();
@@ -53,17 +154,26 @@ mod directory_entry_tests {
         assert_eq!(files.directory_entries(b"/absent", None), Err(2));
         assert_eq!(files.directory_entries(b"", None), Err(2));
         assert_eq!(files.directory_entries(b"relative", None), Err(2));
-        files.register_directory(b"/hidden/child", 0o555, false).unwrap();
+        files
+            .register_directory(b"/hidden/child", 0o555, false)
+            .unwrap();
         files.register_directory(b"/hidden", 0o400, false).unwrap();
         assert_eq!(files.directory_entries(b"/hidden/child", None), Err(13));
     }
     #[test]
     fn dirent_layout_padding_and_name_limits() {
         for length in 1..=255 {
-            let entry = DirectoryEntry { inode: 0x12345678, directory: length % 2 == 0, name: vec![0xff; length] };
+            let entry = DirectoryEntry {
+                inode: 0x12345678,
+                directory: length % 2 == 0,
+                name: vec![0xff; length],
+            };
             let record = entry.record().unwrap();
             assert_eq!(&record[..4], &[0x78, 0x56, 0x34, 0x12]);
-            assert_eq!(u16::from_le_bytes(record[4..6].try_into().unwrap()) as usize, record.len());
+            assert_eq!(
+                u16::from_le_bytes(record[4..6].try_into().unwrap()) as usize,
+                record.len()
+            );
             assert_eq!(record.len() % 4, 0);
             assert_eq!(record[6], if entry.directory { 4 } else { 8 });
             assert_eq!(record[7] as usize, length);
@@ -71,7 +181,15 @@ mod directory_entry_tests {
             assert!(record[8 + length..].iter().all(|byte| *byte == 0));
         }
         for name in [vec![], vec![b'x'; 256], b"a/b".to_vec(), b"a\0".to_vec()] {
-            assert!(DirectoryEntry { inode: 1, directory: false, name }.record().is_err());
+            assert!(
+                DirectoryEntry {
+                    inode: 1,
+                    directory: false,
+                    name
+                }
+                .record()
+                .is_err()
+            );
         }
     }
 }
@@ -181,12 +299,26 @@ impl Default for NamespaceProfile {
 }
 #[derive(Clone)]
 struct Directory {
+    identity: Rc<()>,
     inode: u32,
     mode: u16,
     uid: u32,
     gid: u32,
     read_only: bool,
     links: u16,
+}
+/// Retains namespace and node identity, not a pathname or mutable metadata.
+/// Cloned namespace plans share identity only; their metadata stays isolated.
+#[derive(Clone, Debug)]
+pub struct DirectoryToken {
+    owner: Rc<()>,
+    identity: Rc<()>,
+    inode: u32,
+}
+impl DirectoryToken {
+    pub fn inode(&self) -> u32 {
+        self.inode
+    }
 }
 pub struct MkdirPlan {
     directories: BTreeMap<Vec<u8>, Directory>,
@@ -207,7 +339,11 @@ impl DirectoryEntry {
     /// u8 name length, NUL-terminated name padded to a four-byte boundary.
     /// https://raw.githubusercontent.com/freebsd/freebsd-src/releng/11.4/sys/sys/dirent.h
     pub fn record(&self) -> Result<Vec<u8>> {
-        if self.name.is_empty() || self.name.len() > 255 || self.name.contains(&0) || self.name.contains(&b'/') {
+        if self.name.is_empty()
+            || self.name.len() > 255
+            || self.name.contains(&0)
+            || self.name.contains(&b'/')
+        {
             return Err("Invalid directory entry name".into());
         }
         let length = 8 + (self.name.len() + 1).next_multiple_of(4);
@@ -263,6 +399,7 @@ impl Default for Files {
             directories: BTreeMap::from([(
                 b"/".to_vec(),
                 Directory {
+                    identity: Rc::new(()),
                     inode: 1,
                     mode: 0o555,
                     uid: profile.uid,
@@ -415,30 +552,117 @@ impl Files {
     /// the final directory requires read access, not write permission.
     /// Dot entries precede byte-sorted immediate children. Ordering is a
     /// virtual filesystem policy, not an assertion about console disk order.
-    pub fn directory_entries(&self, path: &[u8], cwd: Option<&[u8]>) -> std::result::Result<Vec<DirectoryEntry>, u32> {
+    pub fn directory_entries(
+        &self,
+        path: &[u8],
+        cwd: Option<&[u8]>,
+    ) -> std::result::Result<Vec<DirectoryEntry>, u32> {
         let resolved = self.resolve(path, cwd)?;
         let path = trimmed(&resolved);
-        let directory = self.directories.get(path).ok_or(if self.files.contains_key(path) { 20u32 } else { 2 })?;
+        let directory = self
+            .directories
+            .get(path)
+            .ok_or(if self.files.contains_key(path) {
+                20u32
+            } else {
+                2
+            })?;
         if !self.access(directory, 4) {
             return Err(13);
         }
+        self.entries_at(path, directory)
+    }
+    /// Captures successful traversal and read access. Enumeration through the
+    /// token does not repeat pathname permission checks after opening.
+    pub fn open_directory(
+        &self,
+        path: &[u8],
+        cwd: Option<&[u8]>,
+    ) -> std::result::Result<DirectoryToken, u32> {
+        let resolved = self.resolve(path, cwd)?;
+        let path = trimmed(&resolved);
+        let directory = self
+            .directories
+            .get(path)
+            .ok_or(if self.files.contains_key(path) {
+                20u32
+            } else {
+                2
+            })?;
+        if !self.access(directory, 4) {
+            return Err(13);
+        }
+        Ok(DirectoryToken {
+            owner: self.owner.clone(),
+            identity: directory.identity.clone(),
+            inode: directory.inode,
+        })
+    }
+    pub fn owns_directory_token(&self, token: &DirectoryToken) -> bool {
+        Rc::ptr_eq(&self.owner, &token.owner)
+    }
+    /// Resolves retained identity after rename, never the former pathname.
+    /// Reading an unlinked/replaced directory is currently unsupported: no
+    /// claim is made about filesystem-specific detached-directory contents.
+    pub fn directory_entries_for_token(
+        &self,
+        token: &DirectoryToken,
+    ) -> Result<Vec<DirectoryEntry>> {
+        if !self.owns_directory_token(token) {
+            return Err("Directory token belongs to another namespace".into());
+        }
+        let (path, directory) = self
+            .directories
+            .iter()
+            .find(|(_, directory)| Rc::ptr_eq(&directory.identity, &token.identity))
+            .ok_or("Enumeration of a detached directory is unsupported")?;
+        self.entries_at(path, directory)
+            .map_err(|_| "Retained directory parent is missing".into())
+    }
+    fn entries_at(
+        &self,
+        path: &[u8],
+        directory: &Directory,
+    ) -> std::result::Result<Vec<DirectoryEntry>, u32> {
         let parent_directory = self.directories.get(parent(path)).ok_or(2u32)?;
         let mut entries = vec![
-            DirectoryEntry { inode: directory.inode, directory: true, name: b".".to_vec() },
-            DirectoryEntry { inode: parent_directory.inode, directory: true, name: b"..".to_vec() },
+            DirectoryEntry {
+                inode: directory.inode,
+                directory: true,
+                name: b".".to_vec(),
+            },
+            DirectoryEntry {
+                inode: parent_directory.inode,
+                directory: true,
+                name: b"..".to_vec(),
+            },
         ];
         let mut children = BTreeMap::new();
         for (name, node) in &self.directories {
             if name.as_slice() != path && parent(name) == path {
-                children.insert(name.rsplit(|b| *b == b'/').next().unwrap().to_vec(), (node.inode, true));
+                children.insert(
+                    name.rsplit(|b| *b == b'/').next().unwrap().to_vec(),
+                    (node.inode, true),
+                );
             }
         }
         for (name, node) in &self.files {
             if parent(name) == path {
-                children.insert(name.rsplit(|b| *b == b'/').next().unwrap().to_vec(), (node.inode, false));
+                children.insert(
+                    name.rsplit(|b| *b == b'/').next().unwrap().to_vec(),
+                    (node.inode, false),
+                );
             }
         }
-        entries.extend(children.into_iter().map(|(name, (inode, directory))| DirectoryEntry { inode, directory, name }));
+        entries.extend(
+            children
+                .into_iter()
+                .map(|(name, (inode, directory))| DirectoryEntry {
+                    inode,
+                    directory,
+                    name,
+                }),
+        );
         Ok(entries)
     }
     fn materialize(
@@ -473,6 +697,7 @@ impl Files {
                 directories.insert(
                     current.clone(),
                     Directory {
+                        identity: Rc::new(()),
                         inode,
                         mode: 0o555,
                         uid: self.profile.uid,
@@ -517,6 +742,7 @@ impl Files {
         directories.insert(
             resolved.to_vec(),
             Directory {
+                identity: Rc::new(()),
                 inode: self.next_inode,
                 mode: mode & 0o777 & !self.profile.umask,
                 uid: self.profile.uid,
