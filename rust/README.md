@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct SETcc now supports all 16 conditions with byte-register and guarded memory
+destinations. 139264 native cases pass. Configured startup's next gap is byte AND
+in the block at 0x2ca0. See
+[SETcc evidence](../docs/status/TRANSLATOR_READINESS.md#direct-setcc-conditions).
+
 Direct immediate SHL/SHR/SAR now handles 32/64-bit registers with x86 count
 masking and flag semantics. 294918 native cases pass; configured startup advances
 to a SETNE gap in the block at 0x2ca0. See

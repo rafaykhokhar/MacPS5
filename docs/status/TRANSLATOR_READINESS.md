@@ -1005,3 +1005,28 @@ This is process 67206; `/tmp/macps5-shift-startup.log` records the result. The
 first real dlsym boundary is still reached, but complete bootstrap/gameplay is
 not established. Reproduce the standalone verifier using the release rlib flags
 above and no arguments; rerun `--direct-startup` for the real-file boundary.
+
+## Direct SETcc conditions
+
+The direct backend now handles all 16 SETcc encodings using the existing guest
+condition helper. Register destinations write only the selected low/high byte.
+Memory destinations use guarded one-byte stores and preserve registers/flags on
+failure. Effective-address lowering preserves the computed condition result until
+the store; SETcc never substitutes host condition flags for guest flags.
+
+`direct_setcc_native.rs` passes 139264 native truth-table cases: every condition
+and relevant flag combination, legacy/REX byte registers, all address bases,
+mapping boundaries, read-only/unmapped writes, fuel and prior faults. The initial
+build revealed that this iced-x86 version has no `Instruction::is_setcc`; an
+explicit match on its 16 SETcc codes corrected that API assumption. Afterward,
+687 library tests, three integration tests, strict Clippy, release build and the
+strict-warning native verifier pass (process 12273 before startup). The existing
+5120-case direct branch verifier also passes (command chunk 4d8a6f, exit 0).
+
+Configured startup now rejects `And_rm8_r8` in the span at image-relative 0x2ca0.
+The process exits 1 at that explicit boundary; `/tmp/macps5-setcc-startup.log`
+records the first real dlsym lookup and subsequent translation error. SETNE is
+accepted during translation, but the complete span has not executed. The next
+CPU gap is byte logical arithmetic; bootstrap and gameplay remain incomplete.
+Use the existing standalone verifier flags and configured startup command to
+reproduce.

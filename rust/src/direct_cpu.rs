@@ -5,6 +5,27 @@ use crate::{
     decode,
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
+fn setcc(i: &Instruction) -> bool {
+    matches!(
+        i.code(),
+        Code::Seto_rm8
+            | Code::Setno_rm8
+            | Code::Setb_rm8
+            | Code::Setae_rm8
+            | Code::Sete_rm8
+            | Code::Setne_rm8
+            | Code::Setbe_rm8
+            | Code::Seta_rm8
+            | Code::Sets_rm8
+            | Code::Setns_rm8
+            | Code::Setp_rm8
+            | Code::Setnp_rm8
+            | Code::Setl_rm8
+            | Code::Setge_rm8
+            | Code::Setle_rm8
+            | Code::Setg_rm8
+    )
+}
 fn immediate_shift(i: &Instruction) -> bool {
     matches!(i.mnemonic(), Mnemonic::Shl | Mnemonic::Shr | Mnemonic::Sar)
         && i.op0_kind() == OpKind::Register
@@ -135,6 +156,7 @@ pub(crate) fn translate_span(
             | Code::Movzx_r64_rm16 => {}
             Code::Mov_r32_rm32 | Code::Mov_rm32_r32 | Code::Mov_r64_rm64 | Code::Mov_rm64_r64 => {}
             _ if i.is_jcc_short_or_near() || i.is_jmp_short_or_near() => {}
+            _ if setcc(&i) => {}
             Code::Call_rel32_64 | Code::Call_rm64 | Code::Jmp_rm64 => {}
             _ if arithmetic_supported(&i) => {}
             _ if immediate_shift(&i) => {}
@@ -241,6 +263,36 @@ pub(crate) fn translate_span(
         )?;
         c.emit(0xd1000529)?; // sub x9,x9,#1
         c.context_access(9, 19, 160, true, true)?;
+        if setcc(i) {
+            let condition = (i.condition_code() as u64)
+                .checked_sub(1)
+                .filter(|cc| *cc < 16)
+                .ok_or("Invalid direct SETcc condition")?;
+            c.emit(0xaa1303e0)?; // mov x0,x19
+            c.load_u64(1, condition)?;
+            c.call_absolute(crate::condition::ffi::native_ps5_condition_v1 as *const () as u64)?;
+            if i.op0_kind() == OpKind::Register {
+                c.emit(0x39000260 | (byte_offset(i.op0_register())? << 10))?; // strb w0,[x19,#offset]
+            } else {
+                c.emit(0xaa0003e2)?; // mov x2,x0; address lowering preserves x2
+                memory_address(&mut c, i)?;
+                c.emit(0xaa1303e0)?; // mov x0,x19
+                c.load_u64(3, 1)?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_store_v1 as *const () as u64,
+                )?;
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+            }
+            continue;
+        }
         if immediate_shift(i) {
             let wide = i.op0_register().size() == 8;
             let destination = register(i.op0_register(), wide)?;
