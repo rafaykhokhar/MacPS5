@@ -1,5 +1,14 @@
 # Rust migration
 
+Owned stdout/stderr `Fprintf` and `Vfprintf` now share the typed formatter.
+Fprintf's four GP argument slots, FP arguments and overflow stack have native
+checks; the previous stderr and printf verifiers also pass. The matching build
+passes 553 library tests, three integration tests and strict Clippy. Regular FILE
+formatting remains explicitly unsupported pending its distinct buffering and
+descriptor integration. See [stdout status](../docs/status/STDOUT.md).
+Startup import/ownership assertions pass at missing `remove`, after binding
+vfprintf, with 19,952 retained dependency bytes (`fprintf-entry-verified.log`).
+
 Guest `Printf` and `Vprintf` services now use the typed renderer and fixed stream
 buffer. Direct-call bookkeeping remains host-owned, with live guest overflow
 reads; caller va_list writes retain their existing behavior. The matching build
@@ -8,7 +17,7 @@ formatting checks, and existing integer/wide/hex asprintf regressions. Decimal,
 extended, positional and general-stream formatting remain incomplete. See
 [stdout status](../docs/status/STDOUT.md).
 
-Startup-only import/ownership assertions now pass at missing `vfprintf`, after
+The preceding startup-only import/ownership assertions passed at missing `vfprintf`, after
 binding printf and the initial stdout exports, with 19,920 dependency bytes
 retained (`work/arm64-prototype/printf-call-entry.log`). Game main and cleanup
 remain unexecuted.

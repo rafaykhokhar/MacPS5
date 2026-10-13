@@ -1,5 +1,41 @@
 # Stdout integration gaps
 
+## Owned stdout/stderr formatted FILE checkpoint
+
+`Fprintf` now uses the typed stream formatter instead of the legacy GP-only
+stderr renderer. `Vfprintf` shares its stream dispatch. Owned unbuffered stdout
+and stderr are supported; direct fprintf has four GP variadic registers and
+then overflow-stack arguments. Guest va_list descriptors remain caller-owned.
+FILE preparation establishes byte orientation even for an empty format. Each
+backend commit preserves earlier output when a later conversion or write fails.
+
+The matching build passes 553 library tests, three integration tests, strict
+Clippy and release compilation (`work/fprintf-{tests,clippy,release}.log`,50007
+exit0). Native fprintf/vfprintf, previous stderr, and previous printf checks all
+pass (`work/fprintf-native/native.log`,18813 exit0). These cover four-register
+GP overflow, mixed hex FP, va_list updates, stream isolation, orientation, active
+FILE/frame guards, and buffered versus committed prefixes on failure. The new
+fixture initially over-constrained writes to inactive streams; its expectation
+was corrected. The previous stderr fixture's stale diagnostic assertion was
+updated to require the typed argument read fault. No runtime behavior was
+changed to satisfy either fixture correction.
+
+Startup-only import and ownership assertions pass at missing `remove`, with
+vfprintf bound and 19,952 dependency bytes retained
+(`work/arm64-prototype/fprintf-entry-verified.log`,95849 exit0). Discovery35948
+first exposed that new boundary using the preceding checkpoint's assertions.
+Game main and exit cleanup remain unexecuted; this does not prove the newly
+bound service was called during startup.
+
+Regular FILE formatting is still incomplete and rejected explicitly. The source
+distinguishes write-only unbuffered streams, which use the temporary 1,024-byte
+buffer, from read/write update streams, which require direct vector writes.
+Integration must prepare permissions/direction before even an empty format,
+borrow descriptor/stream state without borrowing renderer memory, preserve
+positive short writes, and publish actual stream error status separately from
+capture-policy faults. Reusing fwrite's zero-length or short-write transitions
+unchanged would give incorrect behavior.
+
 ## Native printf and vprintf services
 
 The executor now connects `Printf` and `Vprintf` to the stream renderer and owned
@@ -27,7 +63,7 @@ formatting. Decimal/extended formatting, positional arguments, grouping, general
 streams, and FILE locking remain incomplete. These checks do not establish game
 compatibility or complete libc behavior.
 
-Startup-only verification now binds printf, __stdoutp, putc and __swbuf and stops
+The preceding startup-only verification bound printf, __stdoutp, putc and __swbuf and stopped
 at missing `vfprintf`, retaining 19,920 dependency bytes
 (`work/arm64-prototype/printf-call-entry.log`,37381 exit0). Vprintf is exported
 and component-tested but occurs after that unresolved import. Binding does not
@@ -117,9 +153,8 @@ or new Metal presentation result is established by this checkpoint.
 
 ## Remaining formatted-stream integration
 
-Startup now encounters missing `vfprintf`. The printf/vprintf checkpoint above
-does not yet connect general FILE arguments; stderr-only legacy Fprintf also
-still needs migration to the typed argument/stream machinery.
+The current owned-stream services cover stdout and stderr. Regular FILE
+arguments still need the descriptor/buffering integration described above.
 
 The `__stdoutp` import at GOT `0x26fb30` is a pointer cell containing a guest
 FILE address. `I_PrintBanner` performs the extra dereference at `0x1174b1`, then

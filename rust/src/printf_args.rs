@@ -71,6 +71,7 @@ struct Direct {
     gp: [u64; 5],
     fp: [u64; 8],
     gp_index: usize,
+    gp_count: usize,
     fp_index: usize,
     vectors_saved: bool,
     overflow: u64,
@@ -78,7 +79,7 @@ struct Direct {
 impl Direct {
     fn fetch<M: Memory>(&mut self, memory: &M, class: Class) -> Result<Value, Error<M::Error>> {
         match class {
-            Class::Gp if self.gp_index < self.gp.len() => {
+            Class::Gp if self.gp_index < self.gp_count => {
                 let value = self.gp[self.gp_index];
                 self.gp_index += 1;
                 return Ok(Value::Gp(value));
@@ -136,6 +137,35 @@ impl Cursor {
         overflow: u64,
         argument_budget: usize,
     ) -> Result<Self, Malformed> {
+        Self::from_registers(gp, 5, fp, al, overflow, argument_budget)
+    }
+    /// Owned snapshot for fprintf(stream, format, ...). Only RDX, RCX, R8,
+    /// and R9 contain GP variadic arguments; the fifth GP fetch uses the shared
+    /// overflow area. FP and AL handling are identical to from_call.
+    pub fn from_fprintf_call(
+        gp: [u64; 4],
+        fp: [u64; 8],
+        al: u8,
+        overflow: u64,
+        argument_budget: usize,
+    ) -> Result<Self, Malformed> {
+        Self::from_registers(
+            [gp[0], gp[1], gp[2], gp[3], 0],
+            4,
+            fp,
+            al,
+            overflow,
+            argument_budget,
+        )
+    }
+    fn from_registers(
+        gp: [u64; 5],
+        gp_count: usize,
+        fp: [u64; 8],
+        al: u8,
+        overflow: u64,
+        argument_budget: usize,
+    ) -> Result<Self, Malformed> {
         if al > 8 {
             return Err(Malformed::VectorCount);
         }
@@ -144,6 +174,7 @@ impl Cursor {
                 gp,
                 fp,
                 gp_index: 0,
+                gp_count,
                 fp_index: 0,
                 vectors_saved: al != 0,
                 overflow,
@@ -364,6 +395,98 @@ mod tests {
     }
     fn fetch(c: &mut Cursor, m: &mut Mem, class: Class) -> Result<Value, Error<&'static str>> {
         c.fetch(m, class, |_, _, _| Ok(()))
+    }
+    #[test]
+    fn fprintf_fifth_gp_uses_stack_while_fp_slots_remain_independent() {
+        let mut m = memory();
+        let before = m.bytes.clone();
+        let gp = [u64::MAX, 11, 22, 33];
+        let fp = std::array::from_fn(|i| 0x8000_0000_0000_0000 + i as u64);
+        let mut c = Cursor::from_fprintf_call(gp, fp, 1, STACK, 15).unwrap();
+        for i in 0..4 {
+            assert_eq!(fetch(&mut c, &mut m, Class::Gp), Ok(Value::Gp(gp[i])));
+            assert_eq!(
+                fetch(&mut c, &mut m, Class::Binary64),
+                Ok(Value::Binary64(fp[i]))
+            );
+        }
+        assert!(m.trace.borrow().is_empty());
+        // With four FP slots still available, the fifth GP must read the stack,
+        // not the padded fifth slot of the shared host register representation.
+        assert_eq!(
+            fetch(&mut c, &mut m, Class::Gp),
+            Ok(Value::Gp(0x7ff0_0000_0000_0001))
+        );
+        for value in &fp[4..] {
+            assert_eq!(
+                fetch(&mut c, &mut m, Class::Binary64),
+                Ok(Value::Binary64(*value))
+            );
+        }
+        assert_eq!(
+            fetch(&mut c, &mut m, Class::Binary64),
+            Ok(Value::Binary64(0xaabb_ccdd_eeff_0011))
+        );
+        m.put(STACK + 16, &0xdead_beef_cafe_babeu64.to_le_bytes());
+        assert_eq!(
+            fetch(&mut c, &mut m, Class::Gp),
+            Ok(Value::Gp(0xdead_beef_cafe_babe))
+        );
+        assert_eq!(c.remaining(), 0);
+        assert_eq!(
+            *m.trace.borrow(),
+            [('r', STACK, 8), ('r', STACK + 8, 8), ('r', STACK + 16, 8)]
+        );
+        m.put(
+            STACK + 16,
+            &before[(STACK + 16) as usize..(STACK + 24) as usize],
+        );
+        assert_eq!(m.bytes, before);
+    }
+    #[test]
+    fn fprintf_first_gp_spill_failure_keeps_cursor_budget_and_fp_position() {
+        let mut m = memory();
+        let mut c = Cursor::from_fprintf_call([1, 2, 3, 4], [7; 8], 8, STACK, 7).unwrap();
+        for expected in 1..=4 {
+            assert_eq!(fetch(&mut c, &mut m, Class::Gp), Ok(Value::Gp(expected)));
+        }
+        m.denied_read = Some((STACK + 7, 1));
+        assert_eq!(fetch(&mut c, &mut m, Class::Gp), Err(Error::Read("read")));
+        assert_eq!(c.remaining(), 3);
+        assert_eq!(
+            fetch(&mut c, &mut m, Class::Binary64),
+            Ok(Value::Binary64(7))
+        );
+        m.denied_read = None;
+        assert_eq!(
+            fetch(&mut c, &mut m, Class::Gp),
+            Ok(Value::Gp(0x7ff0_0000_0000_0001))
+        );
+        assert_eq!(
+            fetch(&mut c, &mut m, Class::Gp),
+            Ok(Value::Gp(0xaabb_ccdd_eeff_0011))
+        );
+        assert_eq!(c.remaining(), 0);
+        assert_eq!(
+            *m.trace.borrow(),
+            [('r', STACK, 8), ('r', STACK, 8), ('r', STACK + 8, 8)]
+        );
+    }
+    #[test]
+    fn fprintf_constructor_keeps_printf_al_policy() {
+        assert!(matches!(
+            Cursor::from_fprintf_call([0; 4], [0; 8], 9, 0, 1),
+            Err(Malformed::VectorCount)
+        ));
+        let mut m = memory();
+        let mut c = Cursor::from_fprintf_call([7; 4], [8; 8], 0, STACK, 2).unwrap();
+        assert_eq!(
+            fetch(&mut c, &mut m, Class::Binary64),
+            Err(Error::UnavailableVectorRegisters)
+        );
+        assert_eq!(c.remaining(), 2);
+        assert_eq!(fetch(&mut c, &mut m, Class::Gp), Ok(Value::Gp(7)));
+        assert!(m.trace.borrow().is_empty());
     }
     #[test]
     fn direct_register_classes_share_only_the_overflow_cursor_and_never_write_guest() {

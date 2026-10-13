@@ -253,7 +253,11 @@ pub fn verify(archive: &Path, directory: &Path) -> Result<(), String> {
         )
         .err()
         .ok_or("Invalid variadic stack unexpectedly succeeded")?;
-    assert!(error.contains("formatting"), "{error}");
+    assert!(
+        error.contains("Printf argument fault: Read(")
+            && error.contains("Guest access outside mapping"),
+        "{error}"
+    );
     assert!(bad_stack.stdio.bytes().is_empty());
     println!(
         "PASS: translated stderr FILE pointer object, observed fprintf warning format, register/stack varargs, exact captured bytes/counts, flush/NULL, readonly object and atomic invalid stream/format/string/FILE/capacity/overflow-stack failures; unbuffered owned stderr only"

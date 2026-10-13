@@ -358,10 +358,12 @@ fn stdout_flush(model: &crate::stdout_file::StdoutFile, memory: &Memory<'_>) -> 
     model.validate_flush(&file, &pointer).map_err(|e| format!("Stdout flush: {e:?}"))
 }
 #[allow(clippy::too_many_arguments)]
-fn printf_stdout_service(
+fn printf_stream_service(
     model: &mut crate::stdout_file::StdoutFile,
     capture: &mut crate::captured_stdout::CapturedStdout,
+    stderr: &mut crate::guest_stdio::GuestStdio,
     memory: &mut Memory<'_>,
+    stream: u64,
     format: u64,
     cursor: crate::printf_args::Cursor,
     errno: Option<u64>,
@@ -369,18 +371,25 @@ fn printf_stdout_service(
     ret: u64,
     hex: crate::printf_render::HexContext<'_>,
 ) -> Result<u64> {
-    let (file, pointer) = stdout_snapshot(memory)?;
-    let plan = model.prepare_bulk(&file, &pointer, 0, crate::stdout_file::Delivery::Success)
-        .map_err(|e| format!("Printf stdout preparation: {e:?}"))?;
-    // Establish byte orientation even for empty output or later format failure.
-    stdout_commit(model, capture, memory, &pointer, plan, &[], sp, ret)?;
+    if memory.load(sp, 8)? != ret { return Err("Formatted stream return frame changed".into()); }
+    let (file_address, pointer_address) = if stream == crate::stdout_file::FILE_ADDR {
+        let (file, pointer) = stdout_snapshot(memory)?;
+        let plan = model.prepare_bulk(&file, &pointer, 0, crate::stdout_file::Delivery::Success)
+            .map_err(|e| format!("Printf stdout preparation: {e:?}"))?;
+        stdout_commit(model, capture, memory, &pointer, plan, &[], sp, ret)?;
+        (crate::stdout_file::FILE_ADDR, crate::stdout_file::STDOUT_PTR_ADDR)
+    } else if stream == crate::guest_stdio::FILE_ADDR {
+        stderr.prepare_formatted(memory, |m, a, n| validate_net_output(m, a, n, sp, ret))?;
+        (crate::guest_stdio::FILE_ADDR, crate::guest_stdio::STDERR_PTR_ADDR)
+    } else {
+        return Err("Formatted output for this FILE backend is not implemented".into());
+    };
     let guard = |memory: &Memory<'_>, address: u64, length: usize| {
         validate_net_output(memory, address, length, sp, ret)?;
         let end = address.checked_add(length as u64).ok_or("Printf output overflow")?;
-        for (base, size) in [(crate::stdout_file::FILE_ADDR, crate::stdout_file::FILE_SIZE),
-                             (crate::stdout_file::STDOUT_PTR_ADDR, 8)] {
+        for (base, size) in [(file_address, crate::stdout_file::FILE_SIZE), (pointer_address, 8)] {
             if address < base + size as u64 && base < end {
-                return Err("Printf write aliases active stdout state".into());
+                return Err("Printf write aliases active stream state".into());
             }
         }
         Ok(())
@@ -390,8 +399,12 @@ fn printf_stdout_service(
         crate::printf_render::Options { errno_address: errno, ..Default::default() },
         Some(hex), guard,
         |bytes| {
-            capture.write_bytes(bytes).map_err(crate::printf_stream::WriteError::Policy)?;
-            Ok(bytes.len())
+            if stream == crate::stdout_file::FILE_ADDR {
+                capture.write_bytes(bytes).map_err(crate::printf_stream::WriteError::Policy)?;
+                Ok(bytes.len())
+            } else {
+                stderr.write_formatted(bytes).map_err(crate::printf_stream::WriteError::Policy)
+            }
         },
     );
     match result {
@@ -1141,6 +1154,7 @@ pub enum Service {
     Vasprintf,
     Printf,
     Vprintf,
+    Vfprintf,
     Errno,
     Getpid,
     Syscall,
@@ -1373,6 +1387,7 @@ impl Service {
             | Self::Vasprintf
             | Self::Printf
             | Self::Vprintf
+            | Self::Vfprintf
             | Self::Strcoll
             | Self::Strxfrm
             | Self::Wcsxfrm
@@ -2539,7 +2554,7 @@ impl NativeExecutor {
                 writable: region.writable,
             })
             .collect::<Vec<_>>();
-        if self.services.values().any(|service| matches!(service, Service::Vasprintf | Service::Printf | Service::Vprintf)) {
+        if self.services.values().any(|service| matches!(service, Service::Vasprintf | Service::Printf | Service::Vprintf | Service::Fprintf | Service::Vfprintf)) {
             let (pool, _) = self.gdtoa.split_mut();
             mapped_data.push(DataRegion { address: GDTOA_POOL, bytes: pool, writable: false });
         }
@@ -2586,7 +2601,7 @@ impl NativeExecutor {
         if self.services.values().any(|service| {
             matches!(
                 service,
-                Service::Fprintf | Service::Fflush | Service::File(_) | Service::Abort
+                Service::Fprintf | Service::Vfprintf | Service::Fflush | Service::File(_) | Service::Abort
             )
         }) {
             mapped_data.push(DataRegion {
@@ -3645,7 +3660,7 @@ impl NativeExecutor {
             memory.add(region.address, region.bytes, region.writable, false)?;
         }
         memory.attach_owned(&mut self.allocations)?;
-        if self.services.values().any(|service| matches!(service, Service::Vasprintf | Service::Printf | Service::Vprintf)) {
+        if self.services.values().any(|service| matches!(service, Service::Vasprintf | Service::Printf | Service::Vprintf | Service::Fprintf | Service::Vfprintf)) {
             memory.add_runtime_data(GDTOA_POOL, gdtoa_pool, gdtoa_state.runtime_owner())?;
         }
 
@@ -3683,7 +3698,7 @@ impl NativeExecutor {
         if self.services.values().any(|service| {
             matches!(
                 service,
-                Service::Fprintf | Service::Fflush | Service::File(_) | Service::Abort
+                Service::Fprintf | Service::Vfprintf | Service::Fflush | Service::File(_) | Service::Abort
             )
         }) {
             memory.add(
@@ -5096,13 +5111,13 @@ impl NativeExecutor {
                             .map_err(|e| format!("Stdout byte preparation: {e:?}"))?;
                         let byte = plan.emitted_byte().ok_or("Missing stdout byte")?;
                         stdout_commit(&mut self.stdout_file, &mut self.stdout, &mut memory, &pointer, plan, &[byte], sp, ret)?
-                    } else if matches!(service, Service::Fprintf | Service::Fflush) {
+                    } else if matches!(service, Service::Fflush) {
                         // Validate the live return frame before a sink commit;
                         // return-PC translation was already checked above.
                         if memory.load(sp, 8)? != ret {
                             return Err("Stdio return frame changed before output".into());
                         }
-                        if matches!(service, Service::Fflush) {
+                        {
                             let stream = cpu.registers[7];
                             if stream == crate::stdout_file::FILE_ADDR || (stream == 0 && self.stdout.configured()) {
                                 stdout_flush(&self.stdout_file, &memory)?;
@@ -5124,38 +5139,6 @@ impl NativeExecutor {
                                 }
                             }
                             0
-                        } else {
-                            validate_net_output(
-                                &memory,
-                                crate::guest_stdio::FILE_ADDR + 172,
-                                4,
-                                sp,
-                                ret,
-                            )?;
-                            let registers = [
-                                cpu.registers[2],
-                                cpu.registers[1],
-                                cpu.registers[8],
-                                cpu.registers[9],
-                            ];
-                            let mut index = 0usize;
-                            let mut next = |memory: &Memory<'_>| -> std::result::Result<u64, crate::strings::Fault> {
-                                let current = index;
-                                index = index.checked_add(1).ok_or(crate::strings::Fault::Limit)?;
-                                if let Some(&value) = registers.get(current) {
-                                    return Ok(value);
-                                }
-                                let offset = u64::try_from(current - registers.len()).map_err(|_| crate::strings::Fault::Read)?
-                                    .checked_mul(8).and_then(|offset| offset.checked_add(8)).ok_or(crate::strings::Fault::Read)?;
-                                let address = sp.checked_add(offset).ok_or(crate::strings::Fault::Read)?;
-                                memory.load(address, 8).map_err(|_| crate::strings::Fault::Read)
-                            };
-                            self.stdio.fprintf(
-                                &mut memory,
-                                cpu.registers[7],
-                                cpu.registers[6],
-                                &mut next,
-                            )? as u32 as u64
                         }
                     } else if matches!(service, Service::Puts) {
                         // The registered return target was validated before
@@ -5233,20 +5216,27 @@ impl NativeExecutor {
                             sp,
                             ret,
                         )?
-                    } else if matches!(service, Service::Printf | Service::Vprintf) {
-                        let cursor = if matches!(service, Service::Vprintf) {
-                            crate::printf_args::Cursor::new(cpu.registers[6], 4096)
+                    } else if matches!(service, Service::Printf | Service::Vprintf | Service::Fprintf | Service::Vfprintf) {
+                        let explicit_stream = matches!(service, Service::Fprintf | Service::Vfprintf);
+                        let stream = if explicit_stream { cpu.registers[7] } else { crate::stdout_file::FILE_ADDR };
+                        let format = if explicit_stream { cpu.registers[6] } else { cpu.registers[7] };
+                        let cursor = if matches!(service, Service::Vprintf | Service::Vfprintf) {
+                            crate::printf_args::Cursor::new(if explicit_stream { cpu.registers[2] } else { cpu.registers[6] }, 4096)
                         } else {
                             let gp = [cpu.registers[6], cpu.registers[2], cpu.registers[1], cpu.registers[8], cpu.registers[9]];
                             let fp = std::array::from_fn(|i| u64::from_le_bytes(cpu.vectors[i][..8].try_into().unwrap()));
-                            crate::printf_args::Cursor::from_call(gp, fp, cpu.registers[0] as u8,
-                                sp.checked_add(8).ok_or("Printf stack argument overflow")?, 4096)
+                            let overflow = sp.checked_add(8).ok_or("Printf stack argument overflow")?;
+                            (if explicit_stream {
+                                crate::printf_args::Cursor::from_fprintf_call([gp[1], gp[2], gp[3], gp[4]], fp, cpu.registers[0] as u8, overflow, 4096)
+                            } else {
+                                crate::printf_args::Cursor::from_call(gp, fp, cpu.registers[0] as u8, overflow, 4096)
+                            })
                                 .map_err(|e| format!("Printf call ABI: {e:?}"))?
                         };
                         let mut retained = crate::guest_gdtoa::Retained::default();
-                        printf_stdout_service(
-                            &mut self.stdout_file, &mut self.stdout, &mut memory,
-                            cpu.registers[7], cursor,
+                        printf_stream_service(
+                            &mut self.stdout_file, &mut self.stdout, &mut self.stdio, &mut memory,
+                            stream, format, cursor,
                             self.kernel.as_ref().map(|kernel| kernel.errno_address()), sp, ret,
                             crate::printf_render::HexContext { state: gdtoa_state, retained: &mut retained, mxcsr: &mut cpu.mxcsr },
                         )?

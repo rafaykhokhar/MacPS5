@@ -54,6 +54,29 @@ impl GuestStdio {
     pub fn take_bytes(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.bytes)
     }
+    /// Prepare the owned unbuffered FILE before typed formatting, including
+    /// empty formats and later render failures. No output allocation occurs.
+    pub(crate) fn prepare_formatted(
+        &self,
+        memory: &mut Memory<'_>,
+        guard: impl Fn(&Memory<'_>, u64, usize) -> Result<()>,
+    ) -> Result<()> {
+        self.validate(memory, FILE_ADDR)?;
+        guard(memory, FILE_ADDR + 172, 4)?;
+        memory.store(FILE_ADDR + 172, u32::MAX.into(), 4)
+    }
+    /// Commit exactly one synchronous backend write. Capacity and allocation
+    /// failures are policy diagnostics and leave this call's bytes unchanged.
+    pub(crate) fn write_formatted(&mut self, bytes: &[u8]) -> Result<usize> {
+        let capacity = self.capacity.ok_or("Stderr capture is not configured")?;
+        let total = self.bytes.len().checked_add(bytes.len()).ok_or("Stderr capture overflow")?;
+        if total > capacity {
+            return Err("Stderr capture capacity exhausted; no output committed".into());
+        }
+        self.bytes.try_reserve(bytes.len()).map_err(|_| "Cannot allocate stderr capture")?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
     fn validate(&self, memory: &Memory<'_>, stream: u64) -> Result<usize> {
         let capacity = self.capacity.ok_or("Stderr capture is not configured")?;
         if stream != FILE_ADDR {
