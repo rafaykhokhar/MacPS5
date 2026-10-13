@@ -902,3 +902,29 @@ the first real symbol lookup is verified progress; complete bootstrap, dependenc
 initialization, game main and gameplay have not succeeded on this backend.
 Use the preceding standalone verifier build flags and configured startup command
 to reproduce these boundaries.
+
+## Direct memory-first CMP and TEST
+
+Direct `CMP r/m32,r32`, `CMP r/m64,r64` and the corresponding TEST forms now
+accept a memory first operand. A guarded read supplies the left operand; the
+register operand is captured afterward. CMP preserves subtraction order and
+TEST computes the conjunction; neither writes a destination. A failed read
+preserves flags and all registers. Immediate second operands for these memory
+forms remain unsupported.
+
+`direct_memory_compare_native.rs` passes 81920 native cases with independent
+flag calculations: both operations/widths, all register/base combinations,
+selected signed/unsigned edge values, read-only/unaligned sources and boundary
+faults. 687 library tests, three integration tests, strict Clippy, release build
+and the strict-warning verifier pass. Memory-source arithmetic, register
+arithmetic and INC/DEC regressions pass (process 79939, exit 0).
+
+Configured startup passes the previous CMP boundary and reaches a translation
+miss at image-relative 0x20e9, where the current per-source 16-attempt limit
+rejects further compilation. Process 48307 exits 1 at that explicit budget
+boundary; `/tmp/macps5-memcmp-startup.log` retains the first real dlsym lookup
+followed by `Direct translation attempt budget exhausted`. This requires a
+separate bounded direct-translation budget, not pretending startup completed
+or disabling resource limits. Full startup and gameplay remain unverified.
+Reproduce with the preceding standalone verifier flags and configured startup
+command.

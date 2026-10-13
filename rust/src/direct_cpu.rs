@@ -5,7 +5,15 @@ use crate::{
     decode,
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
-fn register_arithmetic(i: &Instruction) -> bool {
+fn arithmetic_supported(i: &Instruction) -> bool {
+    if i.op0_kind() == OpKind::Memory
+        && matches!(
+            i.code(),
+            Code::Cmp_rm32_r32 | Code::Cmp_rm64_r64 | Code::Test_rm32_r32 | Code::Test_rm64_r64
+        )
+    {
+        return true;
+    }
     if matches!(
         i.code(),
         Code::Inc_rm32 | Code::Inc_rm64 | Code::Dec_rm32 | Code::Dec_rm64
@@ -106,7 +114,7 @@ pub(crate) fn translate_span(
             Code::Mov_r32_rm32 | Code::Mov_rm32_r32 | Code::Mov_r64_rm64 | Code::Mov_rm64_r64 => {}
             _ if i.is_jcc_short_or_near() || i.is_jmp_short_or_near() => {}
             Code::Call_rel32_64 | Code::Call_rm64 | Code::Jmp_rm64 => {}
-            _ if register_arithmetic(&i) => {}
+            _ if arithmetic_supported(&i) => {}
             _ => return Err(format!("Direct lowering unsupported: {:?}", i.code())),
         }
         offset += i.len();
@@ -380,12 +388,21 @@ pub(crate) fn translate_span(
             )?;
             continue;
         }
-        if register_arithmetic(i) {
-            let wide = i.op0_register().size() == 8;
-            let destination = register(i.op0_register(), wide)?;
+        if arithmetic_supported(i) {
+            let memory_first = i.op0_kind() == OpKind::Memory;
+            let wide = if memory_first {
+                i.op1_register().size() == 8
+            } else {
+                i.op0_register().size() == 8
+            };
+            let destination = if memory_first {
+                None
+            } else {
+                Some(register(i.op0_register(), wide)?)
+            };
             if matches!(i.mnemonic(), Mnemonic::Inc | Mnemonic::Dec) {
                 c.load_u64(2, 1)?;
-            } else if i.op1_kind() == OpKind::Memory {
+            } else if memory_first || i.op1_kind() == OpKind::Memory {
                 memory_address(&mut c, i)?;
                 c.emit(0xaa1303e0)?; // mov x0,x19
                 c.load_u64(2, if wide { 8 } else { 4 })?;
@@ -401,7 +418,12 @@ pub(crate) fn translate_span(
                         nonzero: true,
                     },
                 )?;
-                c.emit(0xaa0003e2)?; // mov x2,x0
+                if memory_first {
+                    c.emit(0xaa0003e1)?; // mov x1,x0
+                    c.context_access(2, 19, register(i.op1_register(), wide)? * 8, wide, false)?;
+                } else {
+                    c.emit(0xaa0003e2)?; // mov x2,x0
+                }
             } else if i.op1_kind() == OpKind::Register {
                 c.context_access(2, 19, register(i.op1_register(), wide)? * 8, wide, false)?;
             } else {
@@ -414,7 +436,9 @@ pub(crate) fn translate_span(
                 };
                 c.load_u64(2, immediate)?;
             }
-            c.context_access(1, 19, destination * 8, wide, false)?;
+            if let Some(destination) = destination {
+                c.context_access(1, 19, destination * 8, wide, false)?;
+            }
             let (opcode, operation) = match i.mnemonic() {
                 Mnemonic::Add => (0x0b020023, 1),
                 Mnemonic::Inc => (0x0b020023, 3),
@@ -427,7 +451,13 @@ pub(crate) fn translate_span(
             };
             c.emit(opcode | if wide { 0x80000000 } else { 0 })?;
             if !matches!(i.mnemonic(), Mnemonic::Cmp | Mnemonic::Test) {
-                c.context_access(3, 19, destination * 8, true, true)?;
+                c.context_access(
+                    3,
+                    19,
+                    destination.ok_or("Direct arithmetic needs destination")? * 8,
+                    true,
+                    true,
+                )?;
             }
             c.context_access(0, 19, 136, true, false)?;
             c.load_u64(4, if wide { 64 } else { 32 })?;

@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct CMP/TEST32/64 now supports memory-first, register-second operands without
+modifying either operand. 81920 native cases pass. Configured startup advances
+to 0x20e9 and reaches the current 16-attempt translation budget. See
+[memory-first comparison evidence](../docs/status/TRANSLATOR_READINESS.md#direct-memory-first-cmp-and-test).
+
 Direct register INC/DEC32/64 now preserves carry while updating arithmetic flags.
 12288 native cases pass. Configured startup reaches its first actual
 `sceKernelDlsym` lookup and then stops on a memory-first CMP at 0x3d9. See
