@@ -1325,3 +1325,36 @@ warnings denied. Configured `--direct-startup` passes the former BEXTR block at
 `/tmp/macps5-bextr-{tests,clippy,build,startup}.log` and record the first real dlsym
 lookup. The next gap is byte NOT; bootstrap and PS5 gameplay remain incomplete.
 The startup-only harness skips Metal presentation.
+
+## Direct bitwise NOT
+
+Direct lowering now accepts unlocked NOT on byte/word/dword/qword registers or
+memory. Register forms emit ARM64 MVN with narrow writes for 8/16-bit operands
+and zero-extension for 32-bit destinations. Legacy high-byte registers retain
+their correct position. Memory forms use operation 5 of the guarded integer RMW
+helper; its RHS is ignored and it preserves flags on successful writes as well
+as faults. Read and write failures preserve memory and flags. LOCK forms remain
+explicitly rejected because this helper is not a host atomic operation.
+
+`rust/verification/direct_not_native.rs` uses subtraction from an all-ones mask
+as its independent complement oracle. It checks every register/base encoding,
+legacy high bytes, all four widths, unaligned/final-byte/short/unmapped operands,
+read-only and writable mappings, source values with varied high bits, prior
+faults and zero/one/two instruction budgets. It compares all GPRs, mapped bytes,
+flags, RIP and fault/fuel/stop state. The existing memory-arithmetic verifier is
+also rerun for the shared helper; its invalid-operation case now uses 6 because
+5 is the newly supported NOT operation.
+
+Validation passes: 27648 native NOT cases, 407205 memory-arithmetic regression
+checks, 687 library tests, three integration tests, strict Clippy and release
+build. Both standalone verifiers compile with warnings denied. Reproduce with
+the release rlib/dependency flags above using `direct_not_native.rs` and
+`direct_memory_arithmetic_native.rs`.
+
+Configured `--direct-startup` still reaches the first real dlsym lookup, then
+exits 1 in the span at image-relative 0xa2a with
+`Direct lowering unsupported: VEX_Shrx_r32_rm32_r32`. NOT is accepted during
+translation, but the entire span has not executed. Logs are
+`/tmp/macps5-not-{tests,clippy,build,startup}.log`. The next gap is BMI variable
+shift lowering. Bootstrap and PS5 gameplay remain incomplete; this startup-only
+run skips Metal presentation.

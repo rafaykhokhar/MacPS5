@@ -324,6 +324,8 @@ pub(crate) fn translate_span(
             _ if vector_move(&i).is_some() => {}
             _ if conditional_move(&i) => {}
             _ if memory_arithmetic(&i) => {}
+            Code::Not_rm8 | Code::Not_rm16 | Code::Not_rm32 | Code::Not_rm64
+                if !i.has_lock_prefix() => {}
             Code::VEX_Bextr_r32_rm32_r32 | Code::VEX_Bextr_r64_rm64_r64 => {}
             _ => return Err(format!("Direct lowering unsupported: {:?}", i.code())),
         }
@@ -609,6 +611,50 @@ pub(crate) fn translate_span(
             c.emit(0x9a9f17ea)?; // cset x10,eq
             c.emit(0xaa0a1929)?; // orr x9,x9,x10,lsl #6
             c.context_access(9, 19, 136, true, true)?;
+            continue;
+        }
+        if matches!(
+            i.code(),
+            Code::Not_rm8 | Code::Not_rm16 | Code::Not_rm32 | Code::Not_rm64
+        ) {
+            if i.op0_kind() == OpKind::Memory {
+                memory_address(&mut c, i)?;
+                c.emit(0xaa1303e0)?;
+                c.load_u64(2, 0)?;
+                c.load_u64(3, i.memory_size().size() as u64)?;
+                c.load_u64(4, 5)?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_integer_rmw_v1 as *const () as u64,
+                )?;
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+            } else {
+                let operand = i.op0_register();
+                let size = operand.size();
+                let reg = register(operand.full_register(), true)?;
+                if size == 1 {
+                    c.emit(0x39400260 | (byte_offset(operand)? << 10))?;
+                } else if size == 2 {
+                    c.emit(0x79400260 | ((reg as u32 * 4) << 10))?;
+                } else {
+                    c.context_access(0, 19, reg * 8, size == 8, false)?;
+                }
+                c.emit(if size == 8 { 0xaa2003e0 } else { 0x2a2003e0 })?; // mvn x0/w0
+                if size == 1 {
+                    c.emit(0x39000260 | (byte_offset(operand)? << 10))?;
+                } else if size == 2 {
+                    c.emit(0x79000260 | ((reg as u32 * 4) << 10))?;
+                } else {
+                    c.context_access(0, 19, reg * 8, true, true)?;
+                }
+            }
             continue;
         }
         if memory_arithmetic(i) {

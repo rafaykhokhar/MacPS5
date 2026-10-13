@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct NOT now supports all integer widths for registers and guarded memory,
+preserving flags. 27648 native cases and 407205 shared-helper regression checks
+pass. Startup translates past NOT in the block at 0xa2a but now rejects SHRX32;
+that whole block has not executed. See
+[NOT evidence](../docs/status/TRANSLATOR_READINESS.md#direct-bitwise-not).
+
 Direct BEXTR32/64 now uses ARM64 extraction, selects and masks, with guarded
 memory sources. 1277952 native cases pass, including every start/length control.
 Configured startup passes BEXTR and reaches byte NOT at 0xa2a. See
