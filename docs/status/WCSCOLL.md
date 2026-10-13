@@ -25,5 +25,6 @@ tree passes 502 library tests, three integration tests and strict Clippy.
 
 Startup discovery binds `wcscoll` and reaches missing `wcsxfrm`, retaining 19,488
 dependency bytes before normal failure exit (`wcscoll-startup.log`, 81115).
-That discovery run failed the previous boundary assertion; the updated startup
-assertions are being checked separately. Game main has not executed.
+That discovery run failed the previous boundary assertion. Updated startup-only
+assertions now pass (`wcscoll-startup-verified.log`, 2306 exit0), explicitly
+excluding component regressions and Metal presentation. Game main has not executed.

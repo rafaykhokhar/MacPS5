@@ -10,8 +10,8 @@ Omitting the argument retains the full suite and its presentation-failure gate.
 The matching release now passes 24,614 native `LZCNT32` cases and 32 actual
 `wcscoll_l`/direct C/POSIX cases, plus 502 library tests, three integration tests
 and strict Clippy. Startup discovery resolves `wcscoll` and reaches missing
-`wcsxfrm`, with 19,488 dependency bytes (`wcscoll-startup.log`, 81115); the
-updated boundary assertion rerun is pending. The prior `strxfrm` startup-only
+`wcsxfrm`, with 19,488 dependency bytes. Updated startup-only assertions pass
+(`wcscoll-startup-verified.log`, 2306 exit0). The prior `strxfrm` startup-only
 check passed its ownership assertions (76410). Startup-only checks explicitly
 exclude component regressions and Metal; the last full presentation check still
 failed. No game main has executed.
