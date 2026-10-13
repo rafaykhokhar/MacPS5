@@ -1264,3 +1264,32 @@ now with `Direct lowering unsupported: Mov_rm8_r8`. NOPw is accepted during
 translation, but that entire span has not executed. The next gap is byte MOV
 between registers and memory. Bootstrap and PS5 gameplay remain incomplete;
 these startup-only runs skip Metal presentation.
+
+## Direct byte and word register/memory moves
+
+Direct lowering accepts both encoding directions of byte and word MOV between
+registers and between registers and memory. Narrow ARM64 context loads/stores
+preserve surrounding destination bits, including legacy AH/CH/DH/BH aliases.
+Guest addresses are calculated before a guarded memory helper runs, and register
+loads commit only after fault checking. Stores use the existing complete-range
+write validation and preserve CPU flags and registers on failure. Immediate-word
+and moffs encodings are not added by this change.
+
+`rust/verification/direct_narrow_mov_native.rs` checks both widths and directions,
+legacy and REX register combinations, source/destination aliases, address-base
+aliases, high-byte sources and destinations, read-only/writable mappings,
+unaligned/final-byte/short/unmapped reads and writes, and address overflow.
+The oracle compares all GPRs, the entire mapping, flags and fault/fuel/stop.
+FS/GS and 32-bit memory addressing are explicitly rejected. Reproduce using the
+standalone release rlib/dependency flags above with `direct_narrow_mov_native.rs`.
+
+Validation passes: 84480 native narrow-MOV cases, 687 library tests, three
+integration tests, strict Clippy and release build. The standalone verifier
+compiles with warnings denied.
+
+Configured `--direct-startup` proceeds past the block at image-relative 0x969 and
+exits 1 at 0x99d: `Direct lowering unsupported: VEX_Bextr_r32_rm32_r32`.
+Logs are `/tmp/macps5-narrow-mov-{tests,clippy,build,startup}.log` and still record
+the first real dlsym lookup. The next CPU gap is BMI bit-field extraction.
+Bootstrap and PS5 gameplay remain incomplete; this startup-only run skips Metal
+presentation.

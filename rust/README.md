@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct byte/word MOV now handles register copies and guarded loads/stores while
+preserving surrounding register bits. 84480 native cases pass. Configured startup
+passes the block at 0x969 and reaches BEXTR32 at 0x99d. See
+[narrow MOV evidence](../docs/status/TRANSLATOR_READINESS.md#direct-byte-and-word-registermemory-moves).
+
 Direct unlocked memory ADD/SUB/AND/OR/XOR now supports all four integer widths
 and register/immediate sources, with flags committed only after a successful
 guarded store. 407205 native checks pass. NOPw is also accepted (150 NOP cases).

@@ -307,6 +307,7 @@ pub(crate) fn translate_span(
             Code::Mov_r32_imm32 | Code::Mov_r64_imm64 => {}
             Code::Mov_rm32_imm32 | Code::Mov_rm64_imm32 => {}
             Code::Mov_r8_imm8 | Code::Mov_rm8_imm8 => {}
+            Code::Mov_r8_rm8 | Code::Mov_rm8_r8 | Code::Mov_r16_rm16 | Code::Mov_rm16_r16 => {}
             Code::Movzx_r32_rm8
             | Code::Movzx_r64_rm8
             | Code::Movzx_r32_rm16
@@ -501,6 +502,59 @@ pub(crate) fn translate_span(
                     c.context_access(9, 19, 224 + dst * 32, true, true)?;
                     c.context_access(9, 19, 232 + dst * 32, true, true)?;
                 }
+            }
+            continue;
+        }
+        if matches!(
+            i.code(),
+            Code::Mov_r8_rm8 | Code::Mov_rm8_r8 | Code::Mov_r16_rm16 | Code::Mov_rm16_r16
+        ) {
+            let store = i.op0_kind() == OpKind::Memory;
+            let operand = if store {
+                i.op1_register()
+            } else {
+                i.op0_register()
+            };
+            let byte = operand.size() == 1;
+            let offset = |r: Register| -> Result<u32> {
+                if byte {
+                    byte_offset(r)
+                } else {
+                    Ok(register(r.full_register(), true)? as u32 * 4)
+                }
+            };
+            let load_opcode = if byte { 0x39400260 } else { 0x79400260 };
+            let store_opcode = if byte { 0x39000260 } else { 0x79000260 };
+            if store || i.op1_kind() == OpKind::Memory {
+                memory_address(&mut c, i)?;
+                c.emit(0xaa1303e0)?;
+                if store {
+                    c.emit(load_opcode | 2 | (offset(operand)? << 10))?; // ldrb/ldrh w2
+                    c.load_u64(3, if byte { 1 } else { 2 })?;
+                    c.call_absolute(
+                        crate::guest_memory::ffi::native_ps5_module_store_v1 as *const () as u64,
+                    )?;
+                } else {
+                    c.load_u64(2, if byte { 1 } else { 2 })?;
+                    c.call_absolute(
+                        crate::guest_memory::ffi::native_ps5_module_load_v1 as *const () as u64,
+                    )?;
+                }
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+                if !store {
+                    c.emit(store_opcode | (offset(operand)? << 10))?;
+                }
+            } else {
+                c.emit(load_opcode | (offset(i.op1_register())? << 10))?;
+                c.emit(store_opcode | (offset(i.op0_register())? << 10))?;
             }
             continue;
         }
