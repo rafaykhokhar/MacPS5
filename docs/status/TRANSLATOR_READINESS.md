@@ -1658,3 +1658,29 @@ compiles with warnings denied. Logs are
 `/tmp/macps5-clshift-{tests,clippy,build}.log`. These checks broaden CPU coverage
 beyond the pinned startup path; no new gameplay or startup claim follows from
 them. Full CPU translation and PS5 game execution remain incomplete.
+
+## Direct narrow register shifts
+
+Direct SHL/SHR/SAR now supports 8/16-bit register operands with immediate,
+implicit-one and CL counts. Byte/word loads and stores preserve the surrounding
+register bits; legacy AH/CH/DH/BH and REX low-byte registers use their distinct
+context offsets. SAR sign-extends the original narrow operand to 32 bits before
+the ARM64 shift. Five-bit count masking permits counts at or above the narrow
+width without wrapping at 8 or 16. The flag helper receives the original
+operand width and retains the existing deterministic undefined-flag policy.
+
+`rust/verification/direct_narrow_shift_native.rs` uses an iterative one-bit
+oracle across all byte values, word sign boundaries, all 256 immediate/CL
+counts, implicit-one encodings, and every register encoding with and without
+REX. Cases include CL and CH destination overlap with the count register, and
+check the full GPR bank, flags and fault/fuel/stop state. The existing wider
+shift verifier covers the unchanged 32/64-bit forms on the same release build.
+Reproduce using the release rlib/dependency flags above with
+`direct_narrow_shift_native.rs` and `direct_shift_native.rs`.
+
+Validation passes: 9714168 narrow native state checks, 589830 wider regression
+checks, 687 library tests, three integration tests, strict Clippy and release
+build. Both standalone verifiers compile with warnings denied. Logs are
+`/tmp/macps5-narrowshift-{tests,clippy,build}.log`. Memory shifts remain an
+explicit direct-backend gap. This adds CPU instruction coverage without changing
+the previously observed homebrew library boundary or establishing gameplay.

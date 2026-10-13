@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct SHL/SHR/SAR now also supports 8/16-bit registers with immediate,
+implicit-one and CL counts, preserving partial-register state. 9714168 narrow
+native checks and 589830 wider regression checks pass. Memory shifts remain
+unsupported. See [narrow shift evidence](../docs/status/TRANSLATOR_READINESS.md#direct-narrow-register-shifts).
+
 Direct SHL/SHR/SAR32/64 now accepts CL counts, including ECX/RCX destination
 aliases. 589830 native immediate/CL shift checks pass, along with the library
 and integration suites and strict Clippy. Memory and narrow shifts remain a

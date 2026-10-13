@@ -217,7 +217,7 @@ fn setcc(i: &Instruction) -> bool {
 fn register_shift(i: &Instruction) -> bool {
     matches!(i.mnemonic(), Mnemonic::Shl | Mnemonic::Shr | Mnemonic::Sar)
         && i.op0_kind() == OpKind::Register
-        && matches!(i.op0_register().size(), 4 | 8)
+        && matches!(i.op0_register().size(), 1 | 2 | 4 | 8)
         && (i.op1_kind() == OpKind::Immediate8
             || (i.op1_kind() == OpKind::Register && i.op1_register() == Register::CL))
 }
@@ -1107,9 +1107,19 @@ pub(crate) fn translate_span(
             continue;
         }
         if register_shift(i) {
-            let wide = i.op0_register().size() == 8;
-            let destination = register(i.op0_register(), wide)?;
-            c.context_access(1, 19, destination * 8, wide, false)?;
+            let size = i.op0_register().size();
+            let wide = size == 8;
+            let destination = register(i.op0_register().full_register(), true)?;
+            if size == 1 {
+                c.emit(0x39400261 | (byte_offset(i.op0_register())? << 10))?;
+            } else if size == 2 {
+                c.emit(0x79400261 | ((destination as u32 * 4) << 10))?;
+            } else {
+                c.context_access(1, 19, destination * 8, wide, false)?;
+            }
+            if i.mnemonic() == Mnemonic::Sar && size < 4 {
+                c.emit(if size == 1 { 0x13001c21 } else { 0x13003c21 })?; // SXTB/SXTH w1,w1
+            }
             if i.op1_kind() == OpKind::Register {
                 c.context_access(2, 19, 8, false, false)?; // ECX, captured before a possible ECX/RCX write
                 c.emit(if wide { 0x53001442 } else { 0x53001042 })?; // UBFX w2,w2,#0,#6/#5
@@ -1124,9 +1134,15 @@ pub(crate) fn translate_span(
                 _ => unreachable!(),
             };
             c.emit(opcode | if wide { 0x80000000 } else { 0 })?;
-            c.context_access(3, 19, destination * 8, true, true)?;
+            if size == 1 {
+                c.emit(0x39000263 | (byte_offset(i.op0_register())? << 10))?;
+            } else if size == 2 {
+                c.emit(0x79000263 | ((destination as u32 * 4) << 10))?;
+            } else {
+                c.context_access(3, 19, destination * 8, true, true)?;
+            }
             c.context_access(0, 19, 136, true, false)?;
-            c.load_u64(4, if wide { 64 } else { 32 })?;
+            c.load_u64(4, size as u64 * 8)?;
             c.load_u64(5, operation)?;
             c.call_absolute(crate::shift_flags::native_ps5_shift_flags_v1 as *const () as u64)?;
             c.context_access(0, 19, 136, true, true)?;
