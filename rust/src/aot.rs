@@ -37,6 +37,35 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn packed_equality_forms_and_address_guards() {
+        for (map, opcode) in [(0xe1, 0x74), (0xe1, 0x75), (0xe1, 0x76), (0xe2, 0x29)] {
+            for length in [0, 4] {
+                for operand in [0xc0, 0xc1, 0x07] {
+                    let bytes = [0xc4, map, 0x69 | length, opcode, operand];
+                    assert!(super::translate_rust_memory_region(&bytes, 0, "equal").is_ok());
+                }
+                for prefix in [0x64, 0x65, 0x67] {
+                    let bytes = [prefix, 0xc4, map, 0x69 | length, opcode, 0x07];
+                    assert!(super::translate_rust_memory_region(&bytes, 0, "address").is_err());
+                }
+                let bytes = [
+                    0x67,
+                    0xc4,
+                    map,
+                    0x69 | length,
+                    opcode,
+                    0x04,
+                    0x25,
+                    0,
+                    0,
+                    0,
+                    0,
+                ];
+                assert!(super::translate_rust_memory_region(&bytes, 0, "address").is_err());
+            }
+        }
+    }
+    #[test]
     fn packed_immediate_shift_forms() {
         for opcode in [0x71, 0x72, 0x73] {
             for operation in [2, 4, 6] {
@@ -872,6 +901,56 @@ impl Emitter {
                     216 + merge * 32, 208 + dst * 32, 216 + dst * 32,
                     224 + dst * 32, 232 + dst * 32
                 ));
+            }
+            M::Vpcmpeqb | M::Vpcmpeqw | M::Vpcmpeqd | M::Vpcmpeqq => {
+                use iced_x86::Code;
+                let (lane_size, wide, lanes) = match i.code() {
+                    Code::VEX_Vpcmpeqb_xmm_xmm_xmmm128 => (1, false, "16b"),
+                    Code::VEX_Vpcmpeqb_ymm_ymm_ymmm256 => (1, true, "16b"),
+                    Code::VEX_Vpcmpeqw_xmm_xmm_xmmm128 => (2, false, "8h"),
+                    Code::VEX_Vpcmpeqw_ymm_ymm_ymmm256 => (2, true, "8h"),
+                    Code::VEX_Vpcmpeqd_xmm_xmm_xmmm128 => (4, false, "4s"),
+                    Code::VEX_Vpcmpeqd_ymm_ymm_ymmm256 => (4, true, "4s"),
+                    Code::VEX_Vpcmpeqq_xmm_xmm_xmmm128 => (8, false, "2d"),
+                    Code::VEX_Vpcmpeqq_ymm_ymm_ymmm256 => (8, true, "2d"),
+                    _ => return Err("Only VEX packed integer equality is implemented".into()),
+                };
+                let dst = vector(i.op0_register())?;
+                let first = vector(i.op1_register())?;
+                if i.op2_kind() == OpKind::Memory {
+                    if i.memory_base() == R::None
+                        && i.memory_index() == R::None
+                        && i.memory_displ_size() != 8
+                    {
+                        return Err("32-bit absolute addressing is not implemented".into());
+                    }
+                    self.address(i)?;
+                    self.emit(format!(
+                        "mov x0, x19\nmov x2, #{dst}\nmov x3, #{first}\nmov x4, #{}\nmov x5, #{lane_size}\nbl _native_ps5_module_vector_cmpeq_v1",
+                        if wide { 32 } else { 16 }
+                    ));
+                    self.fault();
+                } else {
+                    let second = vector(i.op2_register())?;
+                    self.emit(format!(
+                        "ldr q0, [x19, #{}]\nldr q1, [x19, #{}]\ncmeq v0.{lanes}, v0.{lanes}, v1.{lanes}",
+                        208 + first * 32, 208 + second * 32
+                    ));
+                    if wide {
+                        self.emit(format!(
+                            "ldr q2, [x19, #{}]\nldr q3, [x19, #{}]\ncmeq v2.{lanes}, v2.{lanes}, v3.{lanes}",
+                            224 + first * 32, 224 + second * 32
+                        ));
+                    } else {
+                        self.emit("movi v2.16b, #0");
+                    }
+                    // Both inputs are captured before any aliased destination.
+                    self.emit(format!(
+                        "str q0, [x19, #{}]\nstr q2, [x19, #{}]",
+                        208 + dst * 32,
+                        224 + dst * 32
+                    ));
+                }
             }
             M::Vpcmpgtd => {
                 if i.code() != iced_x86::Code::VEX_Vpcmpgtd_ymm_ymm_ymmm256 {

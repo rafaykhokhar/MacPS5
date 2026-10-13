@@ -582,7 +582,8 @@ impl<'a> Memory<'a> {
         let index = self.region(address, N)?;
         let region = &mut self.regions[index];
         let offset = (address - region.address) as usize;
-        (&mut region.bytes[offset..offset + N]).try_into()
+        (&mut region.bytes[offset..offset + N])
+            .try_into()
             .map_err(|_| "Guest write borrow size mismatch".into())
     }
     /// Bounded libc memcpy. Validate both full ranges before committing output;
@@ -742,6 +743,36 @@ pub fn vector_cmpgtd256(
     vectors[destination as usize] = result;
     Ok(())
 }
+/// Compare packed integer lanes after validating the complete memory operand.
+/// A 128-bit result clears the destination's modeled upper 128 bits.
+pub fn vector_cmpeq(
+    memory: &Memory<'_>,
+    vectors: &mut [[u8; 32]; 16],
+    address: u64,
+    destination: u64,
+    first: u64,
+    size: u64,
+    lane_size: u64,
+) -> Result<()> {
+    vector_operand(address, destination, size, 0)?;
+    if first >= 16 || ![1, 2, 4, 8].contains(&lane_size) {
+        return Err("Invalid packed equality operand".into());
+    }
+    let source = memory.read(address, size as usize)?;
+    let mut result = [0; 32];
+    for start in (0..size as usize).step_by(lane_size as usize) {
+        let end = start + lane_size as usize;
+        result[start..end].fill(
+            if vectors[first as usize][start..end] == source[start..end] {
+                0xff
+            } else {
+                0
+            },
+        );
+    }
+    vectors[destination as usize] = result;
+    Ok(())
+}
 pub fn vector_xor(
     memory: &Memory<'_>,
     vectors: &mut [[u8; 32]; 16],
@@ -861,6 +892,39 @@ pub mod ffi {
     /// # Safety
     /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
     #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn native_ps5_module_vector_cmpeq_v1(
+        cpu: *mut Cpu,
+        address: u64,
+        destination: u64,
+        first: u64,
+        size: u64,
+        lane_size: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if cpu.memory != 0
+            && vector_cmpeq(
+                unsafe { &*(cpu.memory as *const Memory<'_>) },
+                &mut cpu.vectors,
+                address,
+                destination,
+                first,
+                size,
+                lane_size,
+            )
+            .is_ok()
+        {
+            return;
+        }
+        cpu.fault = 1;
+    }
+    /// # Safety
+    /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
+    #[unsafe(no_mangle)]
     pub unsafe extern "C" fn native_ps5_module_vector_cmpgtd256_v1(
         cpu: *mut Cpu,
         address: u64,
@@ -937,6 +1001,112 @@ pub mod ffi {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn packed_equality_all_widths_and_aliases() {
+        for size in [16usize, 32] {
+            for lane in [1usize, 2, 4, 8] {
+                for destination in [3usize, 15] {
+                    let first = 15;
+                    let mut vectors = [[0xa5; 32]; 16];
+                    vectors[first] = std::array::from_fn(|i| (i * 17 + 129) as u8);
+                    let mut data = vectors[first];
+                    let mut expected = [0; 32];
+                    for start in (0..size).step_by(lane) {
+                        if start / lane % 2 == 0 {
+                            expected[start..start + lane].fill(0xff);
+                        } else {
+                            // Last-byte mismatches catch partial-lane comparisons.
+                            data[start + lane - 1] ^= 1;
+                        }
+                    }
+                    let mut memory = Memory::default();
+                    memory
+                        .add(0x1_0000_0001, &mut data[..size], false, false)
+                        .unwrap();
+                    let mut all_expected = vectors;
+                    all_expected[destination] = expected;
+                    vector_cmpeq(
+                        &memory,
+                        &mut vectors,
+                        0x1_0000_0001,
+                        destination as u64,
+                        first as u64,
+                        size as u64,
+                        lane as u64,
+                    )
+                    .unwrap();
+                    assert_eq!(vectors, all_expected);
+                }
+            }
+        }
+    }
+    #[test]
+    fn packed_equality_rejects_parameters_and_incomplete_spans_atomically() {
+        let original = [[0xa5; 32]; 16];
+        for size in [16u64, 32] {
+            for lane in [1, 2, 4, 8] {
+                for length in 0..size as usize {
+                    let mut data = vec![0xa5; length];
+                    let mut memory = Memory::default();
+                    if length != 0 {
+                        memory.add(0x1001, &mut data, false, false).unwrap();
+                    }
+                    let mut vectors = original;
+                    assert!(vector_cmpeq(&memory, &mut vectors, 0x1001, 0, 0, size, lane).is_err());
+                    assert_eq!(vectors, original);
+                }
+            }
+        }
+        let mut data = [0xa5; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        for (dst, first, size, lane) in [
+            (16, 0, 16, 1),
+            (0, 16, 16, 1),
+            (u64::MAX, 0, 16, 1),
+            (0, u64::MAX, 16, 1),
+            (0, 0, 0, 1),
+            (0, 0, 8, 1),
+            (0, 0, 64, 1),
+            (0, 0, u64::MAX, 1),
+            (0, 0, 16, 0),
+            (0, 0, 16, 3),
+            (0, 0, 16, 16),
+            (0, 0, 16, u64::MAX),
+        ] {
+            let mut vectors = original;
+            assert!(vector_cmpeq(&memory, &mut vectors, 0x1001, dst, first, size, lane).is_err());
+            assert_eq!(vectors, original);
+        }
+    }
+    #[test]
+    #[allow(unsafe_code)]
+    fn packed_equality_ffi_preserves_prior_fault_and_guards_missing_memory() {
+        use crate::legacy_cpu::Cpu;
+        let mut cpu = Cpu {
+            vectors: [[0xa5; 32]; 16],
+            ..Cpu::default()
+        };
+        for fault in [0, 2, 13] {
+            cpu.fault = fault;
+            unsafe { ffi::native_ps5_module_vector_cmpeq_v1(&mut cpu, 0x1000, 0, 0, 32, 4) };
+            assert_eq!(cpu.fault, if fault == 0 { 1 } else { fault });
+            assert_eq!(cpu.vectors, [[0xa5; 32]; 16]);
+        }
+        let mut data = [0xa5; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut data, false, false).unwrap();
+        cpu.memory = (&mut memory as *mut Memory<'_>) as u64;
+        cpu.fault = 0;
+        unsafe { ffi::native_ps5_module_vector_cmpeq_v1(&mut cpu, 0x1000, 0, 0, 16, 8) };
+        assert_eq!(cpu.fault, 0);
+        assert_eq!(&cpu.vectors[0][..16], &[0xff; 16]);
+        assert_eq!(&cpu.vectors[0][16..], &[0; 16]);
+        let before = cpu.vectors;
+        unsafe { ffi::native_ps5_module_vector_cmpeq_v1(&mut cpu, 0x1000, 0, 0, 16, 3) };
+        assert_eq!(cpu.fault, 1);
+        assert_eq!(cpu.vectors, before);
+    }
     #[test]
     fn packed_compare_full_span_and_bad_registers_preserve_destination() {
         for length in 1..32 {

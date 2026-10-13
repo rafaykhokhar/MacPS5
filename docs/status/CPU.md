@@ -1,5 +1,36 @@
 # CPU completion criteria
 
+## Packed integer equality
+
+VEX VPCMPEQB/W/D/Q now support XMM and YMM register or memory operands.
+Each equal lane becomes all ones, each unequal lane zero. Register forms
+lower directly to ARM64 CMEQ; memory forms validate the complete 16/32-byte
+operand before committing any vector lane. Both preserve flags and FP state,
+capture source aliases safely, and clear upper YMM bits for XMM results.
+The helper validates register indices, vector sizes and lane sizes before
+mutation. Architectural alignment-check exceptions remain outside the current
+guarded-memory model; legacy/EVEX and FS/GS/address32 remain unsupported.
+
+Reference: AMD APM Volume 4 rev.3.24 pp.300–307
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)).
+The matching build passes 614 library tests, three integration tests, strict
+Clippy and release compilation (`work/packed-equal-native/{tests,clippy,release}.log`,
+process 14239 exit 0). The [native verifier](../../rust/verification/packed_equal_native.rs)
+passes 20,088 comparisons across 96 decoded fixtures, covering every individual
+bit mismatch, randomized/mixed equal lanes, source/destination aliases, high
+registers, WIG, exact-end readonly high/unaligned/RIP loads, all short spans,
+fault atomicity, flags/FP and execution guards. Unit tests additionally exercise
+invalid helper parameters and FFI failure preservation
+(`work/packed-equal-native/native.log`, process 41037 exit 0).
+
+Pinned discovery reaches 55,597 instructions in 12,667 blocks. Thirteen former
+comparison boundaries disappear and twelve new stops become reachable, leaving
+206 unsupported boundaries. The combined verifier compiles and its startup-only
+run retains the expected missing `fscanf` exit: ten named dependencies accepted,
+20,288 dependency bytes owned, cleanup pending and game main not executed
+(`work/packed-equal-native/entry.log`, process 41037 exit 0).
+These component checks do not establish full CPU or retail-game compatibility.
+
 ## Packed immediate shifts
 
 VEX immediate VPSLLW/D/Q, VPSRLW/D/Q and VPSRAW/D now support both XMM and

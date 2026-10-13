@@ -1,5 +1,11 @@
 # Rust migration
 
+VEX packed equality comparisons cover B/W/D/Q lanes for XMM/YMM, with guarded
+full-width memory reads and atomic destination updates. The matching build
+passes 614 library tests, three integration tests, strict Clippy and 20,088 native
+checks. Discovery reaches 55,597 instructions; startup remains before game main
+at missing `fscanf`. See [CPU evidence](../docs/status/CPU.md).
+
 VEX packed immediate shifts now cover logical left/right W/D/Q and arithmetic
 right W/D for XMM/YMM destinations. The build passes 610 library tests, three
 integration tests, strict Clippy, 79,296 new native checks and 82,005 existing
