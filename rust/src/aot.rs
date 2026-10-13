@@ -37,6 +37,15 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn scalar_move_absolute_address_guard() {
+        for prefix in [0x7a, 0x7b] {
+            for opcode in [0x10, 0x11] {
+                let bytes = [0x67, 0xc4, 0xe1, prefix, opcode, 0x04, 0x25, 0, 0, 0, 0];
+                assert!(super::translate_rust_memory_region(&bytes, 0, "address").is_err());
+            }
+        }
+    }
+    #[test]
     fn packed_double_move_absolute_address_guard() {
         for opcode in [0x10, 0x11, 0x28, 0x29] {
             for length in [0, 4] {
@@ -2417,18 +2426,54 @@ impl Emitter {
                     self.write(i, 0, scalar_width, 20)?;
                 }
             }
-            M::Vmovsd => {
-                if i.code() != iced_x86::Code::VEX_Vmovsd_xmm_m64 {
-                    return Err("Only VEX VMOVSD m64-to-XMM is implemented".into());
+            M::Vmovss | M::Vmovsd => {
+                use iced_x86::Code;
+                let scalar_width = match i.code() {
+                    Code::VEX_Vmovss_xmm_xmm_xmm
+                    | Code::VEX_Vmovss_xmm_xmm_xmm_0F11
+                    | Code::VEX_Vmovss_xmm_m32
+                    | Code::VEX_Vmovss_m32_xmm => 32,
+                    Code::VEX_Vmovsd_xmm_xmm_xmm
+                    | Code::VEX_Vmovsd_xmm_xmm_xmm_0F11
+                    | Code::VEX_Vmovsd_xmm_m64
+                    | Code::VEX_Vmovsd_m64_xmm => 64,
+                    _ => return Err("Only VEX scalar single/double moves are implemented".into()),
+                };
+                if (i.op0_kind() == OpKind::Memory || i.op1_kind() == OpKind::Memory)
+                    && i.memory_base() == R::None
+                    && i.memory_index() == R::None
+                    && i.memory_displ_size() != 8
+                {
+                    return Err("32-bit absolute addressing is not implemented".into());
                 }
-                let dst = vector(i.op_register(0))?;
-                self.read(i, 1, 64, 20)?;
-                // Memory form clears bits255:64. Commit after guarded load;
-                // integer bit-copy preserves NaN payloads without FP exceptions.
-                self.emit(format!(
-                    "str x20, [x19, #{}]\nstr xzr, [x19, #{}]\nstr xzr, [x19, #{}]\nstr xzr, [x19, #{}]",
-                    208 + dst * 32, 216 + dst * 32, 224 + dst * 32, 232 + dst * 32
-                ));
+                if i.op0_kind() == OpKind::Memory {
+                    let src = vector(i.op1_register())?;
+                    self.emit(format!(
+                        "ldr {}20, [x19, #{}]",
+                        if scalar_width == 32 { "w" } else { "x" },
+                        208 + src * 32
+                    ));
+                    self.write(i, 0, scalar_width, 20)?;
+                } else {
+                    let dst = vector(i.op0_register())?;
+                    if i.op1_kind() == OpKind::Memory {
+                        self.read(i, 1, scalar_width, 20)?;
+                        // Guarded scalar read zero-extends; clear every bit
+                        // above the scalar after a successful access.
+                        self.emit(format!("str x20, [x19, #{}]\nstr xzr, [x19, #{}]\nstr xzr, [x19, #{}]\nstr xzr, [x19, #{}]",208+dst*32,216+dst*32,224+dst*32,232+dst*32));
+                    } else {
+                        let first = vector(i.op1_register())?;
+                        let second = vector(i.op2_register())?;
+                        let (reg, element) = if scalar_width == 32 {
+                            ("w", "s")
+                        } else {
+                            ("x", "d")
+                        };
+                        // Both opcode directions are normalized by the decoder.
+                        // Capture merge and scalar inputs before aliasing writes.
+                        self.emit(format!("ldr q0, [x19, #{}]\nldr {reg}9, [x19, #{}]\nins v0.{element}[0], {reg}9\nmovi v1.16b, #0\nstr q0, [x19, #{}]\nstr q1, [x19, #{}]",208+first*32,208+second*32,208+dst*32,224+dst*32));
+                    }
+                }
             }
             M::Movdqu => {
                 if !matches!(
@@ -3108,7 +3153,7 @@ mod tests {
 mod scalar_vmovsd_tests {
     use super::*;
     #[test]
-    fn observed_scalar_memory_load_only() {
+    fn scalar_memory_load_and_extended_move_forms() {
         for bytes in [
             &[0xc5, 0xfb, 0x10, 0x05, 0x2a, 0xdd, 0x1c, 0][..],
             &[0xc5, 0x7b, 0x10, 0x3f][..],
@@ -3117,9 +3162,8 @@ mod scalar_vmovsd_tests {
             assert_eq!(instruction.code(), iced_x86::Code::VEX_Vmovsd_xmm_m64);
             assert!(supported(&instruction).is_ok());
         }
-        // Scalar store and register merge forms remain explicitly unsupported.
-        assert!(translate_rust_memory_region(&[0xc5, 0xfb, 0x11, 0x07], 0, "no_store").is_err());
-        assert!(translate_rust_memory_region(&[0xc5, 0xf3, 0x10, 0xc2], 0, "no_merge").is_err());
+        assert!(translate_rust_memory_region(&[0xc5, 0xfb, 0x11, 0x07], 0, "store").is_ok());
+        assert!(translate_rust_memory_region(&[0xc5, 0xf3, 0x10, 0xc2], 0, "merge").is_ok());
     }
 }
 #[cfg(test)]

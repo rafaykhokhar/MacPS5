@@ -1,5 +1,45 @@
 # CPU completion criteria
 
+## Scalar single/double moves
+
+VEX VMOVSS and VMOVSD now support all eight decoded memory and register-merge
+forms, extending the previous VMOVSD memory-load-only implementation. Loads
+copy exactly four/eight guarded bytes and clear all higher destination bits.
+Stores copy exactly the scalar and preserve the source. Register forms take
+the low scalar from the second source and the remainder of bits127:0 from
+the first, then clear bits255:128. Both opcode directions use the decoder's
+normalized operands, and input snapshots preserve aliases. All operations
+copy raw bits, without floating-point arithmetic.
+
+Reference: AMD APM Volume 4 rev.3.24 pp.224–225 and 230–231
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)),
+including ignored W/L encoding fields. Legacy/EVEX, reserved memory-form vvvv
+and unsupported FS/GS/address32 forms remain rejected. Architectural
+alignment-control behavior and full fault delivery remain outside the guard
+model.
+
+The matching build passes 674 library tests, three integration tests, strict
+Clippy and release compilation (`work/scalar-move-native/{tests,clippy,release}.log`,
+process 44622 exit 0). The old load-only test's store/merge rejection assertions
+were updated to the newly supported behavior. The
+[native verifier](../../rust/verification/scalar_move_native.rs) passes 80,952
+checks across 192 decoded fixtures: all W/L combinations, both register opcode
+directions, merge ordering, aliases/high registers, raw FP bits/random data,
+exact readonly loads/writable stores with sentinels, high/unaligned/RIP
+operands, every short span, readonly stores and flags/FP/fuel/prior faults.
+The existing VMOVSD verifier (including its MXCSR and signed32 VCVTSI2SD checks)
+also passes (`work/scalar-move-native/{native,regression}.log`, process 16051
+exit 0).
+
+Discovery reaches 57,838 instructions and 13,101 blocks with 142 unsupported
+sites: six old stops removed and six later stops exposed. These counts do not
+establish CPU completion. The entry runner compiles with warnings denied;
+startup-only verification passes at the missing `fscanf` boundary, with ten
+accepted dependencies, 20,288 owned dependency bytes and pending cleanup.
+Game main has not executed (`work/scalar-move-native/entry.log`, process 34889
+exit 0). No full GPU suite was run for this CPU change. Production readiness
+and retail gameplay remain unverified.
+
 ## Packed double moves
 
 VEX VMOVAPD and VMOVUPD now support their eight XMM/YMM load/store encodings,

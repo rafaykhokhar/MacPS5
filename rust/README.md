@@ -1,5 +1,14 @@
 # Rust migration
 
+VEX VMOVSS/VMOVSD now support eight scalar memory/register forms, including
+register merging, load zeroing and exact four/eight-byte stores. The matching
+build passes 674 library tests, three integration tests, strict Clippy, 80,952
+native checks and the existing VMOVSD regression. Discovery reaches 57,838
+instructions with 142 unsupported sites: six old stops removed, six new ones
+exposed. Startup remains at missing `fscanf`, before game main. See
+[CPU evidence](../docs/status/CPU.md). Production readiness and retail gameplay
+remain unverified.
+
 VEX VMOVAPD/VMOVUPD now support eight XMM/YMM load/store forms with guarded
 copies and the required aligned/unaligned distinction. The matching build
 passes 673 library tests, three integration tests, strict Clippy, 38,016 native
