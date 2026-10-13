@@ -3,6 +3,94 @@
 //! Rev.3.31 pp.315/318/334 specifies CF as the last shifted-out bit, including
 //! narrow counts at/beyond width. Rotate counts are masked before width reduction.
 use crate::arithmetic::FlagsResult;
+
+/// SHLD/SHRD. Architecturally undefined word counts 17..31 preserve value/flags.
+pub fn double_shift(
+    old: u64,
+    value: u64,
+    source: u64,
+    raw: u64,
+    bits: u64,
+    right: bool,
+) -> Option<(u64, u64)> {
+    if ![16, 32, 64].contains(&bits) {
+        return None;
+    }
+    let mask = u64::MAX >> (64 - bits);
+    let value = value & mask;
+    let source = source & mask;
+    let count = raw & if bits == 64 { 63 } else { 31 };
+    if count == 0 || count > bits {
+        return Some((value, old));
+    }
+    let result = if right {
+        (((u128::from(source) << bits) | u128::from(value)) >> count) as u64 & mask
+    } else {
+        ((((u128::from(value) << bits) | u128::from(source)) << count) >> bits) as u64 & mask
+    };
+    let mut f = flags(old, value, count, result, bits, u64::from(right)).flags;
+    if count == 1 {
+        f = (f & !0x800) | ((((value ^ result) >> (bits - 1)) & 1) << 11);
+    }
+    Some((result, f))
+}
+
+/// # Safety
+/// CPU and its Memory must be live, exclusive and disjoint for this call.
+/// Mode is 0 for a register slot, 1 for guarded memory; right must be 0 or 1.
+#[allow(unsafe_code)]
+pub unsafe extern "C" fn native_double_shift(
+    cpu: *mut crate::legacy_cpu::Cpu,
+    target: u64,
+    source: u64,
+    raw: u64,
+    size: u64,
+    right: u64,
+    mode: u64,
+) {
+    let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+        return;
+    };
+    if cpu.fault != 0 {
+        return;
+    }
+    if ![2, 4, 8].contains(&size) || right > 1 || mode > 1 || (mode == 0 && target >= 16) {
+        cpu.fault = 3;
+        return;
+    }
+    let value = if mode == 0 {
+        cpu.registers[target as usize]
+    } else {
+        if cpu.memory == 0 {
+            cpu.fault = 1;
+            return;
+        }
+        match unsafe { &*(cpu.memory as *const crate::guest_memory::Memory<'_>) }.load(target, size)
+        {
+            Ok(v) => v,
+            Err(_) => {
+                cpu.fault = 1;
+                return;
+            }
+        }
+    };
+    let (result, flags) =
+        double_shift(cpu.flags, value, source, raw, size * 8, right != 0).unwrap();
+    if mode == 0 {
+        cpu.registers[target as usize] = if size == 2 {
+            (value & !0xffff) | result
+        } else {
+            result
+        };
+    } else if unsafe { &mut *(cpu.memory as *mut crate::guest_memory::Memory<'_>) }
+        .store(target, result, size)
+        .is_err()
+    {
+        cpu.fault = 2;
+        return;
+    }
+    cpu.flags = flags;
+}
 /// Rotate a width+carry ring. Undefined multi-bit OF retains its old value.
 pub fn rotate_carry(old: u64, value: u64, raw: u64, bits: u32, right: bool) -> Option<(u64, u64)> {
     if ![8, 16, 32, 64].contains(&bits) {

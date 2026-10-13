@@ -5,6 +5,12 @@ use crate::{
     decode,
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
+fn double_shift(i: &Instruction) -> bool {
+    matches!(i.mnemonic(), Mnemonic::Shld | Mnemonic::Shrd)
+        && i.encoding() == iced_x86::EncodingKind::Legacy
+        && !i.has_lock_prefix()
+        && matches!(i.op1_register().size(), 2 | 4 | 8)
+}
 fn bit_test(i: &Instruction) -> bool {
     matches!(
         i.mnemonic(),
@@ -495,6 +501,7 @@ pub(crate) fn translate_span(
             Code::Bswap_r32 | Code::Bswap_r64 => {}
             _ if bit_scan(&i) => {}
             _ if bit_test(&i) => {}
+            _ if double_shift(&i) => {}
             Code::Clc | Code::Stc | Code::Cmc | Code::Cld | Code::Std | Code::Lahf | Code::Sahf => {
             }
             Code::VEX_Andn_r32_r32_rm32 | Code::VEX_Andn_r64_r64_rm64 => {}
@@ -1095,6 +1102,41 @@ pub(crate) fn translate_span(
                 })?;
             }
             c.context_access(9, 19, 136, true, true)?;
+            continue;
+        }
+        if double_shift(i) {
+            let memory = i.op0_kind() == OpKind::Memory;
+            if memory {
+                memory_address(&mut c, i)?;
+            } else {
+                c.load_u64(1, register(i.op0_register().full_register(), true)? as u64)?;
+            }
+            c.context_access(
+                2,
+                19,
+                register(i.op1_register().full_register(), true)? * 8,
+                true,
+                false,
+            )?;
+            if i.op2_kind() == OpKind::Immediate8 {
+                c.load_u64(3, i.immediate8() as u64)?;
+            } else {
+                c.context_access(3, 19, 8, true, false)?; // count from CL, masked by helper
+            }
+            c.emit(0xaa1303e0)?;
+            c.load_u64(4, i.op1_register().size() as u64)?;
+            c.load_u64(5, u64::from(i.mnemonic() == Mnemonic::Shrd))?;
+            c.load_u64(6, u64::from(memory))?;
+            c.call_absolute(crate::shift_flags::native_double_shift as *const () as u64)?;
+            c.context_access(9, 19, 152, true, false)?;
+            c.branch(
+                EXIT,
+                Branch::CompareZero {
+                    register: 9,
+                    wide: true,
+                    nonzero: true,
+                },
+            )?;
             continue;
         }
         if bit_test(i) {

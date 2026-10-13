@@ -2142,3 +2142,33 @@ warnings denied; reproduce with the release rlib/dependency flags above using
 `direct_flags_native.rs`. Logs are `/tmp/macps5-flags-{tests,clippy,build}.log`.
 This establishes these flag operations within the direct backend, not full
 CPU readiness, string-instruction support or PS5 gameplay.
+
+## Direct double-width shifts
+
+Direct SHLD/SHRD supports 16/32/64-bit register or guarded-memory destinations,
+a register source and immediate or CL counts. The native Rust helper combines
+the two operands using u128 arithmetic. Counts are masked to five bits (word
+and dword) or six bits (qword). Defined CF/SF/ZF/PF and single-bit OF are
+updated; AF and multi-bit OF are preserved deterministically. Zero counts
+preserve flags. Word counts 17..31 have undefined result and flags; the helper
+deterministically preserves the original word and flags. These boundaries
+follow the [Intel instruction reference](https://cdrdv2-public.intel.com/671110/325383-sdm-vol-2abcd.pdf).
+
+Sources and count are captured before destination writes. Word writes preserve
+upper bits; dword writes zero-extend. Memory writes are guarded even for a
+masked-zero count, and read/write faults preserve destination and flags.
+LOCK-prefixed forms are rejected.
+
+`rust/verification/direct_double_shift_native.rs` independently shifts arrays
+of individual bits one step at a time. Checks cover every source/destination
+or base register pair, CL aliases, both directions, all widths, count and
+sign boundaries, every immediate count, single-bit inputs, zero/one/patterned
+data, unaligned and short reads, overflowing addresses and read-only writes.
+Full GPR, flags, memory, RIP and fault/fuel/stop state are compared.
+
+Validation passes: 927744 native cases and explicit LOCK rejection, 687 library
+tests, three integration tests, strict Clippy and release build. The standalone
+verifier compiles with warnings denied; reproduce using the release rlib and
+dependency flags above with `direct_double_shift_native.rs`. Logs are
+`/tmp/macps5-double-shift-{tests,clippy,build}.log`. These scoped checks do not
+establish production CPU readiness or PS5 gameplay.

@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct SHLD/SHRD now supports 16/32/64-bit registers and guarded memory with
+immediate or CL counts. All 927744 native cases pass, along with library and
+integration tests and strict Clippy. See
+[double-shift evidence](../docs/status/TRANSLATOR_READINESS.md#direct-double-width-shifts).
+
 Direct CLC/STC/CMC/CLD/STD/LAHF/SAHF now emits ARM64 flag and AH updates.
 All 638976 native state checks pass, alongside library/integration tests and
 strict Clippy. See [flag-control evidence](../docs/status/TRANSLATOR_READINESS.md#direct-flag-control).
