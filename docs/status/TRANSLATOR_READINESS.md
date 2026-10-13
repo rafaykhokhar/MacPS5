@@ -1293,3 +1293,35 @@ Logs are `/tmp/macps5-narrow-mov-{tests,clippy,build,startup}.log` and still rec
 the first real dlsym lookup. The next CPU gap is BMI bit-field extraction.
 Bootstrap and PS5 gameplay remain incomplete; this startup-only run skips Metal
 presentation.
+
+## Direct BEXTR bit-field extraction
+
+Direct lowering now accepts the VEX32/64 BEXTR forms with register or guarded
+memory data sources and a register control. The implementation emits ARM64
+UBFX, conditional selects, shifts and masks: start and length come from the low
+two control bytes, length is clipped to the remaining source bits, and empty or
+out-of-range fields yield zero. Both inputs are captured before the destination
+write. Results zero-extend for BEXTR32. CF/OF clear, ZF reflects the result, and
+the runtime retains undefined SF/AF/PF as the existing AOT implementation does.
+A memory source is read even for a zero-length field; read failure preserves the
+destination and flags. XOP/immediate BEXTR forms remain unsupported.
+
+All 17 raw instruction encodings used in the extraction/flag sequence were
+compared with Apple clang's ARM64 assembler and otool section bytes
+(`/tmp/macps5-bextr-encoding.s` and `.o`). The independent native verifier
+`rust/verification/direct_bextr_native.rs` uses a per-bit extraction oracle,
+exercises all 65536 start/length controls at both widths with six input patterns,
+and checks all GPR destination/source/control combinations, aliases, ignored
+high control bits, unaligned and short memory operands, and address overflow.
+It compares the complete GPR bank, flags, mapped bytes and fault/fuel/stop.
+Reproduce with the standalone release rlib/dependency flags above using
+`direct_bextr_native.rs`.
+
+Validation passes: 1277952 native BEXTR cases, 687 library tests, three integration
+tests, strict Clippy and release build. The standalone verifier compiles with
+warnings denied. Configured `--direct-startup` passes the former BEXTR block at
+0x99d and exits 1 at image-relative 0xa2a with
+`Direct lowering unsupported: Not_rm8`. Logs are
+`/tmp/macps5-bextr-{tests,clippy,build,startup}.log` and record the first real dlsym
+lookup. The next gap is byte NOT; bootstrap and PS5 gameplay remain incomplete.
+The startup-only harness skips Metal presentation.

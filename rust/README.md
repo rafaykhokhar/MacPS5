@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct BEXTR32/64 now uses ARM64 extraction, selects and masks, with guarded
+memory sources. 1277952 native cases pass, including every start/length control.
+Configured startup passes BEXTR and reaches byte NOT at 0xa2a. See
+[BEXTR evidence](../docs/status/TRANSLATOR_READINESS.md#direct-bextr-bit-field-extraction).
+
 Direct byte/word MOV now handles register copies and guarded loads/stores while
 preserving surrounding register bits. 84480 native cases pass. Configured startup
 passes the block at 0x969 and reaches BEXTR32 at 0x99d. See

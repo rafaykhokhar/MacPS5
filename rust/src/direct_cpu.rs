@@ -324,6 +324,7 @@ pub(crate) fn translate_span(
             _ if vector_move(&i).is_some() => {}
             _ if conditional_move(&i) => {}
             _ if memory_arithmetic(&i) => {}
+            Code::VEX_Bextr_r32_rm32_r32 | Code::VEX_Bextr_r64_rm64_r64 => {}
             _ => return Err(format!("Direct lowering unsupported: {:?}", i.code())),
         }
         offset += i.len();
@@ -556,6 +557,58 @@ pub(crate) fn translate_span(
                 c.emit(load_opcode | (offset(i.op1_register())? << 10))?;
                 c.emit(store_opcode | (offset(i.op0_register())? << 10))?;
             }
+            continue;
+        }
+        if matches!(
+            i.code(),
+            Code::VEX_Bextr_r32_rm32_r32 | Code::VEX_Bextr_r64_rm64_r64
+        ) {
+            let wide = i.op0_register().size() == 8;
+            let dst = register(i.op0_register(), wide)?;
+            if i.op1_kind() == OpKind::Memory {
+                memory_address(&mut c, i)?;
+                c.emit(0xaa1303e0)?;
+                c.load_u64(2, if wide { 8 } else { 4 })?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_load_v1 as *const () as u64,
+                )?;
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+            } else {
+                c.context_access(0, 19, register(i.op1_register(), wide)? * 8, wide, false)?;
+            }
+            c.context_access(1, 19, register(i.op2_register(), wide)? * 8, wide, false)?;
+            c.emit(0xd3401c29)?; // ubfx x9,x1,#0,#8: start
+            c.emit(0xd3483c2a)?; // ubfx x10,x1,#8,#8: length
+            c.load_u64(11, if wide { 64 } else { 32 })?;
+            c.emit(0xcb09016c)?; // sub x12,x11,x9: remaining bits
+            c.emit(0xeb0b013f)?; // cmp x9,x11
+            c.emit(0x9a9f318c)?; // csel x12,x12,xzr,lo
+            c.emit(0xeb0c015f)?; // cmp x10,x12
+            c.emit(0x9a8c314a)?; // csel x10,x10,x12,lo: clamp length
+            c.load_u64(11, 64)?;
+            c.emit(0xcb0a016b)?; // sub x11,x11,x10
+            c.load_u64(12, u64::MAX)?;
+            c.emit(0x9acb258c)?; // lsrv x12,x12,x11
+            c.emit(0xf100015f)?; // cmp x10,#0
+            c.emit(0x9a9f118c)?; // csel x12,x12,xzr,ne: zero-length mask
+            c.emit(0x9ac92400)?; // lsrv x0,x0,x9
+            c.emit(0x8a0c0000)?; // and x0,x0,x12
+            c.context_access(0, 19, dst * 8, true, true)?;
+            c.context_access(9, 19, 136, true, false)?;
+            c.load_u64(10, 0x841)?; // clear CF/OF/ZF; retain undefined AF/SF/PF
+            c.emit(0x8a2a0129)?; // bic x9,x9,x10
+            c.emit(0xf100001f)?; // cmp x0,#0
+            c.emit(0x9a9f17ea)?; // cset x10,eq
+            c.emit(0xaa0a1929)?; // orr x9,x9,x10,lsl #6
+            c.context_access(9, 19, 136, true, true)?;
             continue;
         }
         if memory_arithmetic(i) {
