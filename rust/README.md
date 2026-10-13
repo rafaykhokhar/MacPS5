@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct NEG now supports all integer widths with guarded memory updates and
+subtraction flags. 255744 native cases plus NOT/memory-arithmetic regressions
+pass. Startup translates past NEG in the block at 0x3b9c but now rejects SBB32;
+that whole block has not executed. See
+[NEG evidence](../docs/status/TRANSLATOR_READINESS.md#direct-integer-neg).
+
 Direct MULX32/64 now computes both unsigned product halves, preserving flags and
 handling overlapping destinations and guarded memory. 1474560 native cases pass.
 Configured startup passes MULX and reaches NEG32 at 0x3b9c. See

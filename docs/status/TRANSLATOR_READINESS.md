@@ -1499,3 +1499,34 @@ image-relative 0x3b9c with `Direct lowering unsupported: Neg_rm32`.
 Logs are `/tmp/macps5-mulx-{tests,clippy,build,startup}.log` and retain the first
 real dlsym lookup. NEG is the next CPU gap. Bootstrap and PS5 gameplay remain
 incomplete; this startup-only run skips Metal presentation.
+
+## Direct integer NEG
+
+Direct lowering accepts unlocked NEG on 8/16/32/64-bit registers and memory.
+Register forms emit ARM64 NEG after capturing the original operand, preserve
+surrounding bits for narrow destinations and zero-extend dword writes. The
+existing arithmetic flag helper computes zero minus the original operand.
+Memory NEG uses operation 6 of the guarded RMW helper, calculating flags before
+but committing them only after a successful store. Invalid reads/writes preserve
+flags and bytes. LOCK forms remain explicitly unsupported by this non-atomic path.
+
+`rust/verification/direct_neg_native.rs` uses modular subtraction and direct
+carry/nibble/sign/zero/parity/overflow rules as an independent oracle. It checks
+all byte values, signed-minimum overflow at all widths, all register/base
+encodings, legacy high-byte aliases, partial writes, unaligned/final-byte/short/
+unmapped operands, read-only mappings, prior faults and zero/one/two instruction
+budgets. Expected state includes the full GPR bank, mapped bytes, flags, RIP and
+fault/fuel/stop. NOT and memory arithmetic verifiers are rerun for shared paths;
+the latter's invalid-operation case is now 7 because 6 implements NEG. Reproduce
+with the release rlib/dependency flags above using `direct_neg_native.rs`,
+`direct_not_native.rs`, and `direct_memory_arithmetic_native.rs`.
+
+Validation passes: 255744 native NEG cases, 27648 NOT cases, 407205 memory-
+arithmetic cases, 687 library tests, three integration tests, strict Clippy and
+release build. Standalone verifiers compile with warnings denied. Configured
+`--direct-startup` exits 1 in the same span at image-relative 0x3b9c, now with
+`Direct lowering unsupported: Sbb_rm32_r32`. NEG is accepted during translation,
+but this entire span has not executed. Logs are
+`/tmp/macps5-neg-{tests,clippy,build,startup}.log` and retain the first real dlsym
+lookup. Subtract-with-borrow is the next CPU gap. Bootstrap and PS5 gameplay
+remain incomplete; this startup-only run skips Metal presentation.

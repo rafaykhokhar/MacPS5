@@ -345,6 +345,8 @@ pub(crate) fn translate_span(
             _ if memory_arithmetic(&i) => {}
             Code::Not_rm8 | Code::Not_rm16 | Code::Not_rm32 | Code::Not_rm64
                 if !i.has_lock_prefix() => {}
+            Code::Neg_rm8 | Code::Neg_rm16 | Code::Neg_rm32 | Code::Neg_rm64
+                if !i.has_lock_prefix() => {}
             Code::VEX_Bextr_r32_rm32_r32 | Code::VEX_Bextr_r64_rm64_r64 => {}
             _ if bmi_shift(&i).is_some() => {}
             _ if movbe(&i) => {}
@@ -752,14 +754,22 @@ pub(crate) fn translate_span(
         }
         if matches!(
             i.code(),
-            Code::Not_rm8 | Code::Not_rm16 | Code::Not_rm32 | Code::Not_rm64
+            Code::Not_rm8
+                | Code::Not_rm16
+                | Code::Not_rm32
+                | Code::Not_rm64
+                | Code::Neg_rm8
+                | Code::Neg_rm16
+                | Code::Neg_rm32
+                | Code::Neg_rm64
         ) {
+            let negate = i.mnemonic() == Mnemonic::Neg;
             if i.op0_kind() == OpKind::Memory {
                 memory_address(&mut c, i)?;
                 c.emit(0xaa1303e0)?;
                 c.load_u64(2, 0)?;
                 c.load_u64(3, i.memory_size().size() as u64)?;
-                c.load_u64(4, 5)?;
+                c.load_u64(4, if negate { 6 } else { 5 })?;
                 c.call_absolute(
                     crate::guest_memory::ffi::native_ps5_module_integer_rmw_v1 as *const () as u64,
                 )?;
@@ -783,13 +793,30 @@ pub(crate) fn translate_span(
                 } else {
                     c.context_access(0, 19, reg * 8, size == 8, false)?;
                 }
-                c.emit(if size == 8 { 0xaa2003e0 } else { 0x2a2003e0 })?; // mvn x0/w0
+                if negate {
+                    c.emit(0xaa0003e2)?; // mov x2,x0: retain original operand for flags
+                    c.emit(if size == 8 { 0xcb0003e0 } else { 0x4b0003e0 })?; // neg x0/w0
+                } else {
+                    c.emit(if size == 8 { 0xaa2003e0 } else { 0x2a2003e0 })?; // mvn x0/w0
+                }
                 if size == 1 {
                     c.emit(0x39000260 | (byte_offset(operand)? << 10))?;
                 } else if size == 2 {
                     c.emit(0x79000260 | ((reg as u32 * 4) << 10))?;
                 } else {
                     c.context_access(0, 19, reg * 8, true, true)?;
+                }
+                if negate {
+                    c.emit(0xaa0003e3)?; // mov x3,x0: result
+                    c.context_access(0, 19, 136, true, false)?;
+                    c.load_u64(1, 0)?;
+                    c.load_u64(4, size as u64 * 8)?;
+                    c.load_u64(5, 0)?; // flags for zero minus operand
+                    c.call_absolute(
+                        crate::arithmetic::native_ps5_arithmetic_flags_v1 as *const () as u64,
+                    )?;
+                    c.context_access(0, 19, 136, true, true)?;
+                    c.context_access(1, 19, 152, true, true)?;
                 }
             }
             continue;
