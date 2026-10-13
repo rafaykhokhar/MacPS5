@@ -2001,3 +2001,35 @@ library tests, three integration tests, strict Clippy and release build. The
 standalone verifier compiles with warnings denied. Logs are
 `/tmp/macps5-bitscan-{tests,clippy,build}.log`. This adds instruction coverage
 through a native Rust helper, not a proof of full CPU readiness or gameplay.
+
+## Direct BMI1 lowest-bit operations
+
+Direct BLSI/BLSMSK/BLSR supports VEX-encoded 32/64-bit register destinations
+and register or guarded-memory sources. BLSI isolates the lowest set bit,
+BLSMSK fills bits through that bit, and BLSR clears that bit. Source capture
+precedes destination updates, including register aliases. Dword results
+zero-extend. Memory faults preserve destination and flags.
+
+The Rust helper updates defined CF/ZF/SF, clears OF and preserves undefined
+AF/PF. BLSI sets CF for nonzero input; BLSMSK and BLSR set CF for zero input.
+BLSMSK clears ZF even when its source is zero (the result is then all ones).
+These rules follow the Operation and Flags Affected sections of the
+[Intel instruction reference](https://cdrdv2-public.intel.com/868137/325462-089-sdm-vol-1-2abcd-3abcd-4.pdf).
+The BLSI description paragraph contradicts its operation/flags sections on
+zero-input carry; implementation and verification follow the latter sections.
+
+The expanded `rust/verification/direct_bit_scan_native.rs` derives expected
+results by enumerating set-bit positions, independently of the helper's
+arithmetic formulas. It covers all destination/source and destination/base
+register pairs, aliases, both widths, zero/all-one/alternating/single-bit
+inputs, and guarded unaligned, short, unmapped and overflowing reads. It
+compares full GPR, flags, memory and execution-stop state. An additional helper
+guard rejects a nonexistent 16-bit BMI1 operation.
+
+Validation: 2193408 combined native cases (626688 added BMI1 cases) plus six
+helper guards pass, as do 687 library tests, three integration tests, strict
+Clippy and the release build. Reproduce with the existing release rlib and
+dependency flags using `direct_bit_scan_native.rs`. Build/test logs are
+`/tmp/macps5-bls-{tests,clippy,build}.log`. This is additional CPU instruction
+coverage; complete translation, production readiness and gameplay remain
+unverified.

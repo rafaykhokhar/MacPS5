@@ -1,18 +1,41 @@
-//! BSF/BSR/LZCNT/TZCNT/POPCNT with deterministic undefined-state preservation.
+//! Bit scans, counts and BMI1 lowest-bit operations with undefined-state preservation.
 use crate::legacy_cpu::Cpu;
 
-/// Operations 0=BSF, 1=BSR, 2=LZCNT, 3=TZCNT, 4=POPCNT.
+/// Operations 0=BSF, 1=BSR, 2=LZCNT, 3=TZCNT, 4=POPCNT, 5=BLSI, 6=BLSMSK, 7=BLSR.
 pub fn execute(cpu: &mut Cpu, value: u64, destination: u64, size: u64, operation: u64) {
     if cpu.fault != 0 {
         return;
     }
-    if destination >= 16 || ![2, 4, 8].contains(&size) || operation > 4 {
+    if destination >= 16
+        || ![2, 4, 8].contains(&size)
+        || operation > 7
+        || (operation >= 5 && size == 2)
+    {
         cpu.fault = 3;
         return;
     }
     let bits = (size * 8) as u32;
     let mask = u64::MAX >> (64 - bits);
     let value = value & mask;
+    if operation >= 5 {
+        let result = match operation {
+            5 => value & value.wrapping_neg(),
+            6 => value ^ value.wrapping_sub(1),
+            _ => value & value.wrapping_sub(1),
+        } & mask;
+        let carry = if operation == 5 {
+            value != 0
+        } else {
+            value == 0
+        };
+        let zero = operation != 6 && result == 0;
+        cpu.flags = (cpu.flags & !0x8c1)
+            | u64::from(carry)
+            | (u64::from(zero) << 6)
+            | (((result >> (bits - 1)) & 1) << 7);
+        cpu.registers[destination as usize] = result;
+        return;
+    }
     if operation <= 1 && value == 0 {
         cpu.flags |= 64;
         return; // Architecturally undefined destination: preserve it deterministically.

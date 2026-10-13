@@ -6,6 +6,13 @@ use crate::{
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
 fn bit_scan(i: &Instruction) -> bool {
+    if matches!(
+        i.mnemonic(),
+        Mnemonic::Blsi | Mnemonic::Blsmsk | Mnemonic::Blsr
+    ) {
+        return i.encoding() == iced_x86::EncodingKind::VEX
+            && matches!(i.op0_register().size(), 4 | 8);
+    }
     matches!(
         i.mnemonic(),
         Mnemonic::Bsf | Mnemonic::Bsr | Mnemonic::Lzcnt | Mnemonic::Tzcnt | Mnemonic::Popcnt
@@ -1032,7 +1039,10 @@ pub(crate) fn translate_span(
                     Mnemonic::Bsr => 1,
                     Mnemonic::Lzcnt => 2,
                     Mnemonic::Tzcnt => 3,
-                    _ => 4,
+                    Mnemonic::Popcnt => 4,
+                    Mnemonic::Blsi => 5,
+                    Mnemonic::Blsmsk => 6,
+                    _ => 7,
                 },
             )?;
             c.call_absolute(crate::bit_scan::ffi::native_ps5_bit_scan_v1 as *const () as u64)?;

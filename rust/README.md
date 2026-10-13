@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct BMI1 BLSI/BLSMSK/BLSR now supports 32/64-bit register and guarded-memory
+sources. The combined bit-operation verifier passes 2193408 native cases and
+six helper guard checks. Library/integration tests and strict Clippy also pass.
+See [BMI1 lowest-bit evidence](../docs/status/TRANSLATOR_READINESS.md#direct-bmi1-lowest-bit-operations).
+
 Direct BSF/BSR/LZCNT/TZCNT/POPCNT now supports all three operand widths and
 guarded memory sources. 1566720 native cases and five helper guard checks pass,
 along with library/integration tests and strict Clippy. See

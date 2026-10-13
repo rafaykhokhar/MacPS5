@@ -1,6 +1,23 @@
 use native_ps5::{direct_cpu, guest_memory::Memory, jit_memory::JitArena, legacy_cpu::Cpu};
 fn reference(value: u64, bits: usize, op: usize, old: u64) -> (Option<u64>, u64) {
     let set: Vec<usize> = (0..bits).filter(|bit| value & (1u64 << bit) != 0).collect();
+    if op >= 5 {
+        let result = match op {
+            5 => set.first().map_or(0, |bit| 1u64 << bit),
+            6 => (0..=set.first().copied().unwrap_or(bits - 1)).fold(0, |v, bit| v | (1u64 << bit)),
+            _ => set.iter().skip(1).fold(0, |v, bit| v | (1u64 << bit)),
+        };
+        let cf = if op == 5 {
+            !set.is_empty()
+        } else {
+            set.is_empty()
+        };
+        let flags = (old & !0x8c1)
+            | u64::from(cf)
+            | (u64::from(op != 6 && result == 0) << 6)
+            | (((result >> (bits - 1)) & 1) << 7);
+        return (Some(result), flags);
+    }
     if op < 2 && set.is_empty() {
         return (None, old | 64);
     }
@@ -27,33 +44,48 @@ fn main() {
         for size in [2usize, 4, 8] {
             let bits = size * 8;
             let mask = u64::MAX >> (64 - bits);
-            for op in 0..5 {
+            for op in 0..8 {
+                if size == 2 && op >= 5 {
+                    continue;
+                }
                 for dst in 0..16u8 {
                     for src in 0..16u8 {
                         for mem in [false, true] {
                             let mut bytes = Vec::new();
-                            if size == 2 {
-                                bytes.push(0x66);
+                            if op >= 5 {
+                                bytes.extend_from_slice(&[
+                                    0xc4,
+                                    0xc2 | if src < 8 { 0x20 } else { 0 },
+                                    (if size == 8 { 0x80 } else { 0 }) | ((!dst & 15) << 3),
+                                    0xf3,
+                                    (if mem { 0x40 } else { 0xc0 })
+                                        | ((8 - op as u8) << 3)
+                                        | (src & 7),
+                                ]);
+                            } else {
+                                if size == 2 {
+                                    bytes.push(0x66);
+                                }
+                                if op >= 2 {
+                                    bytes.push(0xf3);
+                                }
+                                bytes.push(
+                                    0x40 | if size == 8 { 8 } else { 0 }
+                                        | ((dst >> 3) << 2)
+                                        | (src >> 3),
+                                );
+                                bytes.extend_from_slice(&[
+                                    0x0f,
+                                    if op == 4 {
+                                        0xb8
+                                    } else if op == 0 || op == 3 {
+                                        0xbc
+                                    } else {
+                                        0xbd
+                                    },
+                                    (if mem { 0x40 } else { 0xc0 }) | ((dst & 7) << 3) | (src & 7),
+                                ]);
                             }
-                            if op >= 2 {
-                                bytes.push(0xf3);
-                            }
-                            bytes.push(
-                                0x40 | if size == 8 { 8 } else { 0 }
-                                    | ((dst >> 3) << 2)
-                                    | (src >> 3),
-                            );
-                            bytes.extend_from_slice(&[
-                                0x0f,
-                                if op == 4 {
-                                    0xb8
-                                } else if op == 0 || op == 3 {
-                                    0xbc
-                                } else {
-                                    0xbd
-                                },
-                                (if mem { 0x40 } else { 0xc0 }) | ((dst & 7) << 3) | (src & 7),
-                            ]);
                             if mem {
                                 if src & 7 == 4 {
                                     bytes.push(0x24);
@@ -147,7 +179,8 @@ fn main() {
             (0, 0, 0, 0, 3),
             (1, 0, 0, 0, 3),
             (8, 16, 0, 0, 3),
-            (8, 0, 5, 0, 3),
+            (8, 0, 8, 0, 3),
+            (2, 0, 5, 0, 3),
             (8, 0, 0, 9, 9),
         ] {
             let mut cpu = Cpu {
