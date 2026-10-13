@@ -1,5 +1,37 @@
 # CPU completion criteria
 
+## Packed integer minimum and maximum
+
+VEX VPMIN/MAX signed and unsigned byte, word and dword operations now support
+all 24 XMM/YMM forms. Register lowering uses ARM64 signed/unsigned vector
+min/max and captures both inputs before destination stores. Memory helpers
+guard the complete 16/32-byte operand before committing; signed comparisons
+use sign-bit bias. XMM writes clear the upper half, and flags/FP state remain
+unchanged. Legacy/EVEX and unsupported FS/GS/address32 forms remain rejected.
+
+Reference: AMD APM Volume 4 rev.3.24 pp.368–391
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)).
+Architectural alignment-control behavior and full exception delivery remain
+outside the current guard model.
+
+The matching build passes 659 library tests, three integration tests, strict
+Clippy and release compilation (`work/packed-minmax-native/{tests,clippy,release}.log`,
+process 72903 exit 0). The [native verifier](../../rust/verification/packed_minmax_native.rs)
+passes 599,872 checks across 288 decoded fixtures, with an independent widened
+signed-number oracle: all byte-value pairs, wider sign boundaries/extrema,
+equal/random lanes, aliases/high registers/WIG, readonly high/unaligned/RIP
+operands, every short span, flags/FP/fuel/prior faults
+(`work/packed-minmax-native/native.log`, process 87559 exit 0).
+
+Discovery reaches 57,665 instructions and 13,088 blocks with 152 unsupported
+sites: four former stops removed and no new stops. These counts do not prove
+CPU coverage. The entry runner compiles with warnings denied and startup-only
+verification passes at the existing missing `fscanf` boundary: ten accepted
+dependencies, 20,288 owned dependency bytes and cleanup pending. Game main has
+not executed (`work/packed-minmax-native/entry.log`, process 21440 exit 0).
+No full GPU suite was run for this CPU change. Production readiness and retail
+gameplay remain unverified.
+
 ## Immediate integer vector blending
 
 VEX VPBLENDW and VPBLENDD now select word/dword lanes from two sources in

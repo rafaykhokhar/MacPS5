@@ -37,6 +37,40 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn packed_minmax_absolute_address_guard() {
+        for (map, opcode) in [
+            (1, 0xda),
+            (1, 0xde),
+            (1, 0xea),
+            (1, 0xee),
+            (2, 0x38),
+            (2, 0x39),
+            (2, 0x3a),
+            (2, 0x3b),
+            (2, 0x3c),
+            (2, 0x3d),
+            (2, 0x3e),
+            (2, 0x3f),
+        ] {
+            for length in [0, 4] {
+                let bytes = [
+                    0x67,
+                    0xc4,
+                    0xe0 | map,
+                    0x79 | length,
+                    opcode,
+                    0x04,
+                    0x25,
+                    0,
+                    0,
+                    0,
+                    0,
+                ];
+                assert!(super::translate_rust_memory_region(&bytes, 0, "address").is_err());
+            }
+        }
+    }
+    #[test]
     fn packed_blend_absolute_address_guard() {
         for opcode in [0x02, 0x0e] {
             for length in [0, 4] {
@@ -1704,6 +1738,90 @@ impl Emitter {
                     // Reduce over the complete vector. Only ZF and CF receive
                     // computed values; OF/SF/AF/PF clear and other flags survive.
                     self.emit("ldr x9, [x19, #136]\nmov x10, #0x8d5\nbic x9, x9, x10\ncmp x20, #0\ncset x10, eq\norr x9, x9, x10, lsl #6\ncmp x21, #0\ncset x10, eq\norr x9, x9, x10\nstr x9, [x19, #136]");
+                }
+            }
+            M::Vpminsb
+            | M::Vpminsw
+            | M::Vpminsd
+            | M::Vpminub
+            | M::Vpminuw
+            | M::Vpminud
+            | M::Vpmaxsb
+            | M::Vpmaxsw
+            | M::Vpmaxsd
+            | M::Vpmaxub
+            | M::Vpmaxuw
+            | M::Vpmaxud => {
+                use iced_x86::Code;
+                let (lane_size, wide, signed, maximum) = match i.code() {
+                    Code::VEX_Vpminsb_xmm_xmm_xmmm128 => (1, false, true, false),
+                    Code::VEX_Vpminsb_ymm_ymm_ymmm256 => (1, true, true, false),
+                    Code::VEX_Vpminsw_xmm_xmm_xmmm128 => (2, false, true, false),
+                    Code::VEX_Vpminsw_ymm_ymm_ymmm256 => (2, true, true, false),
+                    Code::VEX_Vpminsd_xmm_xmm_xmmm128 => (4, false, true, false),
+                    Code::VEX_Vpminsd_ymm_ymm_ymmm256 => (4, true, true, false),
+                    Code::VEX_Vpminub_xmm_xmm_xmmm128 => (1, false, false, false),
+                    Code::VEX_Vpminub_ymm_ymm_ymmm256 => (1, true, false, false),
+                    Code::VEX_Vpminuw_xmm_xmm_xmmm128 => (2, false, false, false),
+                    Code::VEX_Vpminuw_ymm_ymm_ymmm256 => (2, true, false, false),
+                    Code::VEX_Vpminud_xmm_xmm_xmmm128 => (4, false, false, false),
+                    Code::VEX_Vpminud_ymm_ymm_ymmm256 => (4, true, false, false),
+                    Code::VEX_Vpmaxsb_xmm_xmm_xmmm128 => (1, false, true, true),
+                    Code::VEX_Vpmaxsb_ymm_ymm_ymmm256 => (1, true, true, true),
+                    Code::VEX_Vpmaxsw_xmm_xmm_xmmm128 => (2, false, true, true),
+                    Code::VEX_Vpmaxsw_ymm_ymm_ymmm256 => (2, true, true, true),
+                    Code::VEX_Vpmaxsd_xmm_xmm_xmmm128 => (4, false, true, true),
+                    Code::VEX_Vpmaxsd_ymm_ymm_ymmm256 => (4, true, true, true),
+                    Code::VEX_Vpmaxub_xmm_xmm_xmmm128 => (1, false, false, true),
+                    Code::VEX_Vpmaxub_ymm_ymm_ymmm256 => (1, true, false, true),
+                    Code::VEX_Vpmaxuw_xmm_xmm_xmmm128 => (2, false, false, true),
+                    Code::VEX_Vpmaxuw_ymm_ymm_ymmm256 => (2, true, false, true),
+                    Code::VEX_Vpmaxud_xmm_xmm_xmmm128 => (4, false, false, true),
+                    Code::VEX_Vpmaxud_ymm_ymm_ymmm256 => (4, true, false, true),
+                    _ => {
+                        return Err(
+                            "Only VEX128/256 byte/word/dword integer min/max is implemented".into(),
+                        );
+                    }
+                };
+                let dst = vector(i.op0_register())?;
+                let first = vector(i.op1_register())?;
+                if i.op2_kind() == OpKind::Memory {
+                    if i.memory_base() == R::None
+                        && i.memory_index() == R::None
+                        && i.memory_displ_size() != 8
+                    {
+                        return Err("32-bit absolute addressing is not implemented".into());
+                    }
+                    self.address(i)?;
+                    self.emit(format!("mov x0, x19\nmov x2, #{dst}\nmov x3, #{first}\nmov x4, #{}\nmov x5, #{lane_size}\nmov x6, #{}\nmov x7, #{}\nbl _native_ps5_module_vector_minmax_v1",
+                        if wide {32} else {16}, u8::from(signed), u8::from(maximum)));
+                    self.fault();
+                } else {
+                    let second = vector(i.op2_register())?;
+                    let lanes = match lane_size {
+                        1 => "16b",
+                        2 => "8h",
+                        _ => "4s",
+                    };
+                    let operation = match (signed, maximum) {
+                        (true, true) => "smax",
+                        (true, false) => "smin",
+                        (false, true) => "umax",
+                        (false, false) => "umin",
+                    };
+                    self.emit(format!("ldr q0, [x19, #{}]\nldr q1, [x19, #{}]\n{operation} v0.{lanes}, v0.{lanes}, v1.{lanes}",208+first*32,208+second*32));
+                    if wide {
+                        self.emit(format!("ldr q2, [x19, #{}]\nldr q3, [x19, #{}]\n{operation} v2.{lanes}, v2.{lanes}, v3.{lanes}",224+first*32,224+second*32));
+                    } else {
+                        self.emit("movi v2.16b, #0");
+                    }
+                    // Preserve both old sources for every destination alias.
+                    self.emit(format!(
+                        "str q0, [x19, #{}]\nstr q2, [x19, #{}]",
+                        208 + dst * 32,
+                        224 + dst * 32
+                    ));
                 }
             }
             M::Vpcmpeqb | M::Vpcmpeqw | M::Vpcmpeqd | M::Vpcmpeqq => {

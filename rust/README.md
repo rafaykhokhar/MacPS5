@@ -1,5 +1,12 @@
 # Rust migration
 
+VEX signed/unsigned integer vector min/max now supports all 24 byte/word/dword
+XMM/YMM forms. The matching build passes 659 library tests, three integration
+tests, strict Clippy and 599,872 native checks. Discovery reaches 57,665
+instructions with 152 unsupported sites. Startup still stops at missing
+`fscanf`, before game main. See [CPU evidence](../docs/status/CPU.md).
+Production readiness and retail gameplay remain unverified.
+
 VEX VPBLENDW/VPBLENDD now support 128/256-bit integer vector blending, including
 guarded full-width memory operands and alias-safe ARM64 register lowering.
 The matching build passes 655 library tests, three integration tests, strict

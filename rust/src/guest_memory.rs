@@ -758,6 +758,57 @@ pub fn vector_cmpgtd256(
     vectors[destination as usize] = result;
     Ok(())
 }
+/// Packed integer minimum/maximum parameters.
+#[derive(Clone, Copy)]
+pub struct VectorMinMax {
+    pub destination: u64,
+    pub first: u64,
+    pub size: u64,
+    pub lane_size: u64,
+    pub signed: u64,
+    pub maximum: u64,
+}
+pub fn vector_minmax(
+    memory: &Memory<'_>,
+    vectors: &mut [[u8; 32]; 16],
+    address: u64,
+    operation: VectorMinMax,
+) -> Result<()> {
+    let VectorMinMax {
+        destination,
+        first,
+        size,
+        lane_size,
+        signed,
+        maximum,
+    } = operation;
+    vector_operand(address, destination, size, 0)?;
+    if first >= 16 || ![1, 2, 4].contains(&lane_size) || signed > 1 || maximum > 1 {
+        return Err("Invalid packed minimum/maximum operand".into());
+    }
+    let source = memory.read(address, size as usize)?;
+    let width = lane_size as usize;
+    let mut result = [0; 32];
+    // Flipping each lane's sign bit turns signed order into unsigned order.
+    let sign_bias = if signed == 1 {
+        1u32 << (width * 8 - 1)
+    } else {
+        0
+    };
+    for start in (0..size as usize).step_by(width) {
+        let end = start + width;
+        let lhs = &vectors[first as usize][start..end];
+        let rhs = &source[start..end];
+        let mut left = [0; 4];
+        let mut right = [0; 4];
+        left[..width].copy_from_slice(lhs);
+        right[..width].copy_from_slice(rhs);
+        let less = (u32::from_le_bytes(left) ^ sign_bias) < (u32::from_le_bytes(right) ^ sign_bias);
+        result[start..end].copy_from_slice(if less == (maximum == 0) { lhs } else { rhs });
+    }
+    vectors[destination as usize] = result;
+    Ok(())
+}
 /// Immediate-controlled packed word/dword selection from two source vectors.
 #[derive(Clone, Copy)]
 pub struct VectorBlend {
@@ -1243,6 +1294,46 @@ pub mod ffi {
                 destination,
                 first,
                 size,
+            )
+            .is_ok()
+        {
+            return;
+        }
+        cpu.fault = 1;
+    }
+    /// # Safety
+    /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn native_ps5_module_vector_minmax_v1(
+        cpu: *mut Cpu,
+        address: u64,
+        destination: u64,
+        first: u64,
+        size: u64,
+        lane_size: u64,
+        signed: u64,
+        maximum: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if cpu.memory != 0
+            && vector_minmax(
+                unsafe { &*(cpu.memory as *const Memory<'_>) },
+                &mut cpu.vectors,
+                address,
+                VectorMinMax {
+                    destination,
+                    first,
+                    size,
+                    lane_size,
+                    signed,
+                    maximum,
+                },
             )
             .is_ok()
         {
@@ -2198,6 +2289,192 @@ mod tests {
         assert_eq!(memory.read(0x1001, 16).unwrap(), &original[15][16..]);
         assert_eq!(cpu.vectors, original);
         assert_eq!(cpu.flags, u64::MAX);
+    }
+    #[test]
+    fn packed_minmax_signed_boundaries_and_aliases() {
+        for size in [16usize, 32] {
+            for width in [1usize, 2, 4] {
+                let bits = width * 8;
+                let top = 1u64 << (bits - 1);
+                let mask = (1u64 << bits) - 1;
+                let cases = [0, 1, top - 1, top, top + 1, mask - 1, mask];
+                for signed in [0, 1] {
+                    for maximum in [0, 1] {
+                        for destination in [3usize, 15] {
+                            for shift in 0..cases.len() {
+                                let mut vectors = [[0xa5; 32]; 16];
+                                let mut data = [0; 32];
+                                let mut result = [0; 32];
+                                for lane in 0..size / width {
+                                    let a = cases[lane % cases.len()];
+                                    let b = cases[(lane + shift) % cases.len()];
+                                    let numeric = |v: u64| -> i64 {
+                                        if signed == 1 && v >= top {
+                                            v as i64 - (1i64 << bits)
+                                        } else {
+                                            v as i64
+                                        }
+                                    };
+                                    let expected = if maximum == 1 {
+                                        numeric(a).max(numeric(b))
+                                    } else {
+                                        numeric(a).min(numeric(b))
+                                    };
+                                    let start = lane * width;
+                                    vectors[15][start..start + width]
+                                        .copy_from_slice(&a.to_le_bytes()[..width]);
+                                    data[start..start + width]
+                                        .copy_from_slice(&b.to_le_bytes()[..width]);
+                                    result[start..start + width]
+                                        .copy_from_slice(&expected.to_le_bytes()[..width]);
+                                }
+                                let mut expected = vectors;
+                                expected[destination] = result;
+                                let mut memory = Memory::default();
+                                memory
+                                    .add(0x1_0000_0001, &mut data[..size], false, false)
+                                    .unwrap();
+                                vector_minmax(
+                                    &memory,
+                                    &mut vectors,
+                                    0x1_0000_0001,
+                                    VectorMinMax {
+                                        destination: destination as u64,
+                                        first: 15,
+                                        size: size as u64,
+                                        lane_size: width as u64,
+                                        signed,
+                                        maximum,
+                                    },
+                                )
+                                .unwrap();
+                                assert_eq!(vectors, expected);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn packed_minmax_full_span_and_invalid_parameters_are_atomic() {
+        let original = [[0xa5; 32]; 16];
+        for size in [16u64, 32] {
+            for lane_size in [1, 2, 4] {
+                for signed in [0, 1] {
+                    for maximum in [0, 1] {
+                        for length in 0..size as usize {
+                            let mut data = vec![0; length];
+                            let mut memory = Memory::default();
+                            if length != 0 {
+                                memory.add(0x1001, &mut data, false, false).unwrap();
+                            }
+                            let mut vectors = original;
+                            assert!(
+                                vector_minmax(
+                                    &memory,
+                                    &mut vectors,
+                                    0x1001,
+                                    VectorMinMax {
+                                        destination: 0,
+                                        first: 0,
+                                        size,
+                                        lane_size,
+                                        signed,
+                                        maximum,
+                                    }
+                                )
+                                .is_err()
+                            );
+                            assert_eq!(vectors, original);
+                        }
+                    }
+                }
+            }
+        }
+        let mut data = [0; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        for (destination, first, size, lane_size, signed, maximum) in [
+            (16, 0, 16, 1, 0, 0),
+            (u64::MAX, 0, 16, 1, 0, 0),
+            (0, 16, 16, 1, 0, 0),
+            (0, u64::MAX, 16, 1, 0, 0),
+            (0, 0, 0, 1, 0, 0),
+            (0, 0, 8, 1, 0, 0),
+            (0, 0, 64, 1, 0, 0),
+            (0, 0, u64::MAX, 1, 0, 0),
+            (0, 0, 16, 0, 0, 0),
+            (0, 0, 16, 3, 0, 0),
+            (0, 0, 16, 8, 0, 0),
+            (0, 0, 16, u64::MAX, 0, 0),
+            (0, 0, 16, 1, 2, 0),
+            (0, 0, 16, 1, u64::MAX, 0),
+            (0, 0, 16, 1, 0, 2),
+            (0, 0, 16, 1, 0, u64::MAX),
+        ] {
+            let mut vectors = original;
+            assert!(
+                vector_minmax(
+                    &memory,
+                    &mut vectors,
+                    0x1001,
+                    VectorMinMax {
+                        destination,
+                        first,
+                        size,
+                        lane_size,
+                        signed,
+                        maximum,
+                    }
+                )
+                .is_err()
+            );
+            assert_eq!(vectors, original);
+        }
+    }
+    #[test]
+    #[allow(unsafe_code)]
+    fn packed_minmax_ffi_preserves_faults_flags_and_fp_state() {
+        use crate::legacy_cpu::Cpu;
+        unsafe {
+            ffi::native_ps5_module_vector_minmax_v1(std::ptr::null_mut(), 0, 0, 0, 16, 1, 0, 0)
+        };
+        let mut cpu = Cpu {
+            vectors: [[0x80; 32]; 16],
+            flags: u64::MAX,
+            mxcsr: 0xffff,
+            x87_control: 0x137f,
+            x87_status: 0x5555,
+            ..Cpu::default()
+        };
+        for fault in [0, 2, 13] {
+            cpu.fault = fault;
+            unsafe { ffi::native_ps5_module_vector_minmax_v1(&mut cpu, 0x1001, 0, 0, 16, 1, 1, 1) };
+            assert_eq!(cpu.fault, if fault == 0 { 1 } else { fault });
+            assert_eq!(cpu.vectors, [[0x80; 32]; 16]);
+            assert_eq!(
+                (cpu.flags, cpu.mxcsr, cpu.x87_control, cpu.x87_status),
+                (u64::MAX, 0xffff, 0x137f, 0x5555)
+            );
+        }
+        let mut data = [0x7f; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        cpu.memory = (&mut memory as *mut Memory<'_>) as u64;
+        cpu.fault = 0;
+        unsafe { ffi::native_ps5_module_vector_minmax_v1(&mut cpu, 0x1001, 0, 0, 16, 1, 1, 1) };
+        assert_eq!(cpu.fault, 0);
+        assert_eq!(&cpu.vectors[0][..16], &[0x7f; 16]);
+        assert_eq!(&cpu.vectors[0][16..], &[0; 16]);
+        let before = cpu.vectors;
+        unsafe { ffi::native_ps5_module_vector_minmax_v1(&mut cpu, 0x1001, 0, 0, 16, 1, 1, 2) };
+        assert_eq!(cpu.fault, 1);
+        assert_eq!(cpu.vectors, before);
+        assert_eq!(
+            (cpu.flags, cpu.mxcsr, cpu.x87_control, cpu.x87_status),
+            (u64::MAX, 0xffff, 0x137f, 0x5555)
+        );
     }
     #[test]
     fn packed_blend_all_masks_widths_and_aliases() {
