@@ -1591,3 +1591,44 @@ at span 0x4b1 with `Direct lowering unsupported: VEX_Vzeroupper`. Logs are
 `/tmp/macps5-cmpimm-{tests,clippy,build,startup}.log`. VZEROUPPER is the next
 observed CPU gap. Bootstrap and PS5 gameplay remain incomplete, and this
 startup-only run skips Metal presentation.
+
+## Direct vector state clearing
+
+The direct ARM64 backend supports VEX VZEROUPPER and VZEROALL in the 64-bit
+guest execution mode. VZEROUPPER clears bytes 16–31 of each of the sixteen
+guest vector registers; VZEROALL clears all 32 bytes. Both emit bounded stores
+into the CPU context without accessing guest memory or calling a helper.
+Scalar registers, flags, MXCSR and x87 state are preserved. This follows the
+AVX state-clearing semantics in the
+[Intel instruction reference](https://cdrdv2-public.intel.com/774492/325383-sdm-vol-2abcd.pdf).
+
+`rust/verification/direct_vector_zero_native.rs` checks both instructions with
+two-byte and three-byte VEX encodings, both ignored W values, all vector bytes,
+and varying nonzero patterns. It also checks zero/one/two instruction budgets,
+pre-existing faults, null guest memory, preserved non-vector state and resuming
+at RET without repeating the vector instruction. Reproduce with the release
+rlib/dependency flags above using `direct_vector_zero_native.rs`.
+
+Validation passes: 9216 native state cases, 687 library tests, three integration
+tests, strict Clippy and release build. The standalone verifier and updated
+startup harness compile with warnings denied. Logs are
+`/tmp/macps5-vzero-{tests,clippy,build,startup}.log`.
+
+Configured direct startup now passes its pinned failure-boundary assertions:
+2603840 BSS bytes cleared, ten named dependency providers accepted, and the
+expected unresolved `fscanf` message followed by an owned normal exit request
+with status -1. The direct backend reports 3863 translated instructions and
+571 attempts. The harness now checks direct translation usage and absence of
+dylib rebuilds in direct mode, retaining the old roots/rebuild assertions for
+the dylib mode. The dependency trace, import bindings, guest log and exit
+ownership assertions remain shared. The first run exposed this harness
+backend mismatch as `Missing translation roots`; the corrected run exits 0
+because it verifies the expected guest failure boundary, not successful startup.
+
+This reaches the same scoped homebrew boundary as the older AOT path. It does
+not prove CPU completeness: instruction families and execution scenarios not
+covered by this path remain to be implemented and validated. Guest cleanup is
+pending, game main has not executed, and PS5 gameplay remains unsupported.
+The startup-only run skips Metal presentation. CPU completeness remains the
+priority; reaching a library boundary does not justify calling the translator
+production-ready.

@@ -368,6 +368,7 @@ pub(crate) fn translate_span(
             _ if immediate_shift(&i) => {}
             _ if vector_xor(&i).is_some() => {}
             _ if vector_move(&i).is_some() => {}
+            Code::VEX_Vzeroupper | Code::VEX_Vzeroall => {}
             _ if conditional_move(&i) => {}
             _ if memory_arithmetic(&i) => {}
             Code::Not_rm8 | Code::Not_rm16 | Code::Not_rm32 | Code::Not_rm64
@@ -484,6 +485,20 @@ pub(crate) fn translate_span(
         )?;
         c.emit(0xd1000529)?; // sub x9,x9,#1
         c.context_access(9, 19, 160, true, true)?;
+        if matches!(i.code(), Code::VEX_Vzeroupper | Code::VEX_Vzeroall) {
+            c.load_u64(9, 0)?;
+            let first_byte = if i.code() == Code::VEX_Vzeroall {
+                0
+            } else {
+                16
+            };
+            for reg in 0..16 {
+                for offset in (first_byte..32).step_by(8) {
+                    c.context_access(9, 19, 208 + reg * 32 + offset, true, true)?;
+                }
+            }
+            continue;
+        }
         if let Some((size, aligned)) = vector_move(i) {
             if i.op0_kind() == OpKind::Register && i.op1_kind() == OpKind::Register {
                 let dst = vector_register(i.op0_register(), size)?;

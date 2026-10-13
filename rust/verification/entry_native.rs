@@ -1472,17 +1472,32 @@ fn main() -> Result<(), String> {
                     "Unexpected dependency lookup trace: {stat_trace:?}"
                 ));
             }
-            let roots = native
-                .translation_roots(bias)
-                .ok_or("Missing translation roots")?;
-            if native.translation_rebuilds(bias) != Some(12)
-                || roots.len() != 13
-                || !roots.contains(&0x6da0)
-                || !roots.contains(&0x67e0)
-                || !roots.contains(&0x7340)
-                || roots.contains(&0x373)
-            {
-                return Err("Actual observed-target recovery did not match the pinned ELF".into());
+            if direct_startup {
+                let usage = native
+                    .direct_translation_usage(bias)
+                    .ok_or("Missing direct translation usage")?;
+                if usage.instructions == 0
+                    || usage.instructions > 65_536
+                    || usage.attempts == 0
+                    || usage.attempts > 4096
+                    || native.translation_rebuilds(bias).is_some()
+                {
+                    return Err("Invalid direct startup translation accounting".into());
+                }
+                println!("Direct startup translation usage: {usage:?}");
+            } else {
+                let roots = native
+                    .translation_roots(bias)
+                    .ok_or("Missing translation roots")?;
+                if native.translation_rebuilds(bias) != Some(12)
+                    || roots.len() != 13
+                    || !roots.contains(&0x6da0)
+                    || !roots.contains(&0x67e0)
+                    || !roots.contains(&0x7340)
+                    || roots.contains(&0x373)
+                {
+                    return Err("Actual observed-target recovery did not match the pinned ELF".into());
+                }
             }
             let image = modules.image(caller).ok_or("Missing adopted image")?;
             let locale_slot = bias + 0x26f6a0;

@@ -1,5 +1,12 @@
 # Rust migration
 
+Direct VZEROUPPER/VZEROALL now passes 9216 native state checks. The direct
+translator reaches the same pinned homebrew startup boundary as the older AOT
+path: ten named dependencies accepted, then an unresolved `fscanf` triggers
+exit -1 before game main. This run translates 3863 instructions in 571 attempts;
+it does not establish complete CPU coverage or gameplay. See
+[vector clearing and startup evidence](../docs/status/TRANSLATOR_READINESS.md#direct-vector-state-clearing).
+
 Direct memory-first CMP/TEST now supports register and immediate operands at
 16/32/64 bits, including sign-extended immediates. 307200 native comparison
 checks and 196608 shared arithmetic regression checks pass. Configured startup
