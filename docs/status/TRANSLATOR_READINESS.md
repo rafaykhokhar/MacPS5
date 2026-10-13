@@ -1876,3 +1876,30 @@ tests, strict Clippy and release build. The standalone verifier compiles with
 warnings denied. Logs are `/tmp/macps5-fullmul-{tests,clippy,build}.log`.
 This closes the direct implicit-product multiplication gap; division and other
 CPU families still need coverage, and PS5 gameplay remains unsupported.
+
+## Direct DIV and IDIV
+
+Direct DIV/IDIV supports 8/16/32/64-bit register and guarded-memory divisors.
+The divisor is captured before calling the existing Rust division helper,
+including AL/AH/RAX/RDX aliases. Guarded source failures stop before division.
+The helper consumes AX or DX:AX/EDX:EAX/RDX:RAX, writes the quotient/remainder
+with the required partial-register rules, and preserves undefined flags.
+Zero divisors and out-of-range quotients produce modeled divide fault 13
+without changing either output. The direct block stops on that fault; delivery
+of an architectural exception to guest handlers is a separate incomplete task.
+
+`rust/verification/direct_divide_native.rs` uses bit-by-bit unsigned long
+division of signed magnitudes, then applies quotient/remainder signs and range
+checks. The oracle does not use the runtime's division implementation. Cases
+cover every register/base encoding, all widths, implicit-output aliases,
+zero divisors, signed minimum divided by -1, quotient boundaries, remainder
+sign, partial-register outputs, unaligned/short/unmapped/overflowing reads,
+prior faults and zero/one/two instruction budgets. Full GPR/flags/memory/RIP/
+fault/fuel/stop state is compared. Reproduce using the release rlib/dependency
+flags above with `direct_divide_native.rs`.
+
+Validation passes: 221184 native division cases, 687 library tests, three
+integration tests, strict Clippy and release build. The standalone verifier
+compiles with warnings denied. Logs are
+`/tmp/macps5-divide-{tests,clippy,build}.log`. This establishes scoped division
+behavior, not full CPU readiness or PS5 gameplay.

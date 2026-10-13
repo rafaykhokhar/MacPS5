@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct DIV/IDIV now supports register and guarded-memory divisors at every
+integer width. 221184 native quotient/remainder/fault checks pass, along with
+the library/integration suites and strict Clippy. Divide errors stop with the
+modeled fault code; guest exception delivery remains incomplete. See
+[division evidence](../docs/status/TRANSLATOR_READINESS.md#direct-div-and-idiv).
+
 Direct one-operand MUL/IMUL now writes full products at all four integer widths,
 using native ARM64 multiplication and guarded memory sources. 296960 native
 cases pass, including exhaustive byte products, along with the library/

@@ -5,6 +5,19 @@ use crate::{
     decode,
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
+fn divide_instruction(i: &Instruction) -> bool {
+    matches!(
+        i.code(),
+        Code::Div_rm8
+            | Code::Div_rm16
+            | Code::Div_rm32
+            | Code::Div_rm64
+            | Code::Idiv_rm8
+            | Code::Idiv_rm16
+            | Code::Idiv_rm32
+            | Code::Idiv_rm64
+    )
+}
 fn full_multiply(i: &Instruction) -> bool {
     matches!(
         i.code(),
@@ -443,6 +456,7 @@ pub(crate) fn translate_span(
             _ if carry_arithmetic(&i) => {}
             _ if truncated_imul(&i) => {}
             _ if full_multiply(&i) => {}
+            _ if divide_instruction(&i) => {}
             Code::VEX_Andn_r32_r32_rm32 | Code::VEX_Andn_r64_r64_rm64 => {}
             Code::VEX_Rorx_r32_rm32_imm8 | Code::VEX_Rorx_r64_rm64_imm8 => {}
             Code::VEX_Mulx_r32_r32_rm32 | Code::VEX_Mulx_r64_r64_rm64 => {}
@@ -926,6 +940,56 @@ pub(crate) fn translate_span(
                     c.context_access(1, 19, 152, true, true)?;
                 }
             }
+            continue;
+        }
+        if divide_instruction(i) {
+            let size = if i.op0_kind() == OpKind::Memory {
+                i.memory_size().size()
+            } else {
+                i.op0_register().size()
+            };
+            if i.op0_kind() == OpKind::Memory {
+                memory_address(&mut c, i)?;
+                c.emit(0xaa1303e0)?;
+                c.load_u64(2, size as u64)?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_load_v1 as *const () as u64,
+                )?;
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+                c.emit(0xaa0003e1)?;
+            } else if size == 1 {
+                c.emit(0x39400261 | (byte_offset(i.op0_register())? << 10))?;
+            } else {
+                let src = register(i.op0_register().full_register(), true)?;
+                if size == 2 {
+                    c.emit(0x79400261 | ((src as u32 * 4) << 10))?;
+                } else {
+                    c.context_access(1, 19, src * 8, size == 8, false)?;
+                }
+            }
+            c.emit(0xaa1303e0)?;
+            c.load_u64(2, size as u64 * 8)?;
+            c.load_u64(3, u64::from(i.mnemonic() == Mnemonic::Idiv))?;
+            c.call_absolute(
+                crate::arithmetic::division_ffi::native_ps5_divide_v1 as *const () as u64,
+            )?;
+            c.context_access(9, 19, 152, true, false)?;
+            c.branch(
+                EXIT,
+                Branch::CompareZero {
+                    register: 9,
+                    wide: true,
+                    nonzero: true,
+                },
+            )?;
             continue;
         }
         if full_multiply(i) {
