@@ -1052,6 +1052,23 @@ fn validate_translation_bytes(image: &Image, start: u64, bytes: &[u8]) -> Result
 pub const MAX_TRANSLATION_REBUILDS: usize = 16;
 const MAX_TRANSLATION_SOURCE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_TRANSLATION_SOURCES: usize = 256;
+/// Host policy for retained generated dylibs, independent of guest memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TranslationCacheLimits {
+    pub mapped_bytes: usize,
+    pub libraries: usize,
+}
+impl Default for TranslationCacheLimits {
+    fn default() -> Self {
+        Self { mapped_bytes: 256 * 1024 * 1024, libraries: 256 }
+    }
+}
+/// Page-rounded Mach-O segment sizes, not RSS or total process memory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TranslationCacheUsage {
+    pub mapped_bytes: usize,
+    pub libraries: usize,
+}
 struct TranslationSource {
     file: Rc<[u8]>,
     roots: std::collections::BTreeSet<u64>,
@@ -1925,6 +1942,7 @@ pub struct NativeExecutor {
     image_blocks: BTreeMap<(u64, u64), Block>,
     translation_sources: BTreeMap<u64, TranslationSource>,
     translation_source_bytes: usize,
+    translation_cache_limits: TranslationCacheLimits,
     automatic_translation: bool,
     services: BTreeMap<u64, Service>,
     pub fuel: u64,
@@ -2760,8 +2778,9 @@ impl NativeExecutor {
             .try_reserve_exact(file.len())
             .map_err(|_| "Cannot allocate immutable translation source")?;
         snapshot.extend_from_slice(file);
+        let remaining = self.translation_cache_capacity()?;
         let compiled =
-            crate::module_compiler::compile(file, roots.clone(), limit, archive, directory)?;
+            crate::module_compiler::compile(file, roots.clone(), limit, archive, directory, remaining)?;
         let archive = archive.canonicalize().map_err(|e| e.to_string())?;
         let directory = directory.canonicalize().map_err(|e| e.to_string())?;
         for entry in &compiled.entries {
@@ -2800,6 +2819,45 @@ impl NativeExecutor {
     /// directories must remain host-controlled. Guest data must not select them.
     pub unsafe fn set_automatic_translation(&mut self, enabled: bool) {
         self.automatic_translation = enabled;
+    }
+    pub fn translation_cache_usage(&self) -> TranslationCacheUsage {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut usage = TranslationCacheUsage::default();
+        for block in self.image_blocks.values() {
+            if let Some(library) = &block._library {
+                if seen.insert(Rc::as_ptr(library)) {
+                    usage.mapped_bytes += library.mapped_bytes();
+                    usage.libraries += 1;
+                }
+            }
+        }
+        usage
+    }
+    pub fn translation_cache_limits(&self) -> TranslationCacheLimits {
+        self.translation_cache_limits
+    }
+    /// Reject reductions below live usage; this never evicts executable code.
+    /// Zero limits intentionally disable any additional compilation.
+    pub fn set_translation_cache_limits(&mut self, limits: TranslationCacheLimits) -> Result<()> {
+        let usage = self.translation_cache_usage();
+        if usage.mapped_bytes > limits.mapped_bytes || usage.libraries > limits.libraries {
+            return Err("Translation cache limits are below live usage".into());
+        }
+        self.translation_cache_limits = limits;
+        Ok(())
+    }
+    fn translation_cache_capacity(&self) -> Result<usize> {
+        let usage = self.translation_cache_usage();
+        if usage.libraries >= self.translation_cache_limits.libraries {
+            return Err("Translation cache library budget exhausted".into());
+        }
+        let remaining = self.translation_cache_limits.mapped_bytes
+            .checked_sub(usage.mapped_bytes)
+            .ok_or("Translation cache accounting exceeds limit")?;
+        if remaining == 0 {
+            return Err("Translation cache mapped-byte budget exhausted".into());
+        }
+        Ok(remaining)
     }
     pub fn translation_rebuilds(&self, bias: u64) -> Option<usize> {
         self.translation_sources
@@ -2849,6 +2907,7 @@ impl NativeExecutor {
         if source.rebuilds >= MAX_TRANSLATION_REBUILDS {
             return Err("Translation rebuild budget exhausted".into());
         }
+        let remaining = self.translation_cache_capacity()?;
         let file = source.file.clone();
         let mut roots = source.roots.clone();
         roots.insert(pc);
@@ -2871,6 +2930,7 @@ impl NativeExecutor {
             archive,
             directory,
             &existing,
+            remaining,
         )?;
         if !compiled.entries.iter().any(|entry| entry.pc == pc) {
             let reason = compiled
@@ -3069,6 +3129,7 @@ impl NativeExecutor {
             image_blocks: BTreeMap::new(),
             translation_sources: BTreeMap::new(),
             translation_source_bytes: 0,
+            translation_cache_limits: TranslationCacheLimits::default(),
             automatic_translation: false,
             services: BTreeMap::new(),
             fuel,

@@ -1,5 +1,10 @@
 # Rust migration
 
+The CPU translation cache now limits retained native libraries and their
+page-rounded Mach-O mappings before loading new batches. Host policy defaults
+to 256 MiB and 256 libraries; it is configurable and does not evict live code.
+This accounting is distinct from process RSS and the total 16 GB memory target.
+
 CPU translator readiness is now the primary implementation track. Translation
 extensions compile only newly discovered instructions and retain old native
 code; cumulative discovery, instruction limits and publication checks remain.

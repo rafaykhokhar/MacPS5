@@ -1,5 +1,5 @@
 //! Standalone ARM64 verification of incremental translation publication.
-use native_ps5::{loader::Image, module_executor::{Execution, NativeExecutor, memory_fixture}, modules::Arguments};
+use native_ps5::{loader::Image, module_executor::{Execution, NativeExecutor, TranslationCacheLimits, TranslationCacheUsage, memory_fixture}, modules::Arguments};
 use std::{collections::{BTreeMap, BTreeSet}, path::Path};
 fn artifacts(parent: &Path) -> BTreeMap<std::path::PathBuf, String> {
     std::fs::read_dir(parent).unwrap().map(|entry| {
@@ -26,17 +26,42 @@ fn main() {
     file[0x180..0x182].copy_from_slice(&[0x0f, 0x0b]);
     let mut image = Image::load(&file, 0x100000, 4096).unwrap();
     let mut n = NativeExecutor::new(0x900000, 4096, 100, 100).unwrap();
+    let default_limits = n.translation_cache_limits();
+    n.set_translation_cache_limits(TranslationCacheLimits {mapped_bytes: 0, libraries: 0}).unwrap();
+    assert!(unsafe { n.compile_image(&file, image.bias, BTreeSet::from([0x100]), 100, &archive, &directory) }.is_err());
+    assert_eq!(n.translation_cache_usage(), TranslationCacheUsage::default());
+    assert!(artifacts(&directory).is_empty());
+    n.set_translation_cache_limits(default_limits).unwrap();
     // SAFETY: matching trusted archive and quiescent executor at every compile.
     unsafe { n.compile_image(&file, image.bias, BTreeSet::from([0x100]), 100, &archive, &directory).unwrap(); }
     returned(&mut n, &mut image, 0x100100, 42);
     let original = artifacts(&directory);
     assert_eq!(original.len(), 1);
+    let initial_usage = n.translation_cache_usage();
+    assert_eq!(initial_usage.libraries, 1);
+    assert!(initial_usage.mapped_bytes > 0);
+    assert_eq!(initial_usage.mapped_bytes % 16384, 0);
+    let defaults = n.translation_cache_limits();
+    assert!(n.set_translation_cache_limits(TranslationCacheLimits {mapped_bytes: 0, libraries: 0}).is_err());
+    assert_eq!(n.translation_cache_limits(), defaults);
+    n.set_translation_cache_limits(TranslationCacheLimits {mapped_bytes: defaults.mapped_bytes, libraries: 1}).unwrap();
+    assert!(unsafe { n.extend_image_translation(&image, 0x100120, &archive, &directory) }.err().unwrap().contains("library budget"));
+    assert_eq!(n.translation_cache_usage(), initial_usage);
+    assert_eq!(artifacts(&directory), original);
+    n.set_translation_cache_limits(TranslationCacheLimits {mapped_bytes: initial_usage.mapped_bytes + 1, libraries: 2}).unwrap();
+    assert!(unsafe { n.extend_image_translation(&image, 0x100120, &archive, &directory) }.err().unwrap().contains("mapped-byte budget"));
+    assert_eq!(n.translation_cache_usage(), initial_usage);
+    assert_eq!(artifacts(&directory), original);
+    returned(&mut n, &mut image, 0x100100, 42);
+    n.set_translation_cache_limits(defaults).unwrap();
     let first = unsafe { n.extend_image_translation(&image, 0x100120, &archive, &directory).unwrap() };
     assert_eq!(first.instruction_count, 4, "Public manifest retains union discovery");
     returned(&mut n, &mut image, 0x100120, 7);
     returned(&mut n, &mut image, 0x100100, 42);
     let second = artifacts(&directory);
     assert_eq!(second.len(), 2, "Old library remains pinned");
+    assert_eq!(n.translation_cache_usage().libraries, 2);
+    assert!(n.translation_cache_usage().mapped_bytes > initial_usage.mapped_bytes);
     for (path, text) in &original { assert_eq!(second.get(path), Some(text)); }
     let added = second.iter().find(|(path, _)| !original.contains_key(*path)).unwrap().1;
     assert!(added.contains("_module_aot_120:"));
@@ -47,6 +72,7 @@ fn main() {
     returned(&mut n, &mut image, 0x100140, 7);
     let complete = artifacts(&directory);
     assert_eq!(complete.len(), 3);
+    println!("CACHE MAPPINGS: initial={initial_usage:?}, three batches={:?}", n.translation_cache_usage());
     for (path, text) in &second { assert_eq!(complete.get(path), Some(text)); }
     let attempts = n.translation_rebuilds(image.bias);
     assert!(unsafe { n.extend_image_translation(&image, 0x100140, &archive, &directory) }.is_err());
@@ -63,5 +89,6 @@ fn main() {
     returned(&mut n, &mut image, 0x100100, 42);
     n.remove_image_translations(image.bias);
     assert!(artifacts(&directory).is_empty(), "All batches retire together");
-    println!("PASS: incremental ARM64 batches retain old assembly/libraries, execute cross-batch interior JMP/CALL/RET, preserve full union manifests, reject overlap/unsupported/stale code atomically, and retire all batches");
+    assert_eq!(n.translation_cache_usage(), TranslationCacheUsage::default());
+    println!("PASS: incremental ARM64 batches retain old assembly/libraries, execute cross-batch interior JMP/CALL/RET, preserve full union manifests, enforce library/mapped-byte budgets without publication, reject overlap/unsupported/stale code atomically, and retire all batches with zero usage");
 }

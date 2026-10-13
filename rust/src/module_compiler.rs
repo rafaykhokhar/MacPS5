@@ -43,6 +43,122 @@ unsafe extern "C" {
 pub(crate) struct Library {
     handle: *mut c_void,
     directory: PathBuf,
+    mapped_bytes: usize,
+}
+impl Library {
+    /// Rounded segment VM span, including zero-fill; not resident memory/RSS.
+    pub(crate) fn mapped_bytes(&self) -> usize {
+        self.mapped_bytes
+    }
+}
+
+/// Thin little-endian arm64 dylib accounting from Apple's mach-o/loader.h.
+/// Only segment mappings are counted; dyld/dependencies and allocator overhead
+/// are outside this budget. Apple Silicon mappings are charged in 16 KiB pages.
+fn macho_mapped_bytes(file: &[u8]) -> Result<usize> {
+    fn u32_at(bytes: &[u8], at: usize) -> Result<u32> {
+        let end = at.checked_add(4).ok_or("Mach-O field overflow")?;
+        Ok(u32::from_le_bytes(
+            bytes
+                .get(at..end)
+                .ok_or("Truncated Mach-O field")?
+                .try_into()
+                .unwrap(),
+        ))
+    }
+    fn u64_at(bytes: &[u8], at: usize) -> Result<u64> {
+        let end = at.checked_add(8).ok_or("Mach-O field overflow")?;
+        Ok(u64::from_le_bytes(
+            bytes
+                .get(at..end)
+                .ok_or("Truncated Mach-O field")?
+                .try_into()
+                .unwrap(),
+        ))
+    }
+    const PAGE: u64 = 16 * 1024;
+    if file.len() < 32
+        || u32_at(file, 0)? != 0xfeedfacf
+        || u32_at(file, 4)? != 0x0100000c
+        || u32_at(file, 8)? != 0
+        || u32_at(file, 12)? != 6
+    {
+        return Err("Generated library must be a thin arm64 Mach-O dylib".into());
+    }
+    let count = u32_at(file, 16)? as usize;
+    let command_bytes = u32_at(file, 20)? as usize;
+    let command_end = 32usize
+        .checked_add(command_bytes)
+        .ok_or("Mach-O command overflow")?;
+    if command_end > file.len() || count > command_bytes / 8 {
+        return Err("Invalid Mach-O load-command bounds".into());
+    }
+    let mut at = 32usize;
+    let mut ranges = Vec::new();
+    for _ in 0..count {
+        if command_end.saturating_sub(at) < 8 {
+            return Err("Truncated Mach-O load command".into());
+        }
+        let command = u32_at(file, at)?;
+        let size = u32_at(file, at + 4)? as usize;
+        let next = at.checked_add(size).ok_or("Mach-O command overflow")?;
+        if size < 8 || size & 7 != 0 || next > command_end {
+            return Err("Invalid Mach-O load-command size".into());
+        }
+        if command == 0x19 {
+            if size < 72 {
+                return Err("Truncated Mach-O segment".into());
+            }
+            let segment = &file[at..next];
+            let section_bytes = (u32_at(segment, 64)? as usize)
+                .checked_mul(80)
+                .and_then(|n| n.checked_add(72))
+                .ok_or("Mach-O section count overflow")?;
+            if section_bytes != size {
+                return Err("Invalid Mach-O segment section bounds".into());
+            }
+            let address = u64_at(segment, 24)?;
+            let length = u64_at(segment, 32)?;
+            let file_offset = u64_at(segment, 40)?;
+            let file_size = u64_at(segment, 48)?;
+            let file_end = file_offset
+                .checked_add(file_size)
+                .ok_or("Mach-O file span overflow")?;
+            if file_size > length || file_end > file.len() as u64 {
+                return Err("Invalid Mach-O segment file span".into());
+            }
+            if length != 0 {
+                let end = address
+                    .checked_add(length)
+                    .ok_or("Mach-O VM span overflow")?;
+                let rounded_end = end
+                    .checked_add(PAGE - 1)
+                    .ok_or("Mach-O page rounding overflow")?
+                    & !(PAGE - 1);
+                ranges.push((address & !(PAGE - 1), rounded_end));
+            }
+        }
+        at = next;
+    }
+    if at != command_end {
+        return Err("Mach-O load-command size mismatch".into());
+    }
+    if ranges.is_empty() {
+        return Err("Mach-O dylib has no segment mappings".into());
+    }
+    ranges.sort_unstable();
+    let mut previous_end = 0;
+    let mut total = 0u64;
+    for (start, end) in ranges {
+        if start < previous_end {
+            return Err("Overlapping Mach-O segment mappings".into());
+        }
+        total = total
+            .checked_add(end - start)
+            .ok_or("Mach-O mapped-byte sum overflow")?;
+        previous_end = end;
+    }
+    usize::try_from(total).map_err(|_| "Mach-O mapped-byte count exceeds host usize".into())
 }
 impl Drop for Library {
     fn drop(&mut self) {
@@ -71,8 +187,17 @@ pub(crate) fn compile(
     limit: usize,
     archive: &Path,
     parent: &Path,
+    remaining_mapped_bytes: usize,
 ) -> Result<Compiled> {
-    compile_incremental(file, roots, limit, archive, parent, &BTreeSet::new())
+    compile_incremental(
+        file,
+        roots,
+        limit,
+        archive,
+        parent,
+        &BTreeSet::new(),
+        remaining_mapped_bytes,
+    )
 }
 
 /// Full discovery still validates overlap and the cumulative instruction limit.
@@ -84,6 +209,7 @@ pub(crate) fn compile_incremental(
     archive: &Path,
     parent: &Path,
     existing: &BTreeSet<u64>,
+    remaining_mapped_bytes: usize,
 ) -> Result<Compiled> {
     if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         return Err("Module compilation requires Apple Silicon macOS".into());
@@ -111,6 +237,7 @@ pub(crate) fn compile_incremental(
     let mut library = Library {
         handle: std::ptr::null_mut(),
         directory,
+        mapped_bytes: 0,
     };
     let source = library.directory.join("module.S");
     let output = library.directory.join("module.dylib");
@@ -130,6 +257,16 @@ pub(crate) fn compile_incremental(
             String::from_utf8_lossy(&build.stderr)
         ));
     }
+    let generated =
+        std::fs::read(&output).map_err(|e| format!("Cannot read generated library: {e}"))?;
+    library.mapped_bytes = macho_mapped_bytes(&generated)?;
+    if library.mapped_bytes > remaining_mapped_bytes {
+        return Err(format!(
+            "Compiled library mapped-byte budget exceeded: {} > {}",
+            library.mapped_bytes, remaining_mapped_bytes
+        ));
+    }
+    drop(generated);
     let path = CString::new(
         output
             .canonicalize()
@@ -246,6 +383,96 @@ fn incremental_discovery(mut discovery: Discovery, existing: &BTreeSet<u64>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn macho_fixture(segments: &[(u64, u64, u64, u64)]) -> Vec<u8> {
+        let mut file = vec![0u8; 32 + segments.len() * 72];
+        for (at, value) in [
+            (0, 0xfeedfacfu32),
+            (4, 0x0100000c),
+            (12, 6),
+            (16, segments.len() as u32),
+            (20, (segments.len() * 72) as u32),
+        ] {
+            file[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        for (n, &(address, size, file_offset, file_size)) in segments.iter().enumerate() {
+            let at = 32 + n * 72;
+            file[at..at + 4].copy_from_slice(&0x19u32.to_le_bytes());
+            file[at + 4..at + 8].copy_from_slice(&72u32.to_le_bytes());
+            for (offset, value) in [
+                (24, address),
+                (32, size),
+                (40, file_offset),
+                (48, file_size),
+            ] {
+                file[at + offset..at + offset + 8].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        file
+    }
+    #[test]
+    fn macho_accounting_counts_zero_fill_and_rounds_full_spans() {
+        let file = macho_fixture(&[(1, 16_384, 0, 104)]);
+        assert_eq!(macho_mapped_bytes(&file).unwrap(), 32_768);
+        let file = macho_fixture(&[
+            (0, 16_384, 0, 100),
+            (32_768, 32_769, 0, 0),
+            (u64::MAX, 0, 0, 0),
+        ]);
+        assert_eq!(macho_mapped_bytes(&file).unwrap(), 65_536);
+        // Even disjoint raw byte ranges must not share a charged VM page.
+        assert!(macho_mapped_bytes(&macho_fixture(&[(0, 1, 0, 0), (1, 1, 0, 0)])).is_err());
+        assert!(
+            macho_mapped_bytes(&macho_fixture(&[(0, 32768, 0, 0), (16384, 16384, 0, 0)])).is_err()
+        );
+        assert!(macho_mapped_bytes(&macho_fixture(&[])).is_err());
+        assert!(macho_mapped_bytes(&macho_fixture(&[(0, 0, 0, 0)])).is_err());
+    }
+    #[test]
+    fn macho_accounting_rejects_malformed_headers_commands_and_spans() {
+        let valid = macho_fixture(&[(0, 16_384, 0, 104)]);
+        for length in [0, 4, 31, 32, 39, 103] {
+            assert!(
+                macho_mapped_bytes(&valid[..length]).is_err(),
+                "length {length}"
+            );
+        }
+        for (offset, value) in [
+            (0, 0xcffaedfeu32), // swapped endian
+            (0, 0xcafebabe),    // universal binary
+            (4, 0x01000007),    // x86_64
+            (8, 2),             // arm64e is not the generated arm64 ABI
+            (12, 2),            // executable, not dylib
+            (16, 2),            // missing command
+            (16, u32::MAX),
+            (20, u32::MAX),
+            (20, 71),
+            (36, 0),
+            (36, 7),
+            (36, 71),
+            (36, 80),
+            (96, 1), // section count exceeds command
+        ] {
+            let mut file = valid.clone();
+            file[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            assert!(
+                macho_mapped_bytes(&file).is_err(),
+                "field {offset}: {value}"
+            );
+        }
+        for segments in [
+            vec![(u64::MAX - 1, 3, 0, 0)], // VM overflow
+            vec![(u64::MAX - 1, 1, 0, 0)], // rounding overflow
+            vec![(0, 1, 0, 2)],            // file size exceeds VM size
+            vec![(0, 16384, 100, 5)],      // file end outside 104-byte fixture
+            vec![(0, 16384, u64::MAX, 1)], // file span overflow
+        ] {
+            assert!(macho_mapped_bytes(&macho_fixture(&segments)).is_err());
+        }
+        let mut extra = valid.clone();
+        extra.extend_from_slice(&[0; 8]);
+        extra[20..24].copy_from_slice(&80u32.to_le_bytes());
+        assert!(macho_mapped_bytes(&extra).is_err()); // unaccounted command bytes
+    }
     #[test]
     fn incremental_emission_stops_at_old_boundaries_and_preserves_union_manifest() {
         let mut file = crate::module_executor::memory_fixture();
@@ -303,8 +530,28 @@ mod tests {
         ));
         let file = crate::module_executor::memory_fixture();
         let archive = directory.join("missing.a");
-        assert!(compile(&file, BTreeSet::new(), 100, &archive, &directory).is_err());
-        assert!(compile(&file, BTreeSet::from([0x100]), 1, &archive, &directory).is_err());
+        assert!(
+            compile(
+                &file,
+                BTreeSet::new(),
+                100,
+                &archive,
+                &directory,
+                usize::MAX
+            )
+            .is_err()
+        );
+        assert!(
+            compile(
+                &file,
+                BTreeSet::from([0x100]),
+                1,
+                &archive,
+                &directory,
+                usize::MAX
+            )
+            .is_err()
+        );
         let mut unsupported = file;
         unsupported[0x100] = 0xf4;
         assert!(
@@ -313,7 +560,8 @@ mod tests {
                 BTreeSet::from([0x100]),
                 100,
                 &archive,
-                &directory
+                &directory,
+                usize::MAX,
             )
             .is_err()
         );

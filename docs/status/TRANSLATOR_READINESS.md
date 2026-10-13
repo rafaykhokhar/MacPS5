@@ -82,3 +82,38 @@ This checkpoint retains synchronous full-union discovery, clang/link subprocess
 latency and the 16-attempt bound. Multiple dylibs retain linked runtime code;
 their resident-memory cost is not yet budgeted or measured. No speedup percentage,
 persistent cache, parallel host execution or production JIT claim follows.
+
+## Retained-library budget
+
+Generated libraries now have a configurable executor-wide budget: by default,
+256 MiB of page-rounded Mach-O segment mappings and 256 retained libraries.
+`translation_cache_usage` deduplicates shared library ownership across native
+entries. `set_translation_cache_limits` rejects limits below current usage;
+zero limits can disable compilation on an empty executor. No code is evicted
+to satisfy a reduction. Removing an image releases its cache ownership.
+
+The compiler reads its generated thin arm64 dylib and charges LC_SEGMENT_64
+virtual sizes, including zero-fill, rounded to 16 KiB pages. It validates load
+commands, section-table bounds, file spans, VM overflow and overlapping rounded
+ranges. A batch exceeding the remaining byte budget is rejected before dlopen
+and its temporary artifacts are removed. The library-count limit is checked
+before compilation. The format reference is Apple's SDK `mach-o/loader.h`
+(`mach_header_64`, `segment_command_64`, `section_64`) and `mach/machine.h`.
+
+This is mapped-segment accounting, not measured RSS. Compiler peak memory,
+dyld metadata, shared dependencies, host allocations, translation source data,
+guest data and graphics resources remain outside this particular budget. The
+16-attempt bound is retained. This does not prove the 16 GB total-memory target.
+
+Verification: 601 library tests, three integration tests, strict Clippy and
+release compilation pass (`work/translator-cache-{tests,clippy,release}.log`,
+process 4452 exit 0). Native checks verify disabled compilation, both budget
+failure paths, retained old execution, unchanged artifacts on rejection and
+zero usage after unload (`work/translator-incremental/cache-native-final.log`,
+process 67343 exit 0). This small fixture charges 32,768 bytes for its first
+library and 98,304 bytes for three libraries; these are not game measurements.
+Existing automatic/explicit translation regressions pass under default limits
+(`work/translator-incremental/cache-regression.log`, process 95230 exit 0).
+The real homebrew startup-only regression also passes under default limits
+(`work/arm64-prototype/translator-cache-entry.log`, process 74074 exit 0),
+stopping at the existing missing fscanf import. Game main remains unexecuted.
