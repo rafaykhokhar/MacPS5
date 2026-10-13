@@ -853,3 +853,27 @@ The archive/directory remain required by the shared harness and potential module
 loading paths. The root direct source has no unsupported-instruction fallback to
 the dylib compiler. The next CPU boundary is byte-immediate MOV, rather than a
 fabricated callback or successful stub for the raw probe's missing environment.
+
+## Direct byte-immediate MOV
+
+Direct B0 and C6 immediate MOV forms now write byte registers, and C6 memory
+destinations use the guarded one-byte store helper. Register lowering distinguishes
+legacy AH/CH/DH/BH from REX-selected SPL/BPL/SIL/DIL and R8L–R15L. It writes exactly
+the selected byte in the trusted CPU context without zero-extending the containing
+register. Flags and neighboring register/memory bytes remain unchanged.
+
+`direct_byte_constant_native.rs` passes 2016 native cases: both register encodings,
+legacy/REX byte-register selection, selected immediate values, fuel/prior faults,
+all memory bases, unaligned/end-of-mapping stores and unmapped/read-only faults.
+687 library tests, three integration tests, strict Clippy, release build and the
+strict-warning verifier pass. The configured startup harness also compiles, then
+exits 1 at the next explicit unsupported instruction (process 13958):
+`Translation miss at 0x10000061 (bias 0x10000000): Direct lowering unsupported: Inc_rm64`.
+The log is `/tmp/macps5-byte-startup.log`; accepting the byte store does not imply
+the rest of that span executed. Existing C7 immediate MOV and register-MOV native
+regressions pass (process 84435, exit 0).
+
+Reproduce the standalone verifier with the release rlib/dependency flags above
+and no arguments. The preceding `--direct-startup` command reproduces the real
+startup boundary. Byte register-to-register/load/store MOV forms, word forms and
+INC remain unfinished in the direct backend; no game compatibility is claimed.

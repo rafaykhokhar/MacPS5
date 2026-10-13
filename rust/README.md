@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct byte-immediate MOV now supports memory and low/high byte registers while
+preserving neighboring bytes. 2016 native cases pass; configured direct startup
+now stops on INC64 instead. See
+[byte MOV evidence](../docs/status/TRANSLATOR_READINESS.md#direct-byte-immediate-mov).
+
 The existing configured startup harness now accepts `--direct-startup`, selecting
 on-demand direct translation for the root ELF with the normal arguments, callback
 table and services. Multi-byte NOPs pass 120 native checks; the configured probe
