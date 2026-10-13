@@ -1,5 +1,11 @@
 # Allocating printf implementation audit
 
+## Protected hexadecimal executor integration
+
+The executor now owns and remaps the gdtoa pool at `0x7fff00002000`, with heap-cache ownership retained through `OwnedMappings`. Ordinary guest writes, frees and reallocations reject runtime-owned storage, including allocator padding; narrowly scoped internal operations require the matching owner and still enforce callback barriers. Suspended contexts expose the pool read-only.
+
+`vasprintf` uses the protected hexadecimal renderer and publishes MXCSR effects in source order even if a later operation fails. Integer/text/wide formatting remains available; decimal floating formatting remains an explicit unsupported boundary pending its owned bigint allocation sequence. The combined tree passes 478 library tests, three integration tests and strict Clippy (`hex-executor-tests.log`, 36283). A service-level test verifies hexadecimal output, retained-buffer cleanup and rejection of final pointer publication into the private pool. Native AL/XMM wrapper verification against a matching release remains pending for this increment.
+
 ## Wide conversion increment
 
 The registered service now supports `%lc` and `%ls` under the audited C-byte/wchar16 policy. Encoding failures publish NULL and EILSEQ after preserving already consumed arguments. Source-required temporary allocations are owned and explicitly freed; a scratch cleanup failure no longer skips cleanup of the independent output allocation. Successful large-precision sizing can set errno as the source does, with guarded writes.

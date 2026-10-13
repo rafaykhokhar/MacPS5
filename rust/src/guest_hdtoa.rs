@@ -169,7 +169,9 @@ mod tests {
         let mut store = Store::new(0x10000).unwrap();
         let (pool, state) = store.split_mut();
         let mut memory = Memory::default();
-        memory.add(0x10000, pool, true, false).unwrap();
+        memory
+            .add_runtime_data(0x10000, pool, state.runtime_owner())
+            .unwrap();
         let mut retained = Retained::default();
         let mut control = 0x1f80;
         let result = convert(
@@ -194,7 +196,9 @@ mod tests {
         let mut store = Store::new(0x10000).unwrap();
         let (pool, state) = store.split_mut();
         let mut memory = Memory::default();
-        memory.add(0x10000, pool, true, false).unwrap();
+        memory
+            .add_runtime_data(0x10000, pool, state.runtime_owner())
+            .unwrap();
         let mut retained = Retained::default();
         let mut control = 0x1f80;
         convert(
@@ -227,7 +231,9 @@ mod tests {
         let mut store = Store::new(0x10000).unwrap();
         let (pool, state) = store.split_mut();
         let mut memory = Memory::default();
-        memory.add(0x10000, pool, true, false).unwrap();
+        memory
+            .add_runtime_data(0x10000, pool, state.runtime_owner())
+            .unwrap();
         for _ in 0..72 {
             state.balloc(&mut memory, 0).unwrap();
         }
@@ -256,7 +262,9 @@ mod tests {
         let (pool, state) = store.split_mut();
         let mut memory = Memory::default();
         memory.attach_owned(&mut owner).unwrap();
-        memory.add(0x10000, pool, true, false).unwrap();
+        memory
+            .add_runtime_data(0x10000, pool, state.runtime_owner())
+            .unwrap();
         let mut retained = Retained::default();
         let mut control = 0x1f80;
         let out = convert(
@@ -268,8 +276,16 @@ mod tests {
             |_| Ok::<_, ()>(1.0f64.to_bits()),
         )
         .unwrap();
-        assert!(memory.heap_allocation_size(out.digits_address - 4).unwrap() >= 4128);
+        assert!(
+            memory
+                .runtime_heap_allocation_size(out.digits_address - 4, state.runtime_owner())
+                .unwrap()
+                >= 4128
+        );
         assert_eq!(out.digits_len, 4097);
+        assert!(memory.heap_allocation_size(out.digits_address - 4).is_err());
+        assert!(memory.free(out.digits_address - 4).is_err());
+        assert!(memory.store(out.digits_address, 0, 1).is_err());
         assert_eq!(state.pool_used(), 0);
         retained.release(state, &mut memory).unwrap();
         assert!(memory.heap_allocation_size(out.digits_address - 4).is_err());

@@ -1,5 +1,19 @@
 //! Borrowed guest mappings. Host pointers are never derived from guest addresses.
 use crate::Result;
+/// Unforgeable identity for runtime-private, guest-readable storage.
+/// There is deliberately no whole-call protection bypass: each internal write
+/// must supply its owner, while guest-directed writes retain normal checks.
+#[derive(Clone)]
+pub struct RuntimeOwner(std::rc::Rc<()>);
+impl RuntimeOwner {
+    pub(crate) fn new() -> Self {
+        Self(std::rc::Rc::new(()))
+    }
+    fn matches(&self, other: &Self) -> bool {
+        std::rc::Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 enum Bytes<'a> {
     Borrowed(&'a mut [u8]),
     Owned(Vec<u8>),
@@ -24,11 +38,19 @@ impl std::ops::DerefMut for Bytes<'_> {
 /// Process-owned anonymous mappings survive dispatcher returns and suspension.
 #[derive(Default)]
 pub struct OwnedMappings {
-    regions: Vec<(u64, Vec<u8>, bool, bool, bool)>,
+    regions: Vec<OwnedRegion>,
+}
+struct OwnedRegion {
+    address: u64,
+    bytes: Vec<u8>,
+    writable: bool,
+    heap: bool,
+    direct: bool,
+    runtime_owner: Option<RuntimeOwner>,
 }
 impl OwnedMappings {
     pub fn bytes_allocated(&self) -> usize {
-        self.regions.iter().map(|(_, b, _, _, _)| b.len()).sum()
+        self.regions.iter().map(|r| r.bytes.len()).sum()
     }
 }
 /// Borrowed process data, including a suspended caller's stack. Never executable.
@@ -41,6 +63,7 @@ struct Region<'a> {
     heap: bool,
     direct: bool,
     service_data: bool,
+    runtime_owner: Option<RuntimeOwner>,
     address: u64,
     bytes: Bytes<'a>,
     writable: bool,
@@ -58,9 +81,14 @@ impl Drop for Memory<'_> {
         if let Some(owner) = self.owned.as_mut() {
             for r in self.regions.drain(..) {
                 if let Bytes::Owned(bytes) = r.bytes {
-                    owner
-                        .regions
-                        .push((r.address, bytes, r.writable, r.heap, r.direct));
+                    owner.regions.push(OwnedRegion {
+                        address: r.address,
+                        bytes,
+                        writable: r.writable,
+                        heap: r.heap,
+                        direct: r.direct,
+                        runtime_owner: r.runtime_owner,
+                    });
                 }
             }
         }
@@ -136,21 +164,31 @@ impl<'a> Memory<'a> {
         if self.owned.is_some() {
             return Err("Anonymous mapping owner already attached".into());
         }
-        for (address, bytes, _, _, _) in &owner.regions {
-            let end = *address + bytes.len() as u64;
+        for r in &owner.regions {
+            let address = r.address;
+            let end = address + r.bytes.len() as u64;
             if self
                 .regions
                 .iter()
-                .any(|r| *address < r.address + r.bytes.len() as u64 && r.address < end)
+                .any(|r| address < r.address + r.bytes.len() as u64 && r.address < end)
             {
                 return Err("Anonymous mapping overlaps process storage".into());
             }
         }
-        for (address, bytes, writable, heap, direct) in owner.regions.drain(..) {
+        for OwnedRegion {
+            address,
+            bytes,
+            writable,
+            heap,
+            direct,
+            runtime_owner,
+        } in owner.regions.drain(..)
+        {
             self.regions.push(Region {
                 heap,
                 direct,
                 service_data: false,
+                runtime_owner,
                 address,
                 bytes: Bytes::Owned(bytes),
                 writable,
@@ -189,7 +227,12 @@ impl<'a> Memory<'a> {
     pub fn heap_allocation_size(&self, address: u64) -> Result<usize> {
         self.regions
             .iter()
-            .find(|r| r.address == address && r.heap && matches!(r.bytes, Bytes::Owned(_)))
+            .find(|r| {
+                r.address == address
+                    && r.heap
+                    && r.runtime_owner.is_none()
+                    && matches!(r.bytes, Bytes::Owned(_))
+            })
             .map(|r| r.bytes.len())
             .ok_or_else(|| "Invalid guest heap allocation base".into())
     }
@@ -200,10 +243,107 @@ impl<'a> Memory<'a> {
         let index = self
             .regions
             .iter()
-            .position(|r| r.address == address && r.heap && matches!(r.bytes, Bytes::Owned(_)))
+            .position(|r| {
+                r.address == address
+                    && r.heap
+                    && r.runtime_owner.is_none()
+                    && matches!(r.bytes, Bytes::Owned(_))
+            })
             .ok_or("Invalid guest heap free")?;
         self.regions.remove(index);
         Ok(())
+    }
+    /// Claim an exact heap allocation, including allocator-rounded padding.
+    pub fn mark_runtime_heap(&mut self, address: u64, owner: &RuntimeOwner) -> Result<()> {
+        let r = self
+            .regions
+            .iter_mut()
+            .find(|r| r.address == address && r.heap && matches!(r.bytes, Bytes::Owned(_)))
+            .ok_or("Invalid runtime heap base")?;
+        if r.runtime_owner
+            .as_ref()
+            .is_some_and(|old| !old.matches(owner))
+        {
+            return Err("Runtime storage owner mismatch".into());
+        }
+        r.runtime_owner = Some(owner.clone());
+        Ok(())
+    }
+    pub fn runtime_heap_allocation_size(
+        &self,
+        address: u64,
+        owner: &RuntimeOwner,
+    ) -> Result<usize> {
+        let r = self
+            .regions
+            .iter()
+            .find(|r| r.address == address && r.heap && matches!(r.bytes, Bytes::Owned(_)))
+            .ok_or("Invalid runtime heap base")?;
+        if !r
+            .runtime_owner
+            .as_ref()
+            .is_some_and(|old| old.matches(owner))
+        {
+            return Err("Runtime storage owner mismatch".into());
+        }
+        Ok(r.bytes.len())
+    }
+    pub fn runtime_free(&mut self, address: u64, owner: &RuntimeOwner) -> Result<()> {
+        self.runtime_heap_allocation_size(address, owner)?;
+        let index = self
+            .regions
+            .iter()
+            .position(|r| r.address == address)
+            .unwrap();
+        self.regions.remove(index);
+        Ok(())
+    }
+    /// Re-map an executor-owned static pool on each Memory reconstruction.
+    pub fn add_runtime_data(
+        &mut self,
+        address: u64,
+        bytes: &'a mut [u8],
+        owner: &RuntimeOwner,
+    ) -> Result<()> {
+        self.add(address, bytes, true, false)?;
+        self.regions.last_mut().unwrap().runtime_owner = Some(owner.clone());
+        Ok(())
+    }
+    pub fn validate_runtime_write(
+        &self,
+        address: u64,
+        size: usize,
+        owner: &RuntimeOwner,
+    ) -> Result<()> {
+        self.validate_write_for(address, size, Some(owner))
+    }
+    pub fn runtime_write(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+        owner: &RuntimeOwner,
+    ) -> Result<()> {
+        self.validate_runtime_write(address, bytes.len(), owner)?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let index = self.region(address, bytes.len())?;
+        let r = &mut self.regions[index];
+        let p = (address - r.address) as usize;
+        r.bytes[p..p + bytes.len()].copy_from_slice(bytes);
+        Ok(())
+    }
+    pub fn runtime_store(
+        &mut self,
+        address: u64,
+        value: u64,
+        size: u64,
+        owner: &RuntimeOwner,
+    ) -> Result<()> {
+        if ![1, 2, 4, 8].contains(&size) {
+            return Err("Invalid scalar width".into());
+        }
+        self.runtime_write(address, &value.to_le_bytes()[..size as usize], owner)
     }
     fn allocate_owned(
         &mut self,
@@ -263,6 +403,7 @@ impl<'a> Memory<'a> {
             heap,
             direct,
             service_data: false,
+            runtime_owner: None,
             address,
             bytes: Bytes::Owned(bytes),
             writable,
@@ -339,6 +480,7 @@ impl<'a> Memory<'a> {
             heap: false,
             direct: false,
             service_data: false,
+            runtime_owner: None,
             address,
             bytes: Bytes::Borrowed(bytes),
             writable,
@@ -460,6 +602,14 @@ impl<'a> Memory<'a> {
     }
     /// Validate an entire output buffer without changing guest storage.
     pub fn validate_write(&self, address: u64, size: usize) -> Result<()> {
+        self.validate_write_for(address, size, None)
+    }
+    fn validate_write_for(
+        &self,
+        address: u64,
+        size: usize,
+        owner: Option<&RuntimeOwner>,
+    ) -> Result<()> {
         if size == 0 {
             return Ok(());
         }
@@ -474,6 +624,11 @@ impl<'a> Memory<'a> {
             return Err("Guest write overlaps an active comparator return frame".into());
         }
         let r = &self.regions[self.region(address, size)?];
+        match (&r.runtime_owner, owner) {
+            (None, None) => (),
+            (Some(stored), Some(supplied)) if stored.matches(supplied) => (),
+            _ => return Err("Guest write to runtime storage or runtime owner mismatch".into()),
+        }
         if !r.writable || r.executable {
             return Err("Guest write permission failure".into());
         }
@@ -713,6 +868,91 @@ pub mod ffi {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn runtime_pool_requires_identity_and_preserves_frame_barriers() {
+        use super::{Memory, RuntimeOwner};
+        let owner = RuntimeOwner::new();
+        let other = RuntimeOwner::new();
+        let mut pool = [0xa5; 64];
+        let mut source = [7; 16];
+        let mut m = Memory::default();
+        m.add_runtime_data(0x1000, &mut pool, &owner).unwrap();
+        m.add(0x2000, &mut source, true, false).unwrap();
+        assert!(m.write(0x1000, &[1]).is_err());
+        assert!(m.store(0x1000, 1, 8).is_err());
+        assert!(m.memcpy(0x1000, 0x2000, 16).is_err());
+        assert!(m.atomic_xadd_u32(0x1000, 1).is_err());
+        assert!(m.runtime_write(0x1000, &[1], &other).is_err());
+        assert!(m.runtime_write(0x2000, &[1], &owner).is_err());
+        assert_eq!(m.read(0x1000, 64).unwrap(), &[0xa5; 64]);
+        m.runtime_store(0x1000, 0x1234, 2, &owner.clone()).unwrap();
+        assert_eq!(m.load(0x1000, 2).unwrap(), 0x1234);
+        m.set_write_barriers(vec![(0x1008, 8)]);
+        assert!(m.runtime_write(0x1007, &[0; 10], &owner).is_err());
+        assert_eq!(m.read(0x1007, 10).unwrap(), &[0xa5; 10]);
+        m.set_write_barriers(Vec::new());
+        assert!(m.write(0x1008, &[1]).is_err());
+        assert!(m.runtime_free(0x1000, &owner).is_err());
+        assert!(m.unmap_anonymous(0x1000, 64).is_err());
+    }
+    #[test]
+    fn runtime_pool_can_be_remapped_without_losing_protection() {
+        use super::{Memory, RuntimeOwner};
+        let owner = RuntimeOwner::new();
+        let mut pool = [0; 64];
+        for value in [17, 29] {
+            let mut m = Memory::default();
+            m.add_runtime_data(0x4000, &mut pool, &owner).unwrap();
+            assert!(m.write(0x4000, &[0]).is_err());
+            assert!(m.mark_runtime_heap(0x4000, &owner).is_err());
+            assert!(m.unmap_anonymous(0x4000, 16384).is_err());
+            m.runtime_write(0x4000, &[value], &owner).unwrap();
+        }
+        assert_eq!(pool[0], 29);
+    }
+    #[test]
+    fn runtime_heap_protection_survives_memory_reconstruction() {
+        use super::{Memory, OwnedMappings, RuntimeOwner};
+        let owner = RuntimeOwner::new();
+        let foreign = RuntimeOwner::new();
+        let mut mappings = OwnedMappings::default();
+        let address;
+        {
+            let mut m = Memory::default();
+            m.attach_owned(&mut mappings).unwrap();
+            address = m.malloc(40).unwrap();
+            assert!(m.mark_runtime_heap(address + 1, &owner).is_err());
+            m.mark_runtime_heap(address, &owner).unwrap();
+            assert!(m.mark_runtime_heap(address, &foreign).is_err());
+            assert!(m.runtime_free(address, &foreign).is_err());
+            assert!(m.free(address).is_err());
+            assert!(m.heap_allocation_size(address).is_err());
+            assert_eq!(m.runtime_heap_allocation_size(address, &owner).unwrap(), 48);
+            assert!(m.write(address + 47, &[1]).is_err());
+            let before = m.regions.len();
+            assert!(crate::libc_memory::realloc(&mut m, address, 64).is_err());
+            assert_eq!(m.regions.len(), before);
+            m.runtime_write(address + 47, &[99], &owner).unwrap();
+            assert!(m.unmap_anonymous(address, 48).is_err());
+        }
+        assert_eq!(mappings.bytes_allocated(), 48);
+        {
+            let mut m = Memory::default();
+            m.attach_owned(&mut mappings).unwrap();
+            assert_eq!(m.load(address + 47, 1).unwrap(), 99);
+            assert!(m.free(address).is_err());
+            assert!(m.write(address, &[1]).is_err());
+            assert_eq!(m.runtime_heap_allocation_size(address, &owner).unwrap(), 48);
+            m.runtime_free(address, &owner).unwrap();
+            let ordinary = m.malloc(40).unwrap();
+            assert_eq!(ordinary, address);
+            m.write(ordinary, &[1]).unwrap();
+            assert!(m.runtime_free(ordinary, &owner).is_err());
+            m.free(ordinary).unwrap();
+        }
+        assert_eq!(mappings.bytes_allocated(), 0);
+    }
+
+    #[test]
     fn memcpy_validates_complete_ranges_before_copying() {
         let mut source = [1, 2, 3, 4, 5, 6, 7, 8];
         let mut output = [0xa5; 16];
@@ -852,9 +1092,11 @@ mod tests {
                     &vectors[reg as usize][..size as usize],
                     memory.read(0x1001, size as usize).unwrap()
                 );
-                assert!(vectors[reg as usize][size as usize..]
-                    .iter()
-                    .all(|&b| b == 0));
+                assert!(
+                    vectors[reg as usize][size as usize..]
+                        .iter()
+                        .all(|&b| b == 0)
+                );
                 let before = vectors;
                 for (address, index, width, aligned) in [
                     (0x1001, reg, size, 1),

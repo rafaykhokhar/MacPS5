@@ -80,11 +80,72 @@ fn pad(
 fn flush(output: &mut Output, buffer: &mut Buffer<'_, '_>) -> Result<(), Error> {
     output.flush(|v| sink(buffer, v)).map_err(output_error)
 }
+/// Explicit source-backed hexadecimal context; the default render entry remains
+/// unchanged. State and pool mappings must belong to this executor.
+pub struct HexContext<'a> {
+    pub state: &'a mut crate::guest_gdtoa::State,
+    pub retained: &'a mut crate::guest_gdtoa::Retained,
+    pub mxcsr: &'a mut u32,
+}
+fn disjoint(address: u64, length: usize, ranges: &[(u64, usize)]) -> crate::Result<()> {
+    let end = address
+        .checked_add(length as u64)
+        .ok_or("Printf private range overflow")?;
+    if length != 0
+        && ranges
+            .iter()
+            .any(|&(base, count)| address < base.saturating_add(count as u64) && base < end)
+    {
+        return Err("Printf source or destination aliases owned gdtoa storage".into());
+    }
+    Ok(())
+}
+fn ranges(state: &crate::guest_gdtoa::State) -> Result<Vec<(u64, usize)>, Error> {
+    let mut result = Vec::new();
+    for range in state.owned_ranges() {
+        result
+            .try_reserve(1)
+            .map_err(|_| fault("Printf ownership snapshot allocation"))?;
+        result.push(range);
+    }
+    Ok(result)
+}
+struct ArgumentMemory<'m, 'a, 'r> {
+    memory: &'m mut Memory<'a>,
+    ranges: &'r [(u64, usize)],
+    output: (u64, usize),
+    wide: Option<(u64, usize)>,
+}
+impl crate::printf_args::Memory for ArgumentMemory<'_, '_, '_> {
+    type Error = String;
+    fn read(&self, address: u64, out: &mut [u8]) -> crate::Result<()> {
+        disjoint(address, out.len(), self.ranges)?;
+        disjoint(address, out.len(), &[self.output])?;
+        if let Some(wide) = self.wide {
+            disjoint(address, out.len(), &[wide])?;
+        }
+        out.copy_from_slice(self.memory.read(address, out.len())?);
+        Ok(())
+    }
+    fn validate_write(&self, address: u64, length: usize) -> crate::Result<()> {
+        disjoint(address, length, self.ranges)?;
+        disjoint(address, length, &[self.output])?;
+        if let Some(wide) = self.wide {
+            disjoint(address, length, &[wide])?;
+        }
+        self.memory.validate_write(address, length)
+    }
+    fn write(&mut self, address: u64, bytes: &[u8]) -> crate::Result<()> {
+        self.validate_write(address, bytes.len())?;
+        self.memory.write(address, bytes)
+    }
+}
 struct Context<'b, 'm, 'a, G> {
     buffer: &'b mut Buffer<'m, 'a>,
     cursor: Cursor,
     guard: &'b mut G,
     wide: Option<u64>,
+    gdtoa_ranges: Vec<(u64, usize)>,
 }
 impl<G: FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>> Context<'_, '_, '_, G> {
     fn fetch(&mut self, class: Class) -> Result<Value, Error> {
@@ -98,6 +159,19 @@ impl<G: FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>> Context<'_, '_, '_,
                     .map(|length| (base, length))
             })
             .transpose()?;
+        if !self.gdtoa_ranges.is_empty() {
+            let guard = &mut self.guard;
+            let mut memory = ArgumentMemory {
+                memory: self.buffer.memory(),
+                ranges: &self.gdtoa_ranges,
+                output: (base, length),
+                wide,
+            };
+            return self
+                .cursor
+                .fetch(&mut memory, class, |m, a, n| guard(m.memory, a, n))
+                .map_err(|e| fault(format!("Printf argument fault: {e:?}")));
+        }
         let guard = &mut self.guard;
         self.cursor
             .fetch(self.buffer.memory(), class, |memory, address, count| {
@@ -116,6 +190,7 @@ impl<G: FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>> Context<'_, '_, '_,
     }
 
     fn external_write(&mut self, address: u64, length: usize) -> Result<(), Error> {
+        disjoint(address, length, &self.gdtoa_ranges)?;
         self.buffer.validate_external_write(address, length)?;
         if let Some(base) = self.wide {
             let size = self.buffer.memory().heap_allocation_size(base)?;
@@ -156,6 +231,10 @@ impl<G: FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>> Context<'_, '_, '_,
             if address < base + size as u64 && base < end {
                 return Err(Kind::PrivateStorageAlias.into());
             }
+        }
+        disjoint(address, 2, &self.gdtoa_ranges)?;
+        if !self.gdtoa_ranges.is_empty() {
+            disjoint(address, 2, &[self.buffer.private_span()?])?;
         }
         Ok(self.buffer.memory().load(address, 2)? as u16)
     }
@@ -241,6 +320,10 @@ impl<G: FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>> Context<'_, '_, '_,
 impl<G: FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>> Host for Context<'_, '_, '_, G> {
     type Fault = Error;
     fn read_byte(&mut self, address: u64) -> Result<u8, Error> {
+        disjoint(address, 1, &self.gdtoa_ranges)?;
+        if !self.gdtoa_ranges.is_empty() {
+            disjoint(address, 1, &[self.buffer.private_span()?])?;
+        }
         Ok(self.buffer.memory().load(address, 1)? as u8)
     }
     fn fetch_gp(&mut self, positional: Option<usize>) -> Result<u64, Error> {
@@ -370,8 +453,36 @@ pub fn render(
     format: u64,
     va: u64,
     options: Options,
+    guard: impl FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>,
+) -> Result<(), Error> {
+    render_internal(buffer, format, va, options, None, guard)
+}
+/// Source-backed a/A rendering, with all gdtoa ranges excluded from guest
+/// format/argument/count accesses. Decimal/extended floats stay unsupported.
+/// The caller must also guard final result-slot publication against gdtoa ranges.
+pub fn render_with_hdtoa(
+    buffer: &mut Buffer<'_, '_>,
+    format: u64,
+    va: u64,
+    options: Options,
+    hex: HexContext<'_>,
+    guard: impl FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>,
+) -> Result<(), Error> {
+    render_internal(buffer, format, va, options, Some(hex), guard)
+}
+fn render_internal(
+    buffer: &mut Buffer<'_, '_>,
+    format: u64,
+    va: u64,
+    options: Options,
+    mut hex: Option<HexContext<'_>>,
     mut guard: impl FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>,
 ) -> Result<(), Error> {
+    let initial_ranges = hex
+        .as_ref()
+        .map(|h| ranges(h.state))
+        .transpose()?
+        .unwrap_or_default();
     let mut parser = Parser::new(format, options.parser)
         .map_err(|e| fault(format!("Printf parser bound: {e:?}")))?;
     let mut output = Output::new(options.output_limit.min(i32::MAX as usize));
@@ -380,6 +491,7 @@ pub fn render(
         cursor: Cursor::new(va, options.argument_limit),
         guard: &mut guard,
         wide: None,
+        gdtoa_ranges: initial_ranges,
     };
     let result = (|| {
         while let Some(item) = parser.next(&mut context).map_err(|e| match e {
@@ -415,6 +527,67 @@ pub fn render(
                     .memory()
                     .store(address, output.total() as u64, width as u64)?;
                 continue; // Source %n bypasses ordinary conversion flush.
+            }
+            if let Some(h) = hex.as_mut()
+                && b"fFeEgGaA".contains(&spec.conversion)
+            {
+                if !b"aA".contains(&spec.conversion) {
+                    return Err(fault("Source decimal gdtoa allocation sequencing pending"));
+                }
+                let output_range = context.buffer.private_span()?;
+                let wide = context
+                    .wide
+                    .map(|base| {
+                        context
+                            .buffer
+                            .memory()
+                            .heap_allocation_size(base)
+                            .map(|n| (base, n))
+                    })
+                    .transpose()?;
+                let cursor = &mut context.cursor;
+                let guard = &mut context.guard;
+                let private = &context.gdtoa_ranges;
+                let converted = crate::guest_hdtoa::convert(
+                    h.state,
+                    h.retained,
+                    context.buffer.memory(),
+                    spec,
+                    h.mxcsr,
+                    |memory| {
+                        let mut memory = ArgumentMemory {
+                            memory,
+                            ranges: private,
+                            output: output_range,
+                            wide,
+                        };
+                        match cursor
+                            .fetch(&mut memory, Class::Binary64, |m, a, n| {
+                                guard(m.memory, a, n)
+                            })
+                            .map_err(|e| fault(format!("Printf argument fault: {e:?}")))?
+                        {
+                            Value::Binary64(bits) => Ok(bits),
+                            _ => Err(fault("Printf binary64 argument invariant")),
+                        }
+                    },
+                )
+                .map_err(|e| match e {
+                    crate::guest_hdtoa::Error::Fetch(e) => e,
+                    other => fault(format!("Printf hdtoa fault: {other:?}")),
+                })?;
+                context.gdtoa_ranges = ranges(h.state)?;
+                converted
+                    .field
+                    .emit(&mut output, |v| sink(context.buffer, v))
+                    .map_err(|e| match e {
+                        crate::printf_float_field::EmitError::Output(e) => output_error(e),
+                        crate::printf_float_field::EmitError::Limit => Kind::OutputLimit.into(),
+                        crate::printf_float_field::EmitError::Allocation => {
+                            fault("Printf float vector host allocation")
+                        }
+                    })?;
+                continue;
             }
             let field = if b"diuoxXp".contains(&spec.conversion) {
                 integer(spec, context.gp()?)?
@@ -521,16 +694,45 @@ pub fn render(
         }
         flush(&mut output, context.buffer)
     })();
-    match context.release_wide() {
-        Ok(()) => result,
-        Err(cleanup) => match result {
+    // vfprintf cleanup releases dtoaresult before convbuf. Attempt both even
+    // after a runtime cleanup fault, preserving every retained address in diagnostics.
+    let mut result = result;
+    if let Some(h) = hex.as_mut() {
+        let address = h.retained.current().map(|s| s.address - 4);
+        if let Err(cleanup) = h.retained.release(h.state, context.buffer.memory()) {
+            let message = format!("Printf gdtoa cleanup failed at {address:?}: {cleanup:?}");
+            let mut error = result.err().unwrap_or_else(|| fault(message.clone()));
+            if let Some(existing) = error.cleanup.as_mut() {
+                existing.message.push_str("; ");
+                existing.message.push_str(&message);
+            } else {
+                error.cleanup = Some(crate::printf_buffer::CleanupFault {
+                    address: address.unwrap_or(0),
+                    message,
+                });
+            }
+            result = Err(error);
+        }
+    }
+    if let Err(cleanup) = context.release_wide() {
+        result = match result {
             Ok(()) => Err(cleanup),
             Err(mut error) => {
-                error.cleanup = cleanup.cleanup;
+                if let Some(extra) = cleanup.cleanup {
+                    if let Some(existing) = error.cleanup.as_mut() {
+                        existing.message.push_str(&format!(
+                            "; wide cleanup retained {}: {}",
+                            extra.address, extra.message
+                        ));
+                    } else {
+                        error.cleanup = Some(extra);
+                    }
+                }
                 Err(error)
             }
-        },
+        };
     }
+    result
 }
 
 #[cfg(test)]
@@ -565,6 +767,153 @@ mod tests {
     fn guard(_: &Memory<'_>, _: u64, _: usize) -> crate::Result<()> {
         Ok(())
     }
+    #[test]
+    fn source_hex_cursor_flags_output_and_retained_cleanup() {
+        let mut data = setup(b"%+012.1a|%.0a%n\0", &[DATA], &[1.5f64.to_bits(), 3]);
+        let mut owner = OwnedMappings::default();
+        let mut store = crate::guest_gdtoa::Store::new(0x9000).unwrap();
+        let (pool, state) = store.split_mut();
+        let mut retained = crate::guest_gdtoa::Retained::default();
+        let mut control = 0x1f80;
+        let mut m = Memory::default();
+        m.add(SLOT, &mut data, true, false).unwrap();
+        m.add_runtime_data(0x9000, pool, state.runtime_owner())
+            .unwrap();
+        m.attach_owned(&mut owner).unwrap();
+        let n = printf_buffer::run(&mut m, SLOT, 65536, guard, |b| {
+            render_with_hdtoa(
+                b,
+                FMT,
+                VA,
+                Options::default(),
+                HexContext {
+                    state,
+                    retained: &mut retained,
+                    mxcsr: &mut control,
+                },
+                guard,
+            )
+        })
+        .unwrap();
+        let expected = b"+0x0001.8p+0|0x1p-1072";
+        assert_eq!(n as usize, expected.len());
+        let p = m.load(SLOT, 8).unwrap();
+        assert_eq!(m.read(p, expected.len()).unwrap(), expected);
+        assert_eq!(m.load(DATA, 4).unwrap(), expected.len() as u64);
+        assert_eq!(m.load(VA + 4, 4).unwrap(), 80);
+        assert_eq!(control, 0x1fa2);
+        assert!(retained.current().is_none());
+        assert_eq!(state.pool_used(), 32);
+        assert!(m.store(0x9000, 0, 8).is_err()); // static pool stays runtime-owned after cleanup.
+    }
+    #[test]
+    fn source_hex_large_field_preserves_output_growth_and_frees_digit_heap() {
+        let mut data = setup(b"%.4096a\0", &[], &[1.0f64.to_bits()]);
+        let mut owner = OwnedMappings::default();
+        let mut store = crate::guest_gdtoa::Store::new(0x9000).unwrap();
+        let (pool, state) = store.split_mut();
+        let mut retained = crate::guest_gdtoa::Retained::default();
+        let mut control = 0x1f80;
+        let mut m = Memory::default();
+        m.add(SLOT, &mut data, true, false).unwrap();
+        m.add_runtime_data(0x9000, pool, state.runtime_owner())
+            .unwrap();
+        m.attach_owned(&mut owner).unwrap();
+        let n = printf_buffer::run(&mut m, SLOT, 65536, guard, |b| {
+            render_with_hdtoa(
+                b,
+                FMT,
+                VA,
+                Options::default(),
+                HexContext {
+                    state,
+                    retained: &mut retained,
+                    mxcsr: &mut control,
+                },
+                guard,
+            )?;
+            assert_eq!(b.logical_capacity(), 4229);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(n, 4103);
+        let p = m.load(SLOT, 8).unwrap();
+        assert_eq!(m.read(p, 4).unwrap(), b"0x1.");
+        assert_eq!(m.read(p + 4100, 4).unwrap(), b"p+0\0");
+        assert_eq!(state.owned_ranges().count(), 1);
+        assert_eq!(state.pool_used(), 0);
+        assert!(retained.current().is_none());
+    }
+    #[test]
+    fn source_hex_count_alias_fault_keeps_flags_and_cleans_output() {
+        let mut data = setup(b"%.0a%n\0", &[0x9004], &[3]);
+        let mut owner = OwnedMappings::default();
+        let mut store = crate::guest_gdtoa::Store::new(0x9000).unwrap();
+        let (pool, state) = store.split_mut();
+        let mut retained = crate::guest_gdtoa::Retained::default();
+        let mut control = 0x1f80;
+        let mut m = Memory::default();
+        m.add(SLOT, &mut data, true, false).unwrap();
+        m.add_runtime_data(0x9000, pool, state.runtime_owner())
+            .unwrap();
+        m.attach_owned(&mut owner).unwrap();
+        let result = printf_buffer::run(&mut m, SLOT, 65536, guard, |b| {
+            render_with_hdtoa(
+                b,
+                FMT,
+                VA,
+                Options::default(),
+                HexContext {
+                    state,
+                    retained: &mut retained,
+                    mxcsr: &mut control,
+                },
+                guard,
+            )
+        });
+        assert!(result.is_err());
+        assert_eq!(control, 0x1fa2);
+        assert_eq!(m.load(VA + 4, 4).unwrap(), 64);
+        assert_eq!(m.load(VA, 4).unwrap(), 8);
+        assert_eq!(m.load(SLOT, 8).unwrap(), 0);
+        assert!(m.heap_allocation_size(0x400000000).is_err());
+        assert!(retained.current().is_none());
+        assert_eq!(m.load(0x900c, 4).unwrap(), 1); // freedtoa restored the cache header.
+    }
+    #[test]
+    fn source_hex_payload_alias_fails_before_cursor_advance() {
+        let mut data = setup(b"%a\0", &[], &[]);
+        data[0x210..0x218].copy_from_slice(&(0x9000u64 - 48).to_le_bytes());
+        let mut owner = OwnedMappings::default();
+        let mut store = crate::guest_gdtoa::Store::new(0x9000).unwrap();
+        let (pool, state) = store.split_mut();
+        let mut retained = crate::guest_gdtoa::Retained::default();
+        let mut control = 0x1f80;
+        let mut m = Memory::default();
+        m.add(SLOT, &mut data, true, false).unwrap();
+        m.add_runtime_data(0x9000, pool, state.runtime_owner())
+            .unwrap();
+        m.attach_owned(&mut owner).unwrap();
+        assert!(
+            printf_buffer::run(&mut m, SLOT, 65536, guard, |b| render_with_hdtoa(
+                b,
+                FMT,
+                VA,
+                Options::default(),
+                HexContext {
+                    state,
+                    retained: &mut retained,
+                    mxcsr: &mut control
+                },
+                guard
+            ))
+            .is_err()
+        );
+        assert_eq!(m.load(VA + 4, 4).unwrap(), 48);
+        assert_eq!(control, 0x1f80);
+        assert_eq!(state.pool_used(), 0);
+    }
+
     #[test]
     fn mixed_gp_fp_stars_and_narrowing_update_cursor_once() {
         let mut data = setup(

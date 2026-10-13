@@ -2,7 +2,8 @@
 //! Policy: contrib/gdtoa/misc.c and dmisc.c, lib/libc/amd64/arith.h.
 //! The 2304-byte private pool is library static data, never guest malloc.
 //! Split Store to attach its pool to Memory at a reserved address. Keep all
-//! returned owned ranges under executor free/realloc/write guards. Heap caches
+//! pool under its RuntimeOwner; heap allocations are claimed immediately and
+//! every internal mutation uses an owner-checked Memory operation. Heap caches
 //! and pool survive individual printf calls; returned strings are call-local.
 //! Bigint-operation allocation sequencing/pow5 cache integration remain separate.
 use crate::guest_memory::Memory;
@@ -52,6 +53,7 @@ pub struct Store {
     state: State,
 }
 pub struct State {
+    runtime_owner: crate::guest_memory::RuntimeOwner,
     owner: Rc<()>,
     pool_address: u64,
     pool_backing: usize,
@@ -76,6 +78,7 @@ impl Store {
         Ok(Self {
             pool,
             state: State {
+                runtime_owner: crate::guest_memory::RuntimeOwner::new(),
                 owner: Rc::new(()),
                 pool_address,
                 pool_backing: backing,
@@ -91,6 +94,9 @@ impl Store {
     }
 }
 impl State {
+    pub fn runtime_owner(&self) -> &crate::guest_memory::RuntimeOwner {
+        &self.runtime_owner
+    }
     pub fn pool_address(&self) -> u64 {
         self.pool_address
     }
@@ -126,7 +132,9 @@ impl State {
     fn block_valid(&self, memory: &Memory<'_>, index: usize) -> Result<(), Error> {
         self.pool_valid(memory)?;
         let b = &self.blocks[index];
-        if b.heap && mem(memory.heap_allocation_size(b.address))? < b.length {
+        if b.heap
+            && mem(memory.runtime_heap_allocation_size(b.address, &self.runtime_owner))? < b.length
+        {
             return Err(Error::Ownership);
         }
         if mem(memory.read(b.address, b.length))?.as_ptr() as usize != b.backing {
@@ -163,8 +171,8 @@ impl State {
             if b.active || mem(memory.load(b.address, 8))? != expected {
                 return Err(Error::Corrupt);
             }
-            mem(memory.validate_write(b.address, 24))?;
-            mem(memory.store(b.address + 16, 0, 8))?;
+            mem(memory.validate_runtime_write(b.address, 24, &self.runtime_owner))?;
+            mem(memory.runtime_store(b.address + 16, 0, 8, &self.runtime_owner))?;
             self.heads[class as usize] = b.next;
             index
         } else {
@@ -182,24 +190,30 @@ impl State {
                     .malloc(length as u64)
                     .map_err(Error::GuestAllocation)?
             };
+            if !pool {
+                if let Err(error) = memory.mark_runtime_heap(address, &self.runtime_owner) {
+                    mem(memory.free(address))?;
+                    return Err(Error::Memory(error));
+                }
+            }
             let initialize = (|| {
-                mem(memory.validate_write(address, 24))?;
+                mem(memory.validate_runtime_write(address, 24, &self.runtime_owner))?;
                 let backing = mem(memory.read(address, length))?.as_ptr() as usize;
                 let owned_length = if pool {
                     length
                 } else {
-                    mem(memory.heap_allocation_size(address))?
+                    mem(memory.runtime_heap_allocation_size(address, &self.runtime_owner))?
                 };
-                mem(memory.store(address + 8, u64::from(class), 4))?;
-                mem(memory.store(address + 12, 1u64 << class, 4))?;
-                mem(memory.store(address + 16, 0, 8))?;
+                mem(memory.runtime_store(address + 8, u64::from(class), 4, &self.runtime_owner))?;
+                mem(memory.runtime_store(address + 12, 1u64 << class, 4, &self.runtime_owner))?;
+                mem(memory.runtime_store(address + 16, 0, 8, &self.runtime_owner))?;
                 Ok((backing, owned_length))
             })();
             let (backing, owned_length) = match initialize {
                 Ok(v) => v,
                 Err(error) => {
                     if !pool {
-                        mem(memory.free(address))?;
+                        mem(memory.runtime_free(address, &self.runtime_owner))?;
                     }
                     return Err(error);
                 }
@@ -248,12 +262,12 @@ impl State {
     fn release(&mut self, memory: &mut Memory<'_>, index: usize) -> Result<(), Error> {
         let b = &self.blocks[index];
         if b.class > KMAX {
-            mem(memory.free(b.address))?;
+            mem(memory.runtime_free(b.address, &self.runtime_owner))?;
             self.blocks[index].backing = 0;
         } else {
             let head = self.heads[b.class as usize];
             let next = head.map_or(0, |i| self.blocks[i].address);
-            mem(memory.store(b.address, next, 8))?;
+            mem(memory.runtime_store(b.address, next, 8, &self.runtime_owner))?;
             self.blocks[index].next = head;
             self.heads[self.blocks[index].class as usize] = Some(index);
         }
@@ -277,7 +291,7 @@ impl State {
         let address = self.blocks[index].address;
         // Balloc already validated this whole header; source rv_alloc overwrites
         // low next-pointer bytes with k. The rest is output capacity.
-        mem(memory.store(address, u64::from(class), 4))?;
+        mem(memory.runtime_store(address, u64::from(class), 4, &self.runtime_owner))?;
         self.blocks[index].string = true;
         Ok(StringTicket {
             block,
@@ -298,12 +312,17 @@ impl State {
             .checked_add(1)
             .filter(|n| *n <= ticket.capacity)
             .ok_or(Error::Bound)?;
-        mem(memory.validate_write(ticket.address, count))?;
+        mem(memory.validate_runtime_write(ticket.address, count, &self.runtime_owner))?;
         // String data overlays the former Bigint fields exactly as rv_alloc does.
         if !bytes.is_empty() {
-            mem(memory.write(ticket.address, bytes))?;
+            mem(memory.runtime_write(ticket.address, bytes, &self.runtime_owner))?;
         }
-        mem(memory.store(ticket.address + bytes.len() as u64, 0, 1))
+        mem(memory.runtime_store(
+            ticket.address + bytes.len() as u64,
+            0,
+            1,
+            &self.runtime_owner,
+        ))
     }
     fn string_valid(
         &self,
@@ -319,7 +338,9 @@ impl State {
         if mem(memory.read(b.address, b.length))?.as_ptr() as usize != b.backing {
             return Err(Error::Ownership);
         }
-        if b.heap && mem(memory.heap_allocation_size(b.address))? < b.length {
+        if b.heap
+            && mem(memory.runtime_heap_allocation_size(b.address, &self.runtime_owner))? < b.length
+        {
             return Err(Error::Ownership);
         }
         if mem(memory.load(b.address, 4))? != u64::from(b.class) {
@@ -335,9 +356,9 @@ impl State {
         let index = self.index(&ticket.block)?;
         self.string_valid(memory, index, ticket)?;
         let b = &self.blocks[index];
-        mem(memory.validate_write(b.address, 16))?;
-        mem(memory.store(b.address + 8, u64::from(b.class), 4))?;
-        mem(memory.store(b.address + 12, 1u64 << b.class, 4))?;
+        mem(memory.validate_runtime_write(b.address, 16, &self.runtime_owner))?;
+        mem(memory.runtime_store(b.address + 8, u64::from(b.class), 4, &self.runtime_owner))?;
+        mem(memory.runtime_store(b.address + 12, 1u64 << b.class, 4, &self.runtime_owner))?;
         self.release(memory, index)
     }
 }
@@ -377,7 +398,9 @@ mod tests {
         let mut store = Store::new(0x10000).unwrap();
         let (pool, state) = store.split_mut();
         let mut memory = Memory::default();
-        memory.add(0x10000, pool, true, false).unwrap();
+        memory
+            .add_runtime_data(0x10000, pool, state.runtime_owner())
+            .unwrap();
         let a = state.balloc(&mut memory, 0).unwrap();
         let b = state.balloc(&mut memory, 0).unwrap();
         assert_eq!(state.address(&a).unwrap(), 0x10000);
@@ -401,26 +424,42 @@ mod tests {
         let (pool, state) = store.split_mut();
         let mut memory = Memory::default();
         memory.attach_owned(&mut owned).unwrap();
-        memory.add(0x10000, pool, true, false).unwrap();
+        memory
+            .add_runtime_data(0x10000, pool, state.runtime_owner())
+            .unwrap();
         let a = state.balloc(&mut memory, 9).unwrap();
         assert_eq!(state.address(&a).unwrap(), 0x10000);
         let b = state.balloc(&mut memory, 9).unwrap();
         let heap = state.address(&b).unwrap();
-        assert!(memory.heap_allocation_size(heap).is_ok());
         assert!(
-            state
-                .owned_ranges()
-                .any(|(base, size)| base == heap
-                    && size == memory.heap_allocation_size(heap).unwrap())
+            memory
+                .runtime_heap_allocation_size(heap, state.runtime_owner())
+                .is_ok()
         );
+        assert!(state.owned_ranges().any(|(base, size)| {
+            base == heap
+                && size
+                    == memory
+                        .runtime_heap_allocation_size(heap, state.runtime_owner())
+                        .unwrap()
+        }));
         state.bfree(&mut memory, &b).unwrap();
-        assert!(memory.heap_allocation_size(heap).is_ok());
+        assert!(
+            memory
+                .runtime_heap_allocation_size(heap, state.runtime_owner())
+                .is_ok()
+        );
         let reused = state.balloc(&mut memory, 9).unwrap();
         assert_eq!(state.address(&reused).unwrap(), heap);
         let big = state.balloc(&mut memory, 10).unwrap();
         let address = state.address(&big).unwrap();
         state.bfree(&mut memory, &big).unwrap();
-        assert!(memory.heap_allocation_size(address).is_err());
+        assert!(
+            memory
+                .runtime_heap_allocation_size(address, state.runtime_owner())
+                .is_err()
+        );
+        assert!(memory.read(address, 1).is_err());
         assert_eq!(state.owned_ranges().count(), 2);
         for _ in 0..5 {
             state.balloc(&mut memory, 1).unwrap();
@@ -428,15 +467,30 @@ mod tests {
         let padded = state.balloc(&mut memory, 1).unwrap();
         let address = state.address(&padded).unwrap();
         assert_eq!(State::allocation_size(1).unwrap(), 40);
-        assert_eq!(memory.heap_allocation_size(address).unwrap(), 48);
+        assert_eq!(
+            memory
+                .runtime_heap_allocation_size(address, state.runtime_owner())
+                .unwrap(),
+            48
+        );
         assert!(state.owned_ranges().any(|range| range == (address, 48)));
+        assert!(memory.write(address + 47, &[1]).is_err());
+        assert!(memory.free(address).is_err());
+        assert!(memory.heap_allocation_size(address).is_err());
+        state.bfree(&mut memory, &padded).unwrap();
+        assert!(memory.write(address + 47, &[1]).is_err());
+        assert!(memory.free(address).is_err());
+        let again = state.balloc(&mut memory, 1).unwrap();
+        assert_eq!(state.address(&again).unwrap(), address);
     }
     #[test]
     fn string_overlays_header_retains_until_release_and_restores_class() {
         let mut store = Store::new(0x10000).unwrap();
         let (pool, state) = store.split_mut();
         let mut memory = Memory::default();
-        memory.add(0x10000, pool, true, false).unwrap();
+        memory
+            .add_runtime_data(0x10000, pool, state.runtime_owner())
+            .unwrap();
         let string = state.rv_alloc(&mut memory, 27).unwrap();
         assert_eq!(string.address, 0x10004);
         assert_eq!(string.capacity, 28);
@@ -472,7 +526,9 @@ mod tests {
         }
         let (pool, state) = store.split_mut();
         let mut memory = Memory::default();
-        memory.add(0x10000, pool, true, false).unwrap();
+        memory
+            .add_runtime_data(0x10000, pool, state.runtime_owner())
+            .unwrap();
         let first = state.balloc(&mut memory, 0).unwrap();
         for _ in 1..72 {
             state.balloc(&mut memory, 0).unwrap();
@@ -488,13 +544,17 @@ mod tests {
         let address = string.address;
         let mut retained = Retained::default();
         retained.install(string).unwrap();
-        memory.store(address - 4, 17, 4).unwrap();
+        memory
+            .runtime_store(address - 4, 17, 4, state.runtime_owner())
+            .unwrap();
         assert!(matches!(
             retained.release(state, &mut memory),
             Err(Error::Corrupt)
         ));
         assert!(retained.current().is_some());
-        memory.store(address - 4, 0, 4).unwrap();
+        memory
+            .runtime_store(address - 4, 0, 4, state.runtime_owner())
+            .unwrap();
         retained.release(state, &mut memory).unwrap();
         assert_eq!(state.pool_used(), POOL_BYTES);
     }
@@ -507,7 +567,9 @@ mod tests {
             let (pool, state) = store.split_mut();
             let mut memory = Memory::default();
             memory.attach_owned(&mut owned).unwrap();
-            memory.add(0x10000, pool, true, false).unwrap();
+            memory
+                .add_runtime_data(0x10000, pool, state.runtime_owner())
+                .unwrap();
             state.balloc(&mut memory, 9).unwrap();
             let heap = state.balloc(&mut memory, 9).unwrap();
             address = state.address(&heap).unwrap();
@@ -516,7 +578,11 @@ mod tests {
         let (pool, state) = store.split_mut();
         let mut memory = Memory::default();
         memory.attach_owned(&mut owned).unwrap();
-        memory.add(0x10000, pool, true, false).unwrap();
+        memory
+            .add_runtime_data(0x10000, pool, state.runtime_owner())
+            .unwrap();
+        assert!(memory.write(address, &[0]).is_err());
+        assert!(memory.free(address).is_err());
         let reused = state.balloc(&mut memory, 9).unwrap();
         assert_eq!(state.address(&reused).unwrap(), address);
     }
@@ -537,14 +603,20 @@ mod tests {
         let (pool, state) = store.split_mut();
         let (pool2, state2) = other.split_mut();
         let mut memory = Memory::default();
-        memory.add(0x10000, pool, true, false).unwrap();
-        memory.add(0x20000, pool2, true, false).unwrap();
+        memory
+            .add_runtime_data(0x10000, pool, state.runtime_owner())
+            .unwrap();
+        memory
+            .add_runtime_data(0x20000, pool2, state2.runtime_owner())
+            .unwrap();
         let a = state.balloc(&mut memory, 0).unwrap();
         assert!(matches!(
             state2.bfree(&mut memory, &a),
             Err(Error::Ownership)
         ));
-        memory.store(state.address(&a).unwrap() + 8, 9, 4).unwrap();
+        memory
+            .runtime_store(state.address(&a).unwrap() + 8, 9, 4, state.runtime_owner())
+            .unwrap();
         assert!(matches!(state.bfree(&mut memory, &a), Err(Error::Corrupt)));
         assert!(matches!(state.balloc(&mut memory, 21), Err(Error::Bound)));
         assert!(matches!(

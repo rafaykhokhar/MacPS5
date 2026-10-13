@@ -71,6 +71,7 @@ const ERROR_TEXT: u64 = 0x7fff00000000;
 // multi-thread guest execution will need per-guest-thread network errno slots.
 const NET_ERRNO: u64 = 0x7fff00000100;
 const LOCALE_NAME: u64 = 0x7fff00000200;
+const GDTOA_POOL: u64 = 0x7fff00002000;
 pub const MAIN_GUEST_THREAD: u64 = 1;
 fn semaphore_storage_owned(
     memory: &Memory<'_>,
@@ -163,6 +164,34 @@ mod vasprintf_dispatch_tests {
         assert_eq!(owner.bytes_allocated(), 0);
     }
     #[test]
+    fn hexadecimal_service_uses_protected_pool_and_guards_publication() {
+        let mut data = bytes(b"%a\0");
+        data[0x330..0x338].copy_from_slice(&1.5f64.to_bits().to_le_bytes());
+        let mut allocations = crate::guest_memory::OwnedMappings::default();
+        let mut store = crate::guest_gdtoa::Store::new(GDTOA_POOL).unwrap();
+        let (pool, state) = store.split_mut();
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut data, true, false).unwrap();
+        memory.attach_owned(&mut allocations).unwrap();
+        memory.add_runtime_data(GDTOA_POOL, pool, state.runtime_owner()).unwrap();
+        let mut retained = crate::guest_gdtoa::Retained::default();
+        let mut mxcsr = 0x1f80;
+        let result = vasprintf_service_with_hex(&mut memory, [OUT, 0x1100, 0x1200], None, SP, RET,
+            Some(crate::printf_render::HexContext { state, retained: &mut retained, mxcsr: &mut mxcsr })).unwrap();
+        assert_eq!(result, 8);
+        assert_eq!(mxcsr, 0x1f80);
+        assert!(retained.current().is_none());
+        let output = memory.load(OUT, 8).unwrap();
+        assert_eq!(memory.read(output, 9).unwrap(), b"0x1.8p+0\0");
+        memory.free(output).unwrap();
+        assert!(memory.store(GDTOA_POOL, 0, 1).is_err());
+        assert!(vasprintf_service_with_hex(&mut memory, [GDTOA_POOL, 0x1100, 0x1200], None, SP, RET,
+            Some(crate::printf_render::HexContext { state, retained: &mut retained, mxcsr: &mut mxcsr })).is_err());
+        assert_eq!(memory.load(SP, 8).unwrap(), RET);
+        drop(memory);
+        assert_eq!(allocations.bytes_allocated(), 0);
+    }
+    #[test]
     fn initial_allocation_failure_precedes_format_read_and_orders_outputs() {
         let mut data = bytes(b"\0");
         let mut memory = Memory::default(); // No attached allocator: real ENOMEM.
@@ -234,28 +263,31 @@ mod vasprintf_dispatch_tests {
         assert_eq!(owner.bytes_allocated(), 0);
     }
 }
-fn vasprintf_service(
+#[cfg(test)]
+fn vasprintf_service(memory: &mut Memory<'_>, arguments: [u64; 3], errno: Option<u64>, sp: u64, ret: u64) -> Result<u64> {
+    vasprintf_service_with_hex(memory, arguments, errno, sp, ret, None)
+}
+fn vasprintf_service_with_hex(
+
     memory: &mut Memory<'_>,
     arguments: [u64; 3],
     errno: Option<u64>,
     sp: u64,
     ret: u64,
+    hex: Option<crate::printf_render::HexContext<'_>>,
 ) -> Result<u64> {
     let [strp, format, va] = arguments;
     let guard = |memory: &Memory<'_>, address, length| {
         validate_net_output(memory, address, length, sp, ret)
     };
     let result = crate::printf_buffer::run(memory, strp, 65536, guard, |buffer| {
-        crate::printf_render::render(
-            buffer,
-            format,
-            va,
-            crate::printf_render::Options {
-                errno_address: errno,
-                ..crate::printf_render::Options::default()
-            },
-            guard,
-        )
+        let options = crate::printf_render::Options { errno_address: errno, ..Default::default() };
+        if let Some(hex) = hex {
+            crate::printf_render::render_with_hdtoa(buffer, format, va, options, hex, guard)
+        } else {
+            crate::printf_render::render(buffer, format, va, options, guard)
+        }
+
     });
     match result {
         Ok(length) => Ok(length as u32 as u64),
@@ -1684,6 +1716,7 @@ pub struct NativeExecutor {
     network_errno: [u8; 4],
     pub locale: crate::guest_locale::GuestLocale,
     pub guest_time: crate::guest_time::GuestTime,
+    gdtoa: crate::guest_gdtoa::Store,
     pub semaphores: crate::guest_semaphore::GuestSemaphore,
     sleep_clock: crate::guest_sleep::Clock,
     pub stdout: crate::captured_stdout::CapturedStdout,
@@ -2379,6 +2412,10 @@ impl NativeExecutor {
                 writable: region.writable,
             })
             .collect::<Vec<_>>();
+        if self.services.values().any(|service| matches!(service, Service::Vasprintf)) {
+            let (pool, _) = self.gdtoa.split_mut();
+            mapped_data.push(DataRegion { address: GDTOA_POOL, bytes: pool, writable: false });
+        }
         if self
             .services
             .values()
@@ -2810,6 +2847,7 @@ impl NativeExecutor {
             network_errno: [0; 4],
             locale: crate::guest_locale::GuestLocale::default(),
             guest_time: crate::guest_time::GuestTime::default(),
+            gdtoa: crate::guest_gdtoa::Store::new(GDTOA_POOL).map_err(|error| format!("Cannot create gdtoa pool: {error:?}"))?,
             semaphores: crate::guest_semaphore::GuestSemaphore::default(),
             sleep_clock: crate::guest_sleep::Clock::default(),
             stdout: crate::captured_stdout::CapturedStdout::default(),
@@ -3448,6 +3486,7 @@ impl NativeExecutor {
                 .validate_contents()
                 .map_err(|e| format!("Corrupt guest environment: {e:?}"))?;
         }
+        let (gdtoa_pool, gdtoa_state) = self.gdtoa.split_mut();
         let mut memory = Memory::default();
         for mapped in std::iter::once(&mut *image).chain(dependencies.iter_mut().map(|i| &mut **i))
         {
@@ -3465,6 +3504,10 @@ impl NativeExecutor {
             memory.add(region.address, region.bytes, region.writable, false)?;
         }
         memory.attach_owned(&mut self.allocations)?;
+        if self.services.values().any(|service| matches!(service, Service::Vasprintf)) {
+            memory.add_runtime_data(GDTOA_POOL, gdtoa_pool, gdtoa_state.runtime_owner())?;
+        }
+
         if let Some(environment) = self.owned_environment.as_mut() {
             for (index, (address, bytes)) in environment.mappings().into_iter().enumerate() {
                 if !bytes.is_empty() {
@@ -5022,12 +5065,14 @@ impl NativeExecutor {
                             ret,
                         )?
                     } else if matches!(service, Service::Vasprintf) {
-                        vasprintf_service(
+                        let mut retained = crate::guest_gdtoa::Retained::default();
+                        vasprintf_service_with_hex(
                             &mut memory,
                             [cpu.registers[7], cpu.registers[6], cpu.registers[2]],
                             self.kernel.as_ref().map(|kernel| kernel.errno_address()),
                             sp,
                             ret,
+                            Some(crate::printf_render::HexContext { state: gdtoa_state, retained: &mut retained, mxcsr: &mut cpu.mxcsr }),
                         )?
                     } else if matches!(
                         service,

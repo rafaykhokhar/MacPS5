@@ -524,13 +524,18 @@ impl Emitter {
                     self.fault();
                 }
             }
-            M::Vmovaps | M::Vmovups | M::Vmovdqa | M::Vmovdqu | M::Vxorps | M::Vxorpd => {
+            M::Vmovaps | M::Vmovups | M::Vmovdqa | M::Vmovdqu | M::Vxorps | M::Vxorpd | M::Vpxor => {
+                // The pinned executable currently requires only VEX128 VPXOR.
+                // Do not inherit wider forms merely because XOR lowering is shared.
+                if m == M::Vpxor && i.code() != iced_x86::Code::VEX_Vpxor_xmm_xmm_xmmm128 {
+                    return Err("Only VEX128 VPXOR is implemented".into());
+                }
                 if !matches!(i.encoding(), iced_x86::EncodingKind::VEX)
                     || ![128, 256].contains(&width)
                 {
                     return Err("Only VEX128/256 vector forms are implemented".into());
                 }
-                if matches!(m, M::Vxorps | M::Vxorpd) {
+                if matches!(m, M::Vxorps | M::Vxorpd | M::Vpxor) {
                     let dst = vector(i.op_register(0))?;
                     let first = vector(i.op_register(1))?;
                     if i.op_kind(2) == OpKind::Memory {
