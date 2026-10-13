@@ -20,6 +20,37 @@ pub const STAT_SIZE: usize = 120;
 mod directory_entry_tests {
     use super::*;
     #[test]
+    fn directory_revision_rejects_foreign_and_stale_but_not_uncommitted_plans() {
+        let mut files = Files::default();
+        let foreign = Files::default();
+        let initial = files.directory_revision();
+        assert_eq!(initial, initial.clone());
+        assert_ne!(initial, foreign.directory_revision());
+        assert!(
+            foreign
+                .validate_directory_revision(&initial)
+                .unwrap_err()
+                .contains("another namespace")
+        );
+        files.register_directory(b"/save", 0o777, false).unwrap();
+        assert!(files.validate_directory_revision(&initial).is_err());
+        let stable = files.directory_revision();
+        let plan = files.plan_mkdir(b"/save/child", None, 0o777).unwrap();
+        assert_eq!(files.directory_revision(), stable);
+        files.validate_directory_revision(&stable).unwrap();
+        files.commit_mkdir(plan).unwrap();
+        assert!(
+            files
+                .validate_directory_revision(&stable)
+                .unwrap_err()
+                .contains("changed")
+        );
+        let current = files.directory_revision();
+        let token = files.open_directory(b"/save", None).unwrap();
+        files.directory_entries_for_token(&token).unwrap();
+        files.validate_directory_revision(&current).unwrap();
+    }
+    #[test]
     fn retained_directory_follows_move_and_preserves_open_access() {
         let mut files = Files::default();
         files.register_directory(b"/save", 0o777, false).unwrap();
@@ -315,6 +346,19 @@ pub struct DirectoryToken {
     identity: Rc<()>,
     inode: u32,
 }
+/// Namespace snapshot version. The owner is compared by allocation identity,
+/// not the value of the zero-sized marker or a revision number alone.
+#[derive(Clone, Debug)]
+pub struct DirectoryRevision {
+    owner: Rc<()>,
+    revision: u64,
+}
+impl PartialEq for DirectoryRevision {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.owner, &other.owner) && self.revision == other.revision
+    }
+}
+impl Eq for DirectoryRevision {}
 impl DirectoryToken {
     pub fn inode(&self) -> u32 {
         self.inode
@@ -600,6 +644,23 @@ impl Files {
     }
     pub fn owns_directory_token(&self, token: &DirectoryToken) -> bool {
         Rc::ptr_eq(&self.owner, &token.owner)
+    }
+    pub fn directory_revision(&self) -> DirectoryRevision {
+        DirectoryRevision {
+            owner: self.owner.clone(),
+            revision: self.revision,
+        }
+    }
+    /// Rejects foreign or changed namespace snapshots before cursor mutation.
+    /// A token alone does not authorize reading any particular directory.
+    pub fn validate_directory_revision(&self, token: &DirectoryRevision) -> Result<()> {
+        if !Rc::ptr_eq(&self.owner, &token.owner) {
+            return Err("Directory revision belongs to another namespace".into());
+        }
+        if token.revision != self.revision {
+            return Err("Directory namespace changed since read preparation".into());
+        }
+        Ok(())
     }
     /// Resolves retained identity after rename, never the former pathname.
     /// Reading an unlinked/replaced directory is currently unsupported: no

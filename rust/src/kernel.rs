@@ -4,7 +4,7 @@ use crate::{Result, descriptors::Descriptors, guest_memory::Memory};
 #[path = "guest_files.rs"]
 mod guest_files;
 pub(crate) use guest_files::{FileBacking, Quota};
-pub use guest_files::{DirectoryEntry, DirectoryToken};
+pub use guest_files::{DirectoryEntry, DirectoryRevision, DirectoryToken};
 pub use guest_files::{Files, MkdirPlan, RenamePlan, NamespaceProfile, STAT_SIZE, StatRequest, StatTrace};
 
 struct Region {
@@ -1303,6 +1303,36 @@ mod tests {
 mod directory_bridge_tests {
     use super::*;
     use crate::descriptors::OpenOptions;
+    #[test]
+    fn directory_batch_copy_failure_preserves_output_and_cursor() {
+        let mut kernel = Kernel::new(0, 0x1000).unwrap();
+        let token = kernel.descriptors.open_directory(&kernel.files, b"/", None).unwrap().unwrap();
+        let plan = kernel.descriptors.preview_directory_read(&kernel.files, &token, 12).unwrap();
+        assert_eq!(plan.bytes().len(), 12);
+        let mut short = [0xa5; 11];
+        let mut readonly = [0xa5; 12];
+        let mut output = [0xa5; 12];
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut short, true, false).unwrap();
+        memory.add(0x2000, &mut readonly, false, false).unwrap();
+        memory.add(0x3000, &mut output, true, false).unwrap();
+        for address in [0x1000, 0x2000, u64::MAX] {
+            assert!(kernel.descriptors.copy_directory_read(&kernel.files, &plan, &mut memory, address).is_err());
+            assert_eq!(kernel.descriptors.directory_position(&token).unwrap(), 0);
+        }
+        assert_eq!(memory.read(0x1000, 11).unwrap(), &[0xa5; 11]);
+        assert_eq!(memory.read(0x2000, 12).unwrap(), &[0xa5; 12]);
+        assert_eq!(kernel.descriptors.copy_directory_read(&kernel.files, &plan, &mut memory, 0x3000).unwrap(), 12);
+        assert_eq!(memory.read(0x3000, 12).unwrap(), plan.bytes());
+        memory.write(0x3000, &[0x5a; 12]).unwrap();
+        assert!(kernel.descriptors.copy_directory_read(&kernel.files, &plan, &mut memory, 0x3000).is_err());
+        assert_eq!(memory.read(0x3000, 12).unwrap(), &[0x5a; 12]);
+        let parent = kernel.descriptors.preview_directory_read(&kernel.files, &token, 12).unwrap();
+        kernel.descriptors.copy_directory_read(&kernel.files, &parent, &mut memory, 0x3000).unwrap();
+        let eof = kernel.descriptors.preview_directory_read(&kernel.files, &token, 0).unwrap();
+        assert!(eof.eof());
+        assert_eq!(kernel.descriptors.copy_directory_read(&kernel.files, &eof, &mut memory, u64::MAX).unwrap(), 0);
+    }
     #[test]
     fn internal_directory_syscalls_stop_before_guest_side_effects() {
         let mut kernel = Kernel::new(0, 0x1000).unwrap();

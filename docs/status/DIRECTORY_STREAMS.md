@@ -18,8 +18,7 @@ It does not use macOS's host dirent layout.
 
 This is an owned enumeration snapshot, not an open directory handle. It does
 not establish stream behavior across rename/unlink or concurrent mutations.
-Remaining requirements include bounded cursor/read plans, guarded guest copies,
-DIR allocation/lifecycle, errno behavior and native
+Remaining requirements include DIR allocation/lifecycle, errno behavior and native
 caller verification before adding the service exports. Existing namespace
 limits, virtual uid/gid policy and lack of host mounting remain in force.
 
@@ -35,8 +34,8 @@ capacity. Their tokens validate table owner and generation, preventing reuse
 or another table from reviving an old handle. Live directory endpoints also
 retain namespace binding. Close retires the endpoint normally. This is not yet
 connected to guest open/opendir: raw directory read/write/stat/seek/truncate
-syscalls report explicit runtime limitations before guest side effects. Buffer,
-cursor, detached-directory metadata and DIR lifecycle integration remain open.
+syscalls report explicit runtime limitations before guest side effects.
+Guest-visible buffers, detached-directory metadata and DIR lifecycle integration remain open.
 
 Verification: 572 library tests, three integration tests and strict all-target
 Clippy pass (25001 exit0; `work/directory-enumeration-{tests,clippy}.log`). New
@@ -51,3 +50,31 @@ rename plans, permission changes after opening, replacement/recreation,
 descriptor reuse/capacity/namespace isolation, and unsupported syscall guards
 with normal close. The release archive and native startup have not been rebuilt
 for this internal-only checkpoint.
+
+The internal read layer now uses bounded batches of complete dirent records with an internal
+entry-index cursor. This is a virtual filesystem policy, not a disk offset or
+public telldir cookie. A read plan must validate namespace ownership/revision,
+descriptor generation and cursor revision before commit. Namespace mutation
+during an active iteration remains an explicit unsupported case until rewind;
+this avoids silently reinterpreting an index in a changed sorted listing.
+
+The pinned SDK exposes DIR as opaque in its
+[public directory API](https://raw.githubusercontent.com/ps5-payload-dev/sdk/10b539de8f2b6773a9a78caa7576a97dbd99b29a/include/freebsd/dirent.h).
+FreeBSD's [readdir implementation](https://raw.githubusercontent.com/freebsd/freebsd-src/releng/11.4/lib/libc/gen/readdir.c)
+returns a pointer within a retained batch and refills it as needed. Connecting
+the internal read plans to that guest-visible lifecycle remains necessary;
+an internal descriptor batch alone is not a working readdir service.
+
+Read plans are capped at 1 MiB and never split a record. A too-small buffer for
+the next record gives an explicit runtime diagnostic. Copy validates plan and
+guest memory before advancing; failed output access leaves the plan available
+for retry. Successful commits, including empty EOF, reject later replay.
+Rewind invalidates pending plans and permits a fresh namespace revision. These
+APIs do not publish errno or public directory cookies; a future guest bridge
+must also protect its live return frame and any companion output fields.
+
+Verification: 584 library tests, three integration tests and strict all-target
+Clippy pass (33806 exit0; `work/directory-batches-{tests,clippy}.log`). Coverage
+includes record boundaries, namespace mutation, competing plans, rewind,
+descriptor reuse, repeated EOF and failed guest copies. No service export or
+new native startup claim is included.

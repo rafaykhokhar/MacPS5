@@ -1,5 +1,10 @@
 # Rust migration
 
+Internal directory batch reads now validate namespace/cursor revisions and
+copy complete guest records before advancing. Failed copies preserve the
+cursor; stale plans are rejected. 584 library tests, three integration tests
+and strict Clippy pass. Guest DIR lifecycle and service wiring remain pending.
+
 Directory identities and internal descriptor ownership now survive rename and
 reject stale/reused handles. The integrated build passes 579 library tests,
 three integration tests and strict Clippy. Guest directory streams still need

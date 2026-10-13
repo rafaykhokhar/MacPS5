@@ -8,7 +8,10 @@
 //! https://raw.githubusercontent.com/freebsd/freebsd-src/releng/11.4/sys/kern/sys_generic.c
 //! Guarded copies are all-or-nothing; this does not model partial EFAULT copies.
 use crate::{Result, guest_memory::Memory};
-use std::{cell::Cell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 const LIMIT: usize = 256;
 /// Process-table and open-instance identity; fd reuse cannot revive this token.
@@ -34,6 +37,36 @@ impl DirectoryDescriptorToken {
     pub fn descriptor(&self) -> u32 {
         self.descriptor
     }
+}
+pub struct DirectoryReadPlan {
+    bytes: Vec<u8>,
+    token: DirectoryDescriptorToken,
+    position: usize,
+    next_position: usize,
+    revision: u64,
+    namespace: crate::kernel::DirectoryRevision,
+    eof: bool,
+}
+impl DirectoryReadPlan {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub fn eof(&self) -> bool {
+        self.eof
+    }
+    pub fn position(&self) -> usize {
+        self.position
+    }
+    pub fn next_position(&self) -> usize {
+        self.next_position
+    }
+}
+struct OpenDirectory {
+    backing: crate::kernel::DirectoryToken,
+    identity: u64,
+    position: Cell<usize>,
+    revision: Cell<u64>,
+    namespace: RefCell<Option<crate::kernel::DirectoryRevision>>,
 }
 pub struct FileReadPlan {
     bytes: Vec<u8>,
@@ -275,10 +308,7 @@ struct OpenFile {
 
 enum Endpoint {
     File(OpenFile),
-    Directory {
-        backing: crate::kernel::DirectoryToken,
-        identity: u64,
-    },
+    Directory(OpenDirectory),
     Control {
         target: Rc<Cell<u64>>,
         selector: bool,
@@ -322,7 +352,7 @@ impl Descriptors {
                 .endpoints
                 .iter()
                 .chain(std::iter::once(&self.stdin))
-                .any(|e| matches!(e, Some(Endpoint::File(_) | Endpoint::Directory { .. })))
+                .any(|e| matches!(e, Some(Endpoint::File(_) | Endpoint::Directory(_))))
                 && !Rc::ptr_eq(quota, &files.quota())
             {
                 return Err(
@@ -360,7 +390,13 @@ impl Descriptors {
             Err(errno) => return Ok(Err(errno)),
         };
         self.file_quota = Some(files.quota());
-        self.endpoints[index] = Some(Endpoint::Directory { backing, identity });
+        self.endpoints[index] = Some(Endpoint::Directory(OpenDirectory {
+            backing,
+            identity,
+            position: Cell::new(0),
+            revision: Cell::new(0),
+            namespace: RefCell::new(None),
+        }));
         self.next_file = next;
         Ok(Ok(DirectoryDescriptorToken {
             descriptor: index as u32 + 3,
@@ -372,12 +408,12 @@ impl Descriptors {
         &self,
         descriptor: u64,
     ) -> std::result::Result<DirectoryDescriptorToken, u32> {
-        let Some(Endpoint::Directory { identity, .. }) = self.endpoint(descriptor) else {
+        let Some(Endpoint::Directory(directory)) = self.endpoint(descriptor) else {
             return Err(9);
         };
         Ok(DirectoryDescriptorToken {
             descriptor: descriptor as u32,
-            identity: *identity,
+            identity: directory.identity,
             owner: self.owner.clone(),
         })
     }
@@ -389,11 +425,145 @@ impl Descriptors {
             return Err(9);
         }
         match self.endpoint(token.descriptor.into()) {
-            Some(Endpoint::Directory { backing, identity }) if *identity == token.identity => {
-                Ok(backing)
+            Some(Endpoint::Directory(directory)) if directory.identity == token.identity => {
+                Ok(&directory.backing)
             }
             _ => Err(9),
         }
+    }
+    fn directory(&self, token: &DirectoryDescriptorToken) -> Result<&OpenDirectory> {
+        if !Rc::ptr_eq(&self.owner, &token.owner) {
+            return Err("Foreign directory descriptor token".into());
+        }
+        match self.endpoint(token.descriptor.into()) {
+            Some(Endpoint::Directory(directory)) if directory.identity == token.identity => {
+                Ok(directory)
+            }
+            _ => Err("Stale or closed directory descriptor token".into()),
+        }
+    }
+    pub fn directory_position(&self, token: &DirectoryDescriptorToken) -> Result<usize> {
+        Ok(self.directory(token)?.position.get())
+    }
+    /// Internal record cursor, not a kernel byte-offset/cookie implementation.
+    /// Namespace mutation after the first committed batch requires rewind.
+    pub fn preview_directory_read(
+        &self,
+        files: &crate::kernel::Files,
+        token: &DirectoryDescriptorToken,
+        capacity: u64,
+    ) -> Result<DirectoryReadPlan> {
+        if capacity > 1_048_576 {
+            return Err("Directory read exceeds prototype capacity".into());
+        }
+        let directory = self.directory(token)?;
+        if let Some(namespace) = directory.namespace.borrow().as_ref() {
+            files.validate_directory_revision(namespace)?;
+        }
+        let namespace = files.directory_revision();
+        let entries = files.directory_entries_for_token(&directory.backing)?;
+        let position = directory.position.get();
+        if position > entries.len() {
+            return Err("Directory cursor exceeds current enumeration".into());
+        }
+        let mut bytes = Vec::new();
+        let mut next = position;
+        for entry in &entries[position..] {
+            let record = entry.record()?;
+            if record.len() > capacity as usize - bytes.len() {
+                if bytes.is_empty() {
+                    return Err("Next complete directory record does not fit".into());
+                }
+                break;
+            }
+            bytes
+                .try_reserve(record.len())
+                .map_err(|_| "Cannot reserve directory read batch")?;
+            bytes.extend_from_slice(&record);
+            next += 1;
+        }
+        directory
+            .revision
+            .get()
+            .checked_add(1)
+            .ok_or("Directory cursor revision exhausted")?;
+        Ok(DirectoryReadPlan {
+            bytes,
+            token: token.clone(),
+            position,
+            next_position: next,
+            revision: directory.revision.get(),
+            namespace,
+            eof: next == entries.len(),
+        })
+    }
+    pub fn validate_directory_read(
+        &self,
+        files: &crate::kernel::Files,
+        plan: &DirectoryReadPlan,
+    ) -> Result<()> {
+        let directory = self.directory(&plan.token)?;
+        if directory.position.get() != plan.position || directory.revision.get() != plan.revision {
+            return Err("Stale directory read plan".into());
+        }
+        if !files.owns_directory_token(&directory.backing) {
+            return Err("Foreign directory namespace".into());
+        }
+        files.validate_directory_revision(&plan.namespace)?;
+        if let Some(namespace) = directory.namespace.borrow().as_ref() {
+            files.validate_directory_revision(namespace)?;
+        }
+        directory
+            .revision
+            .get()
+            .checked_add(1)
+            .ok_or("Directory cursor revision exhausted")?;
+        Ok(())
+    }
+    pub fn commit_directory_read(
+        &self,
+        files: &crate::kernel::Files,
+        plan: &DirectoryReadPlan,
+    ) -> Result<()> {
+        self.validate_directory_read(files, plan)?;
+        let directory = self.directory(&plan.token)?;
+        directory.position.set(plan.next_position);
+        directory.revision.set(plan.revision + 1);
+        *directory.namespace.borrow_mut() = Some(plan.namespace.clone());
+        Ok(())
+    }
+    /// Guard and copy before committing cursor state. Rc/Cell ownership is
+    /// single-threaded and this path runs no callbacks between validations.
+    pub fn copy_directory_read(
+        &self,
+        files: &crate::kernel::Files,
+        plan: &DirectoryReadPlan,
+        memory: &mut Memory<'_>,
+        address: u64,
+    ) -> Result<usize> {
+        self.validate_directory_read(files, plan)?;
+        if !plan.bytes().is_empty() {
+            memory.write(address, plan.bytes())?;
+        }
+        self.commit_directory_read(files, plan)?;
+        Ok(plan.bytes().len())
+    }
+    pub fn rewind_directory(
+        &self,
+        files: &crate::kernel::Files,
+        token: &DirectoryDescriptorToken,
+    ) -> Result<()> {
+        let directory = self.directory(token)?;
+        files.directory_entries_for_token(&directory.backing)?;
+        let next = directory
+            .revision
+            .get()
+            .checked_add(1)
+            .ok_or("Directory cursor revision exhausted")?;
+        directory.position.set(0);
+        directory.revision.set(next);
+        *directory.namespace.borrow_mut() = None;
+        Ok(())
     }
     pub fn close_directory(&mut self, token: &DirectoryDescriptorToken) -> u32 {
         if self.directory_backing(token).is_err() {
@@ -670,7 +840,7 @@ impl Descriptors {
     pub fn kind(&self, descriptor: u64) -> Option<DescriptorKind> {
         self.endpoint(descriptor).map(|endpoint| match endpoint {
             Endpoint::File(_) => DescriptorKind::RegisteredFile,
-            Endpoint::Directory { .. } => DescriptorKind::Directory,
+            Endpoint::Directory(_) => DescriptorKind::Directory,
             Endpoint::Pipe { .. } => DescriptorKind::Pipe,
             Endpoint::Control { .. } => DescriptorKind::Control,
         })
@@ -1691,5 +1861,98 @@ mod directory_descriptor_tests {
             Ok(Err(24))
         ));
         assert!(table.endpoints.iter().all(Option::is_none));
+    }
+}
+
+#[cfg(test)]
+mod directory_read_tests {
+    use super::*;
+    use crate::kernel::Files;
+    fn setup() -> (Files, Descriptors, DirectoryDescriptorToken) {
+        let mut files = Files::default();
+        files.allow_create_directory(b"/dir").unwrap();
+        files.register(b"/dir/a", vec![1]).unwrap();
+        files.register(b"/dir/long-name", vec![2]).unwrap();
+        let mut table = Descriptors::default();
+        let token = table
+            .open_directory(&files, b"/dir", None)
+            .unwrap()
+            .unwrap();
+        (files, table, token)
+    }
+    #[test]
+    fn whole_record_boundaries_eof_and_replay() {
+        let (files, table, token) = setup();
+        for capacity in [0, 11, 1_048_577, u64::MAX] {
+            assert!(
+                table
+                    .preview_directory_read(&files, &token, capacity)
+                    .is_err()
+            );
+            assert_eq!(table.directory_position(&token).unwrap(), 0);
+        }
+        let first = table.preview_directory_read(&files, &token, 12).unwrap();
+        assert_eq!(first.bytes().len(), 12);
+        assert_eq!(&first.bytes()[4..8], &[12, 0, 4, 1]);
+        assert_eq!(&first.bytes()[8..10], b".\0");
+        assert!(!first.eof());
+        assert_eq!(first.next_position(), 1);
+        let competing = table.preview_directory_read(&files, &token, 12).unwrap();
+        table.commit_directory_read(&files, &first).unwrap();
+        assert!(table.commit_directory_read(&files, &competing).is_err());
+        assert!(table.commit_directory_read(&files, &first).is_err());
+        let rest = table.preview_directory_read(&files, &token, 1024).unwrap();
+        assert!(rest.eof());
+        let mut offset = 0;
+        while offset < rest.bytes().len() {
+            let len = u16::from_le_bytes(rest.bytes()[offset + 4..offset + 6].try_into().unwrap())
+                as usize;
+            assert_eq!(len % 4, 0);
+            assert!(len >= 12);
+            offset += len;
+        }
+        assert_eq!(offset, rest.bytes().len());
+        table.commit_directory_read(&files, &rest).unwrap();
+        let eof = table.preview_directory_read(&files, &token, 0).unwrap();
+        assert!(eof.bytes().is_empty());
+        assert!(eof.eof());
+        table.commit_directory_read(&files, &eof).unwrap();
+        assert!(table.commit_directory_read(&files, &eof).is_err());
+    }
+    #[test]
+    fn namespace_mutation_requires_rewind_and_invalidates_previews() {
+        let (mut files, table, token) = setup();
+        let first = table.preview_directory_read(&files, &token, 12).unwrap();
+        table.commit_directory_read(&files, &first).unwrap();
+        let pending = table.preview_directory_read(&files, &token, 12).unwrap();
+        files.register(b"/dir/new", vec![3]).unwrap();
+        assert!(table.validate_directory_read(&files, &pending).is_err());
+        assert!(table.commit_directory_read(&files, &pending).is_err());
+        assert_eq!(table.directory_position(&token).unwrap(), 1);
+        assert!(table.preview_directory_read(&files, &token, 1024).is_err());
+        table.rewind_directory(&files, &token).unwrap();
+        assert_eq!(table.directory_position(&token).unwrap(), 0);
+        assert!(table.commit_directory_read(&files, &pending).is_err());
+        let fresh = table.preview_directory_read(&files, &token, 1024).unwrap();
+        table.rewind_directory(&files, &token).unwrap();
+        assert!(table.commit_directory_read(&files, &fresh).is_err());
+        assert!(table.preview_directory_read(&files, &token, 1024).is_ok());
+    }
+    #[test]
+    fn foreign_tables_namespaces_and_reused_fds_reject_plan() {
+        let (files, mut table, token) = setup();
+        let pending = table.preview_directory_read(&files, &token, 12).unwrap();
+        let (other, foreign, _) = setup();
+        assert!(table.validate_directory_read(&other, &pending).is_err());
+        assert!(foreign.validate_directory_read(&files, &pending).is_err());
+        assert!(table.preview_directory_read(&other, &token, 12).is_err());
+        assert_eq!(table.close_directory(&token), 0);
+        let next = table
+            .open_directory(&files, b"/dir", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.descriptor(), token.descriptor());
+        assert!(table.commit_directory_read(&files, &pending).is_err());
+        assert_eq!(table.directory_position(&next).unwrap(), 0);
     }
 }
