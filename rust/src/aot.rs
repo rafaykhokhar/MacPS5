@@ -37,6 +37,27 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn packed_pack_absolute_address_guard() {
+        for (map, opcode) in [(1, 0x63), (1, 0x6b), (1, 0x67), (2, 0x2b)] {
+            for length in [0, 4] {
+                let bytes = [
+                    0x67,
+                    0xc4,
+                    0xe0 | map,
+                    0x79 | length,
+                    opcode,
+                    0x04,
+                    0x25,
+                    0,
+                    0,
+                    0,
+                    0,
+                ];
+                assert!(super::translate_rust_memory_region(&bytes, 0, "address").is_err());
+            }
+        }
+    }
+    #[test]
     fn packed_variable_shift_absolute_address_guard() {
         for (opcode, w) in [(0x47, 0), (0x47, 0x80), (0x45, 0), (0x45, 0x80), (0x46, 0)] {
             for length in [0, 4] {
@@ -1861,6 +1882,74 @@ impl Emitter {
                     // Preserve both old sources for every destination alias.
                     self.emit(format!(
                         "str q0, [x19, #{}]\nstr q2, [x19, #{}]",
+                        208 + dst * 32,
+                        224 + dst * 32
+                    ));
+                }
+            }
+            M::Vpacksswb | M::Vpackssdw | M::Vpackuswb | M::Vpackusdw => {
+                use iced_x86::Code;
+                let (input_lane_size, unsigned, wide) = match i.code() {
+                    Code::VEX_Vpacksswb_xmm_xmm_xmmm128 => (2, false, false),
+                    Code::VEX_Vpacksswb_ymm_ymm_ymmm256 => (2, false, true),
+                    Code::VEX_Vpackssdw_xmm_xmm_xmmm128 => (4, false, false),
+                    Code::VEX_Vpackssdw_ymm_ymm_ymmm256 => (4, false, true),
+                    Code::VEX_Vpackuswb_xmm_xmm_xmmm128 => (2, true, false),
+                    Code::VEX_Vpackuswb_ymm_ymm_ymmm256 => (2, true, true),
+                    Code::VEX_Vpackusdw_xmm_xmm_xmmm128 => (4, true, false),
+                    Code::VEX_Vpackusdw_ymm_ymm_ymmm256 => (4, true, true),
+                    _ => {
+                        return Err(
+                            "Only VEX128/256 saturating integer packing is implemented".into()
+                        );
+                    }
+                };
+                let dst = vector(i.op0_register())?;
+                let first = vector(i.op1_register())?;
+                if i.op2_kind() == OpKind::Memory {
+                    if i.memory_base() == R::None
+                        && i.memory_index() == R::None
+                        && i.memory_displ_size() != 8
+                    {
+                        return Err("32-bit absolute addressing is not implemented".into());
+                    }
+                    self.address(i)?;
+                    self.emit(format!("mov x0, x19\nmov x2, #{dst}\nmov x3, #{first}\nmov x4, #{}\nmov x5, #{input_lane_size}\nmov x6, #{}\nbl _native_ps5_module_vector_pack_v1",if wide {32} else {16},u8::from(unsigned)));
+                    self.fault();
+                } else {
+                    let second = vector(i.op2_register())?;
+                    let output_bits = input_lane_size * 4;
+                    let minimum = if unsigned {
+                        0
+                    } else {
+                        -(1i32 << (output_bits - 1))
+                    };
+                    let maximum = (1i32 << (output_bits - usize::from(!unsigned))) - 1;
+                    self.emit(format!("mov w10, #{minimum}\nmov w11, #{maximum}"));
+                    for half in 0..if wide { 2 } else { 1 } {
+                        self.emit(format!(
+                            "ldr q0, [x19, #{}]\nldr q1, [x19, #{}]",
+                            208 + first * 32 + half * 16,
+                            208 + second * 32 + half * 16
+                        ));
+                        let lanes = 16 / input_lane_size;
+                        for source in 0..2 {
+                            for lane in 0..lanes {
+                                if input_lane_size == 2 {
+                                    self.emit(format!("smov w9, v{source}.h[{lane}]"));
+                                } else {
+                                    self.emit(format!("umov w9, v{source}.s[{lane}]"));
+                                }
+                                // Scalar clamping avoids changing host FPSR.QC.
+                                self.emit(format!("cmp w9, w10\ncsel w9, w9, w10, ge\ncmp w9, w11\ncsel w9, w9, w11, le\nins v{}.{}[{}], w9",4+half,if input_lane_size==2 {"b"} else {"h"},source*lanes+lane));
+                            }
+                        }
+                    }
+                    if !wide {
+                        self.emit("movi v5.16b, #0");
+                    }
+                    self.emit(format!(
+                        "str q4, [x19, #{}]\nstr q5, [x19, #{}]",
                         208 + dst * 32,
                         224 + dst * 32
                     ));

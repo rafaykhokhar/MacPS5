@@ -758,6 +758,64 @@ pub fn vector_cmpgtd256(
     vectors[destination as usize] = result;
     Ok(())
 }
+/// Saturating narrowing from signed word/dword inputs, per 128-bit half.
+#[derive(Clone, Copy)]
+pub struct VectorPack {
+    pub destination: u64,
+    pub first: u64,
+    pub size: u64,
+    pub input_lane_size: u64,
+    pub unsigned: u64,
+}
+pub fn vector_pack(
+    memory: &Memory<'_>,
+    vectors: &mut [[u8; 32]; 16],
+    address: u64,
+    operation: VectorPack,
+) -> Result<()> {
+    let VectorPack {
+        destination,
+        first,
+        size,
+        input_lane_size,
+        unsigned,
+    } = operation;
+    vector_operand(address, destination, size, 0)?;
+    if first >= 16 || ![2, 4].contains(&input_lane_size) || unsigned > 1 {
+        return Err("Invalid packed saturation operand".into());
+    }
+    let source = memory.read(address, size as usize)?;
+    let input = input_lane_size as usize;
+    let output = input / 2;
+    let (minimum, maximum) = if unsigned == 1 {
+        (0, (1i32 << (output * 8)) - 1)
+    } else {
+        (-(1i32 << (output * 8 - 1)), (1i32 << (output * 8 - 1)) - 1)
+    };
+    let mut result = [0; 32];
+    for base in (0..size as usize).step_by(16) {
+        for (which, data) in [&vectors[first as usize][..], source]
+            .into_iter()
+            .enumerate()
+        {
+            for lane in 0..16 / input {
+                let start = base + lane * input;
+                let value = if input == 2 {
+                    i32::from(i16::from_le_bytes(
+                        data[start..start + 2].try_into().unwrap(),
+                    ))
+                } else {
+                    i32::from_le_bytes(data[start..start + 4].try_into().unwrap())
+                };
+                let offset = base + which * 8 + lane * output;
+                result[offset..offset + output]
+                    .copy_from_slice(&value.clamp(minimum, maximum).to_le_bytes()[..output]);
+            }
+        }
+    }
+    vectors[destination as usize] = result;
+    Ok(())
+}
 /// Packed variable shifts: 0=left logical, 1=right logical, 2=right arithmetic.
 #[derive(Clone, Copy)]
 pub struct VectorVariableShift {
@@ -1410,6 +1468,43 @@ pub mod ffi {
                 destination,
                 first,
                 size,
+            )
+            .is_ok()
+        {
+            return;
+        }
+        cpu.fault = 1;
+    }
+    /// # Safety
+    /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn native_ps5_module_vector_pack_v1(
+        cpu: *mut Cpu,
+        address: u64,
+        destination: u64,
+        first: u64,
+        size: u64,
+        input_lane_size: u64,
+        unsigned: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if cpu.memory != 0
+            && vector_pack(
+                unsafe { &*(cpu.memory as *const Memory<'_>) },
+                &mut cpu.vectors,
+                address,
+                VectorPack {
+                    destination,
+                    first,
+                    size,
+                    input_lane_size,
+                    unsigned,
+                },
             )
             .is_ok()
         {
@@ -2477,6 +2572,203 @@ mod tests {
         assert_eq!(memory.read(0x1001, 16).unwrap(), &original[15][16..]);
         assert_eq!(cpu.vectors, original);
         assert_eq!(cpu.flags, u64::MAX);
+    }
+    #[test]
+    fn packed_saturation_boundaries_ordering_and_aliases() {
+        for size in [16usize, 32] {
+            for input in [2usize, 4] {
+                for unsigned in [0, 1] {
+                    let output = input / 2;
+                    let low = if unsigned == 1 {
+                        0i64
+                    } else {
+                        -(1i64 << (output * 8 - 1))
+                    };
+                    let high = if unsigned == 1 {
+                        (1i64 << (output * 8)) - 1
+                    } else {
+                        (1i64 << (output * 8 - 1)) - 1
+                    };
+                    let values = [
+                        -(1i64 << (input * 8 - 1)),
+                        low - 1,
+                        low,
+                        low + 1,
+                        -1,
+                        0,
+                        1,
+                        high - 1,
+                        high,
+                        high + 1,
+                        (1i64 << (input * 8 - 1)) - 1,
+                    ];
+                    for rotation in 0..values.len() {
+                        for destination in [3usize, 15] {
+                            let mut vectors = [[0xa5; 32]; 16];
+                            let mut data = [0; 32];
+                            let mut result = [0; 32];
+                            for base in (0..size).step_by(16) {
+                                for which in 0..2 {
+                                    for lane in 0..16 / input {
+                                        let value =
+                                            values[(rotation + base / input + which * 3 + lane)
+                                                % values.len()];
+                                        let start = base + lane * input;
+                                        if which == 0 {
+                                            vectors[15][start..start + input]
+                                                .copy_from_slice(&value.to_le_bytes()[..input]);
+                                        } else {
+                                            data[start..start + input]
+                                                .copy_from_slice(&value.to_le_bytes()[..input]);
+                                        }
+                                        let expected = if value < low {
+                                            low
+                                        } else if value > high {
+                                            high
+                                        } else {
+                                            value
+                                        };
+                                        let offset = base + which * 8 + lane * output;
+                                        result[offset..offset + output]
+                                            .copy_from_slice(&expected.to_le_bytes()[..output]);
+                                    }
+                                }
+                            }
+                            let mut expected = vectors;
+                            expected[destination] = result;
+                            let mut memory = Memory::default();
+                            memory
+                                .add(0x1_0000_0001, &mut data[..size], false, false)
+                                .unwrap();
+                            vector_pack(
+                                &memory,
+                                &mut vectors,
+                                0x1_0000_0001,
+                                VectorPack {
+                                    destination: destination as u64,
+                                    first: 15,
+                                    size: size as u64,
+                                    input_lane_size: input as u64,
+                                    unsigned,
+                                },
+                            )
+                            .unwrap();
+                            assert_eq!(vectors, expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn packed_saturation_rejects_short_memory_and_invalid_operands_atomically() {
+        let original = [[0xa5; 32]; 16];
+        for size in [16u64, 32] {
+            for input_lane_size in [2, 4] {
+                for unsigned in [0, 1] {
+                    for length in 0..size as usize {
+                        let mut data = vec![0; length];
+                        let mut memory = Memory::default();
+                        if length != 0 {
+                            memory.add(0x1001, &mut data, false, false).unwrap();
+                        }
+                        let mut vectors = original;
+                        assert!(
+                            vector_pack(
+                                &memory,
+                                &mut vectors,
+                                0x1001,
+                                VectorPack {
+                                    destination: 0,
+                                    first: 0,
+                                    size,
+                                    input_lane_size,
+                                    unsigned
+                                }
+                            )
+                            .is_err()
+                        );
+                        assert_eq!(vectors, original);
+                    }
+                }
+            }
+        }
+        let mut data = [0; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        for (destination, first, size, input_lane_size, unsigned) in [
+            (16, 0, 16, 2, 0),
+            (u64::MAX, 0, 16, 2, 0),
+            (0, 16, 16, 2, 0),
+            (0, u64::MAX, 16, 2, 0),
+            (0, 0, 0, 2, 0),
+            (0, 0, 8, 2, 0),
+            (0, 0, 64, 2, 0),
+            (0, 0, u64::MAX, 2, 0),
+            (0, 0, 16, 0, 0),
+            (0, 0, 16, 1, 0),
+            (0, 0, 16, 3, 0),
+            (0, 0, 16, 8, 0),
+            (0, 0, 16, u64::MAX, 0),
+            (0, 0, 16, 2, 2),
+            (0, 0, 16, 2, u64::MAX),
+        ] {
+            let mut vectors = original;
+            assert!(
+                vector_pack(
+                    &memory,
+                    &mut vectors,
+                    0x1001,
+                    VectorPack {
+                        destination,
+                        first,
+                        size,
+                        input_lane_size,
+                        unsigned
+                    }
+                )
+                .is_err()
+            );
+            assert_eq!(vectors, original);
+        }
+    }
+    #[test]
+    #[allow(unsafe_code)]
+    fn packed_saturation_ffi_preserves_faults_and_fp_state() {
+        use crate::legacy_cpu::Cpu;
+        unsafe { ffi::native_ps5_module_vector_pack_v1(std::ptr::null_mut(), 0, 0, 0, 16, 2, 0) };
+        let mut cpu = Cpu {
+            vectors: [[0xff; 32]; 16],
+            flags: u64::MAX,
+            mxcsr: 0xffff,
+            x87_control: 0x137f,
+            x87_status: 0x5555,
+            ..Cpu::default()
+        };
+        for fault in [0, 2, 13] {
+            cpu.fault = fault;
+            unsafe { ffi::native_ps5_module_vector_pack_v1(&mut cpu, 0x1001, 0, 0, 16, 2, 1) };
+            assert_eq!(cpu.fault, if fault == 0 { 1 } else { fault });
+            assert_eq!(cpu.vectors, [[0xff; 32]; 16]);
+        }
+        let mut data = [0x7f; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        cpu.memory = (&mut memory as *mut Memory<'_>) as u64;
+        cpu.fault = 0;
+        unsafe { ffi::native_ps5_module_vector_pack_v1(&mut cpu, 0x1001, 0, 0, 16, 2, 1) };
+        assert_eq!(cpu.fault, 0);
+        assert_eq!(&cpu.vectors[0][..8], &[0; 8]);
+        assert_eq!(&cpu.vectors[0][8..16], &[255; 8]);
+        assert_eq!(&cpu.vectors[0][16..], &[0; 16]);
+        let before = cpu.vectors;
+        unsafe { ffi::native_ps5_module_vector_pack_v1(&mut cpu, 0x1001, 0, 0, 16, 2, 2) };
+        assert_eq!(cpu.fault, 1);
+        assert_eq!(cpu.vectors, before);
+        assert_eq!(
+            (cpu.flags, cpu.mxcsr, cpu.x87_control, cpu.x87_status),
+            (u64::MAX, 0xffff, 0x137f, 0x5555)
+        );
     }
     #[test]
     fn packed_variable_shift_full_counts_and_signed_extrema() {

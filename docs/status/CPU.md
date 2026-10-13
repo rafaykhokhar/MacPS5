@@ -1,5 +1,42 @@
 # CPU completion criteria
 
+## Saturating integer packing
+
+VEX VPACKSSWB/SSDW/USWB/USDW now support eight XMM/YMM forms. Inputs are
+signed words/dwords even for unsigned-output packing. Each 128-bit half packs
+the first source's clipped values followed by the second source's clipped
+values. ARM64 register lowering uses scalar comparisons and selection instead
+of saturating NEON operations that would set host FPSR.QC. Destination writes
+follow all source reads; memory helpers guard the complete 16/32-byte operand
+before committing. XMM writes clear the upper half; guest flags/FP state are
+unchanged.
+
+References: AMD APM Volume 4 rev.3.24 pp.259–266
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)) and
+Intel SDM Volume 2B, PACK instruction operation definitions
+([manual](https://cdrdv2-public.intel.com/825757/253667-sdm-vol-2b.pdf)).
+Intel's VEX256 encoding and per-half operation definition resolve the AMD
+VPACKUSDW YMM table's printed L=0 typo. Architectural alignment-control
+behavior and full exception delivery remain outside the current guard model.
+
+The matching build passes 671 library tests, three integration tests, strict
+Clippy and release compilation (`work/packed-pack-native/{tests,clippy,release}.log`,
+process 2312 exit 0). The [native verifier](../../rust/verification/packed_pack_native.rs)
+passes 287,168 checks across 96 decoded fixtures using an independent signed
+input/clamp oracle: every i16 input, i32 clipping boundaries/extrema, per-half
+ordering, random lanes, aliases/high registers/WIG, readonly high/unaligned/RIP
+operands, every short span, guest flags/FP/fuel/prior faults and direct host
+FPSR preservation (`work/packed-pack-native/native.log`, process 38241 exit 0).
+
+Discovery reaches 57,756 instructions and 13,095 blocks with 148 unsupported
+sites: one former stop removed and no new stops. These counts do not measure
+CPU completion. The entry runner compiles with warnings denied; startup-only
+verification passes at the unchanged missing `fscanf` boundary, with ten
+accepted dependencies, 20,288 owned dependency bytes and cleanup pending.
+Game main has not executed (`work/packed-pack-native/entry.log`, process 74877
+exit 0). No full GPU suite was run for this CPU change. Production readiness
+and retail gameplay remain unverified.
+
 ## Per-lane variable shifts
 
 VEX VPSLLVD/Q, VPSRLVD/Q and VPSRAVD now support ten XMM/YMM forms. The
