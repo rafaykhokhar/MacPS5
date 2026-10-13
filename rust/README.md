@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct JMP/Jcc can now hand off to separately registered blocks through the
+executor, including conditional fallthrough. 1024 external-branch state checks,
+taken/fallthrough results, missing-target rejection and a fuel-bounded two-block
+loop pass. See [cross-block evidence](../docs/status/TRANSLATOR_READINESS.md#direct-branches-between-registered-blocks).
+
 An identical-workload M5 Pro comparison verifies direct translation/publication
 at 5.8–27.4 μs (arena setup separately 1.3–15.8 μs), versus 582–592 ms through
 dylibs. Both paths execute the same checked integer loop. This is a synthetic

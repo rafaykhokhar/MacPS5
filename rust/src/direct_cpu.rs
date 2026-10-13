@@ -88,31 +88,47 @@ pub fn translate(bytes: &[u8], address: u64, instruction_limit: usize) -> Result
         }
         decoded.push(i);
     }
-    if decoded.last().is_none_or(|i| i.code() != Code::Retnq) {
-        return Err("Direct block must end in RET64".into());
+    if decoded.last().is_none_or(|i| {
+        i.code() != Code::Retnq && !i.is_jmp_short_or_near() && !i.is_jcc_short_or_near()
+    }) {
+        return Err("Direct block must end in RET64 or a supported branch".into());
     }
     const EXIT: u32 = u32::MAX;
     const FUEL: u32 = u32::MAX - 1;
     if decoded.len() >= FUEL as usize {
         return Err("Too many direct labels".into());
     }
-    let boundaries: std::collections::BTreeMap<_, _> = decoded
+    let mut boundaries: std::collections::BTreeMap<_, _> = decoded
         .iter()
         .enumerate()
         .map(|(index, i)| (i.ip(), index as u32))
         .collect();
+    let end = decoded.last().unwrap().next_ip();
+    let mut external = std::collections::BTreeSet::new();
+    if decoded.last().unwrap().is_jcc_short_or_near() {
+        external.insert(end);
+    }
     for i in &decoded {
         if (i.is_jcc_short_or_near() || i.is_jmp_short_or_near())
             && !boundaries.contains_key(&i.near_branch_target())
         {
-            return Err(
-                "Direct branch target must be an instruction boundary within the block".into(),
-            );
+            let target = i.near_branch_target();
+            if (address..end).contains(&target) {
+                return Err("Direct branch enters an instruction interior".into());
+            }
+            external.insert(target);
         }
+    }
+    for target in &external {
+        let label = u32::try_from(boundaries.len()).map_err(|_| "Too many direct labels")?;
+        if label >= FUEL {
+            return Err("Too many direct labels".into());
+        }
+        boundaries.insert(*target, label);
     }
     let limit = decoded
         .len()
-        .checked_mul(48)
+        .checked_mul(64)
         .and_then(|n| n.checked_add(32))
         .ok_or("Direct emission budget overflow")?;
     let mut c = Arm64Code::new(limit);
@@ -277,6 +293,18 @@ pub fn translate(bytes: &[u8], address: u64, instruction_limit: usize) -> Result
                 c.context_access(9, 19, destination * 8, true, true)?;
             }
         }
+    }
+    if decoded.last().unwrap().is_jcc_short_or_near() {
+        c.branch(boundaries[&end], Branch::Jump)?;
+    }
+    for target in external {
+        c.bind(boundaries[&target])?;
+        c.load_u64(9, target)?;
+        c.context_access(9, 19, 128, true, true)?;
+        c.context_access(9, 19, 176, true, true)?;
+        c.load_u64(9, 2)?;
+        c.context_access(9, 19, 168, true, true)?;
+        c.branch(EXIT, Branch::Jump)?;
     }
     c.bind(FUEL)?;
     c.load_u64(9, 4)?;

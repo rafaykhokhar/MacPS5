@@ -543,3 +543,32 @@ NATIVE_PS5_AOT_DIRECTORY="$PWD/backend-benchmark-new" \
 
 The artifact directory must not exist. Backend selection remains explicit; the
 benchmark does not enable incomplete direct translation for other workloads.
+
+## Direct branches between registered blocks
+
+Direct JMP/Jcc targets outside the submitted span now emit dispatcher exits
+with guest RIP/target and stop reason 2. Conditional fallthrough at the span end
+uses the same path. Spans may end in supported branches as well as RET64.
+Targets inside the submitted span still require decoded instruction boundaries;
+labels and emission budgets are checked before publication. This is dispatcher
+handoff, not patched native cross-block branches or automatic discovery. The
+existing executor enforces target registration, live guest bytes, ownership,
+fuel and transition limits. Missing targets do not silently execute or fall back.
+
+`direct_cross_block_native.rs` passes 1024 short/near external Jcc truth-table
+and state checks. Real executor tests verify separately registered taken and
+fallthrough destinations returning 42/7, missing-target rejection, and a loop
+between two separately registered JMP blocks stopped by fuel. Its transition
+budget is deliberately larger than fuel to distinguish the two limit checks;
+the first equal-budget run stopped at the transition limit instead. The initial
+verifier build also needed `.err().expect(...)` because Execution lacks Debug.
+After those verifier corrections the strict-warning build/run passes (command
+chunk f93dbc, exit 0; `work/direct-cross-block/native.log`).
+
+687 library tests, three integration tests, strict Clippy and release build
+passed before the standalone verifier step (logs in the same directory; process
+64369 subsequently exited 1 on that verifier compilation error). Direct branch,
+immediate arithmetic, memory and register regression verifiers pass against the
+same runtime (process 16274 exit 0). Reproduce the new standalone verifier using
+the preceding release rlib/dependency flags; no arguments required. Calls,
+indirect branches and automatic direct translation remain unfinished.
