@@ -191,3 +191,36 @@ CALL/JMP/RET, cached-target reuse and exactly-once effects. The homebrew
 startup-only check still accepts ten dependencies and stops at missing `fscanf`
 before game main (process 25355 exit 0, `regression.log` and `entry.log` in the
 same directory). This does not verify retail games or graphics.
+
+## Compilation stage timing
+
+Set `NATIVE_PS5_TRANSLATION_TIMINGS=1` when running the benchmark (or another
+host using the module compiler) to emit one `TRANSLATION_TIMING` line to stderr
+for each successfully compiled batch. Other values and an unset variable leave
+diagnostics silent. Stdout remains available for the benchmark CSV.
+
+The nanosecond wall-clock stages are disjoint: ELF discovery/manifest/assembly
+emission, filesystem preparation, the xcrun clang/link subprocess, generated
+Mach-O validation, `dlopen`, and symbol lookup/entry construction. Emitted
+instruction/block counts describe the new batch. The timings end before the
+executor's final live-byte validation and publication. Failed compilations do
+not emit this success-only timing record. The compiler still enforces the same
+translation and mapped-memory budgets.
+
+On the same M5 Pro, ten measured batches (five initial and five incremental)
+showed `dlopen` taking 498.5–533.0 ms, versus 81.2–92.5 ms in clang/linking.
+Discovery/emission took 0.108–0.827 ms. This identifies library loading as the
+dominant measured stage for this fixture; it does not identify the underlying
+OS cause or extrapolate to large workloads. The existing direct ARM64 backend
+plan should target this repeated dylib-load cost as well as subprocess latency.
+It must retain executable-memory permissions, instruction-cache coherency,
+ownership, relocation and guarded-memory correctness.
+
+Evidence: `work/translation-stage-timing/stages.log` contains all ten records;
+`results.csv` contains five samples with all 505 result checks and complete
+retirement passing. Release build, strict-warning benchmark compilation and
+execution completed with process 46692 exit 0.
+682 library tests, three integration tests and strict Clippy also pass. A second
+benchmark run without the variable passes all result/retirement checks and
+produces zero stderr bytes (`default.csv`, `default.stderr`; process 34676
+exit 0). The diagnostics add no instruction support or gameplay compatibility.

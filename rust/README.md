@@ -1,5 +1,11 @@
 # Rust migration
 
+Optional `NATIVE_PS5_TRANSLATION_TIMINGS=1` diagnostics now separate discovery,
+filesystem setup, clang/linking, Mach-O validation, dylib loading and entry
+construction. On the synthetic M5 Pro benchmark, dylib loading dominates at
+499–533 ms per batch, compared with 81–93 ms in clang/linking. See
+[stage timing evidence](../docs/status/TRANSLATOR_READINESS.md#compilation-stage-timing).
+
 Generated translation libraries now export only translated block entries and
 discard unreachable runtime code. The checked synthetic benchmark retains
 458752 mapped bytes across two libraries, versus 4915200 before this change.

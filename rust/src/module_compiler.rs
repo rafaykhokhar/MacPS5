@@ -14,6 +14,7 @@ use std::{
     process::Command,
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
 };
 // Native static archives do not carry rustc's framework-link metadata into
 // clang consumers. CPU and GPU helpers can share archive codegen objects.
@@ -214,6 +215,9 @@ pub(crate) fn compile_incremental(
     if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         return Err("Module compilation requires Apple Silicon macOS".into());
     }
+    let timing_enabled =
+        std::env::var_os("NATIVE_PS5_TRANSLATION_TIMINGS").is_some_and(|value| value == "1");
+    let started = Instant::now();
     let elf = Elf::parse(file)?;
     let discovery = Discovery::run(&elf, roots, limit)?;
     let manifest = union_manifest(&discovery, file);
@@ -223,6 +227,7 @@ pub(crate) fn compile_incremental(
         return Err("Module has no translatable blocks".into());
     }
     let assembly = aot::rust_memory_helpers(artifacts.assembly)?;
+    let emitted = Instant::now();
     let archive = archive
         .canonicalize()
         .map_err(|e| format!("Missing Rust runtime archive: {e}"))?;
@@ -253,6 +258,7 @@ pub(crate) fn compile_incremental(
         .collect();
     std::fs::write(&exports, symbols).map_err(|e| e.to_string())?;
     std::fs::write(&source, assembly).map_err(|e| e.to_string())?;
+    let prepared = Instant::now();
     let build = Command::new("xcrun")
         .args(["clang", "-arch", "arm64", "-dynamiclib"])
         .args([
@@ -275,6 +281,7 @@ pub(crate) fn compile_incremental(
             String::from_utf8_lossy(&build.stderr)
         ));
     }
+    let linked = Instant::now();
     let generated =
         std::fs::read(&output).map_err(|e| format!("Cannot read generated library: {e}"))?;
     library.mapped_bytes = macho_mapped_bytes(&generated)?;
@@ -293,12 +300,14 @@ pub(crate) fn compile_incremental(
             .as_encoded_bytes(),
     )
     .map_err(|_| "Invalid module output path")?;
+    let validated = Instant::now();
     // macOS RTLD_NOW | RTLD_LOCAL. Input is exclusively generated ARM64, linked
     // against the matching trusted Rust runtime archive supplied by the host.
     library.handle = unsafe { dlopen(path.as_ptr(), 2 | 4) };
     if library.handle.is_null() {
         return Err("Cannot load compiled ARM64 module library".into());
     }
+    let loaded = Instant::now();
     let mut entries = Vec::new();
     for block in &artifacts.manifest.blocks {
         let symbol = CString::new(format!("module_aot_{:x}", block.start))
@@ -322,6 +331,22 @@ pub(crate) fn compile_incremental(
                 function,
             });
         }
+    }
+    if timing_enabled {
+        // Emit only successful batches. Durations are disjoint wall-clock
+        // stages; this ends before the executor's publication/live-byte checks.
+        eprintln!(
+            "TRANSLATION_TIMING discovery_emit_ns={} prepare_ns={} clang_link_ns={} validate_ns={} dlopen_ns={} entries_ns={} instructions={} blocks={} mapped_bytes={}",
+            emitted.duration_since(started).as_nanos(),
+            prepared.duration_since(emitted).as_nanos(),
+            linked.duration_since(prepared).as_nanos(),
+            validated.duration_since(linked).as_nanos(),
+            loaded.duration_since(validated).as_nanos(),
+            loaded.elapsed().as_nanos(),
+            discovery.instructions.len(),
+            artifacts.manifest.blocks.len(),
+            library.mapped_bytes
+        );
     }
     Ok(Compiled {
         library: Rc::new(library),
