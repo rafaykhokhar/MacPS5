@@ -9,3 +9,5 @@ Three model tests cover all 65,536 unsigned-byte pairs, aliases, read ordering, 
 The native verifier executes the pinned executable's actual `strcoll_l` tail wrapper at `0x1161b0`, using its import slot at `0x26fad0`. Checks pass for C/POSIX selection, unsigned bytes, prefixes, full-width addresses, unchanged source/errno/heap state, early mismatch before inaccessible memory, and faults for equal inaccessible suffixes (`work/strcoll-native/native.log`, session 99268). These checks establish the stated wrapper behavior; they do not establish game execution or non-C collation support.
 
 If the runtime later accepts other collation locales, dispatch must choose their corresponding implementation rather than silently routing them through `compare_c`.
+
+Updated integrated startup passes the binding/state assertions and reaches missing `strftime`, then requests normal exit -1 with 19,296 dependency bytes retained (`work/arm64-prototype/strcoll-entry-integrated.log`, 39042). The full run returns failure because all three Metal presentations are dropped. Game main has not executed.
