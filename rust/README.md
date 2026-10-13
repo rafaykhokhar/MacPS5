@@ -1,5 +1,11 @@
 # Rust migration
 
+VEX byte/word/dword/quadword insertion now preserves merge lanes, masks the
+immediate index and clears the upper YMM half after a successful scalar read.
+The matching build passes 608 library tests, three integration tests, strict
+Clippy and 24,480 native checks. Discovery reaches 55,198 instructions; startup
+still stops at missing `fscanf`, before game main. See [CPU evidence](../docs/status/CPU.md).
+
 VEX packed integer broadcasts now cover byte, word, dword and quadword inputs
 with XMM/YMM destinations. The build passes 607 library tests, three integration
 tests, strict Clippy, 25,074 new native checks and 65,579 dword regressions.

@@ -37,6 +37,29 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn packed_insert_forms_and_guards() {
+        for (map, opcode) in [(0xe3, 0x20), (0xe1, 0xc4), (0xe3, 0x22)] {
+            for w in [0, 0x80] {
+                for operand in [0xc1, 0xc0, 0x07] {
+                    for index in [0, 1, 7, 15, 128, 255] {
+                        let bytes = [0xc4, map, 0x69 | w, opcode, operand, index];
+                        assert!(super::translate_rust_memory_region(&bytes, 0, "insert").is_ok());
+                        let invalid = [0xc4, map, 0x6d | w, opcode, operand, index];
+                        assert!(
+                            super::translate_rust_memory_region(&invalid, 0, "invalid").is_err()
+                        );
+                    }
+                }
+                for prefix in [0x64, 0x65, 0x67] {
+                    let invalid = [prefix, 0xc4, map, 0x69 | w, opcode, 0x07, 0];
+                    assert!(super::translate_rust_memory_region(&invalid, 0, "address").is_err());
+                }
+                let invalid = [0x67, 0xc4, map, 0x69 | w, opcode, 0x04, 0x25, 0, 0, 0, 0, 0];
+                assert!(super::translate_rust_memory_region(&invalid, 0, "address").is_err());
+            }
+        }
+    }
+    #[test]
     fn packed_integer_broadcast_forms_and_guards() {
         for opcode in [0x78, 0x79, 0x58, 0x59] {
             for length in [0, 4] {
@@ -842,6 +865,42 @@ impl Emitter {
                     "str q0, [x19, #{}]\nstr q1, [x19, #{}]",
                     208 + dst * 32,
                     224 + dst * 32
+                ));
+            }
+            M::Vpinsrb | M::Vpinsrw | M::Vpinsrd | M::Vpinsrq => {
+                use iced_x86::Code;
+                let (scalar_width, lane_type) = match i.code() {
+                    Code::VEX_Vpinsrb_xmm_xmm_r32m8_imm8 | Code::VEX_Vpinsrb_xmm_xmm_r64m8_imm8 => {
+                        (8, "b")
+                    }
+                    Code::VEX_Vpinsrw_xmm_xmm_r32m16_imm8
+                    | Code::VEX_Vpinsrw_xmm_xmm_r64m16_imm8 => (16, "h"),
+                    Code::VEX_Vpinsrd_xmm_xmm_rm32_imm8 => (32, "s"),
+                    Code::VEX_Vpinsrq_xmm_xmm_rm64_imm8 => (64, "d"),
+                    _ => return Err("Only VEX packed integer insertion is implemented".into()),
+                };
+                if i.op2_kind() == OpKind::Memory
+                    && i.memory_base() == R::None
+                    && i.memory_index() == R::None
+                    && i.memory_displ_size() != 8
+                {
+                    return Err("32-bit absolute addressing is not implemented".into());
+                }
+                let dst = 208 + vector(i.op0_register())? * 32;
+                let merge = 208 + vector(i.op1_register())? * 32;
+                let read_width = if i.op2_kind() == OpKind::Register {
+                    bits(i, 2)
+                } else {
+                    scalar_width
+                };
+                self.read(i, 2, read_width, 20)?;
+                let lane = usize::from(i.immediate8()) & (128 / scalar_width - 1);
+                let register = if scalar_width == 64 { "x20" } else { "w20" };
+                // The immediate selects a lane modulo the 128-bit vector width.
+                // Guard the scalar read, then snapshot merge before aliases write.
+                self.emit(format!(
+                    "ldr q0, [x19, #{merge}]\nins v0.{lane_type}[{lane}], {register}\nstr q0, [x19, #{dst}]\nstr xzr, [x19, #{}]\nstr xzr, [x19, #{}]",
+                    dst + 16, dst + 24
                 ));
             }
             M::Vpbroadcastb | M::Vpbroadcastw | M::Vpbroadcastd | M::Vpbroadcastq => {

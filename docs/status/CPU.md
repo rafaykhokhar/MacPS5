@@ -1,5 +1,39 @@
 # CPU completion criteria
 
+## Packed scalar insertion
+
+VEX VPINSRB/W/D/Q now insert the scalar into the immediate-selected lane of
+the merge XMM source, preserving the other low128 bits and clearing the upper
+YMM half. Lane indices mask to 4/3/2/1 bits. Byte/word W0 and W1 encodings
+both work; their wider GPR operands still supply only the low byte/word.
+Memory reads are exactly 1/2/4/8 bytes. The scalar read and fault guard precede
+loading the merge vector, avoiding both premature writes and caller-saved
+NEON clobbering by memory helpers. Legacy/EVEX, L=1 and FS/GS/address32 remain
+explicit rejection boundaries.
+
+Reference: AMD APM Volume 4 rev.3.24 pp.354–362 and Intel's
+[VPINSRB/D/Q reference](https://cdrdv2-public.intel.com/782151/253667-sdm-vol-2b.pdf).
+VEX.vvvv supplies the merge source; the older AMD table's reserved-vvvv entry
+conflicts with its own prose and Intel's operand encoding, so it is not used
+as a rejection rule.
+
+The matching build passes 608 library tests, three integration tests, strict
+Clippy and release compilation (`work/packed-insert-native/{tests,clippy,release}.log`,
+process 35240 exit 0). The [native verifier](../../rust/verification/packed_insert_native.rs)
+passes 24,480 byte-array reference comparisons over 2,040 decoded fixtures,
+covering all 256 immediate encodings, high/aliased registers, B/W W1 forms,
+exact-end readonly high/unaligned/RIP loads, every insufficient memory span,
+fault atomicity, flags/FP state and execution guards
+(`work/packed-insert-native/native.log`, process 36998 exit 0).
+
+Pinned discovery advances to 55,198 instructions and 12,621 blocks. Twelve
+former boundaries disappear and ten new ones become reachable, leaving 205
+unsupported boundaries. The combined verifier compiles and startup-only
+execution passes the unchanged missing `fscanf` boundary: ten dependencies
+accepted, 20,288 dependency bytes owned, cleanup pending and game main not
+executed (`work/packed-insert-native/entry.log`, process 36998 exit 0).
+This evidence does not establish full CPU coverage or retail-game execution.
+
 ## Packed integer broadcasts
 
 VEX VPBROADCASTB/W/D/Q now support both XMM and YMM destinations. Register
