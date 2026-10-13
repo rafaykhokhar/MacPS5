@@ -2172,3 +2172,36 @@ verifier compiles with warnings denied; reproduce using the release rlib and
 dependency flags above with `direct_double_shift_native.rs`. Logs are
 `/tmp/macps5-double-shift-{tests,clippy,build}.log`. These scoped checks do not
 establish production CPU readiness or PS5 gameplay.
+
+## Direct counter branches
+
+Direct LOOP/LOOPE/LOOPNE supports both RCX and address-override ECX counters.
+It decrements the selected counter without changing guest flags, then tests
+nonzero count and (where required) guest ZF. ECX writes zero-extend into RCX.
+JRCXZ/JECXZ tests the selected counter without decrementing or writing it.
+These operations emit ARM64 code directly and use the same internal labels,
+external-target dispatch, instruction budgets and boundary rejection as Jcc.
+Semantics follow the [Intel instruction reference](https://cdrdv2-public.intel.com/812383/253666-sdm-vol-2a.pdf).
+
+`rust/verification/direct_counter_branch_native.rs` independently simulates
+execution until RET, external dispatch, prior fault or budget exhaustion. It
+covers all eight forms, both ZF states and other arithmetic flags, zero and
+wrapping counters, high RCX bits ignored by ECX forms, forward branches and
+backward loops, all three target layouts and six instruction budgets. Full
+GPR, flags, RIP, target, fault, stop and remaining fuel are compared. Targets
+inside an instruction are rejected. An actual NativeExecutor loop decrements
+three times and crosses into a separately registered continuation returning 42.
+
+Validation passes: 92160 new native state checks; the executor loop; 5120
+existing Jcc truth-table/budget checks, three existing backward-loop checks
+and executor branch result 7; 687 library tests, three integration tests,
+strict Clippy and release build. Both standalone verifiers compile with
+warnings denied. Reproduce using the release rlib/dependency flags above with
+`direct_counter_branch_native.rs` and `direct_branch_native.rs`. Logs are
+`/tmp/macps5-counter-{tests,clippy,build}.log`. The old LOOP rejection fixture
+now specifically rejects a target inside LOOP's displacement byte.
+
+The accompanying source audit found no implemented CPUID path or complete
+versioned target-feature profile. This remains a release requirement; added
+instruction support must not be treated as a complete advertised CPU contract.
+Architectural fault delivery and PS5 gameplay also remain unverified.

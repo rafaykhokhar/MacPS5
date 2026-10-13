@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct LOOP/LOOPE/LOOPNE and JRCXZ/JECXZ now use native ARM64 counter branches,
+including internal and external targets. 92160 native checks and an executor
+loop returning 42 pass, alongside existing branch regressions, library tests
+and strict Clippy. See [counter-branch evidence](../docs/status/TRANSLATOR_READINESS.md#direct-counter-branches).
+
 Direct SHLD/SHRD now supports 16/32/64-bit registers and guarded memory with
 immediate or CL counts. All 927744 native cases pass, along with library and
 integration tests and strict Clippy. See

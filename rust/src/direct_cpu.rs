@@ -5,6 +5,22 @@ use crate::{
     decode,
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
+fn counter_branch(i: &Instruction) -> Option<(bool, u8)> {
+    Some(match i.code() {
+        Code::Loopne_rel8_64_ECX => (false, 0),
+        Code::Loopne_rel8_64_RCX => (true, 0),
+        Code::Loope_rel8_64_ECX => (false, 1),
+        Code::Loope_rel8_64_RCX => (true, 1),
+        Code::Loop_rel8_64_ECX => (false, 2),
+        Code::Loop_rel8_64_RCX => (true, 2),
+        Code::Jecxz_rel8_64 => (false, 3),
+        Code::Jrcxz_rel8_64 => (true, 3),
+        _ => return None,
+    })
+}
+fn conditional_branch(i: &Instruction) -> bool {
+    i.is_jcc_short_or_near() || counter_branch(i).is_some()
+}
 fn double_shift(i: &Instruction) -> bool {
     matches!(i.mnemonic(), Mnemonic::Shld | Mnemonic::Shrd)
         && i.encoding() == iced_x86::EncodingKind::Legacy
@@ -468,7 +484,7 @@ pub(crate) fn translate_span(
             | Code::Movzx_r64_rm16 => {}
             _ if extending_move(&i).is_some() => {}
             Code::Mov_r32_rm32 | Code::Mov_rm32_r32 | Code::Mov_r64_rm64 | Code::Mov_rm64_r64 => {}
-            _ if i.is_jcc_short_or_near() || i.is_jmp_short_or_near() => {}
+            _ if conditional_branch(&i) || i.is_jmp_short_or_near() => {}
             _ if setcc(&i) => {}
             Code::Call_rel32_64 | Code::Call_rm64 | Code::Jmp_rm64 => {}
             _ if arithmetic_supported(&i) => {}
@@ -532,7 +548,7 @@ pub(crate) fn translate_span(
                 Code::Call_rel32_64 | Code::Call_rm64 | Code::Jmp_rm64
             )
             && !i.is_jmp_short_or_near()
-            && !i.is_jcc_short_or_near()
+            && !conditional_branch(i)
     }) {
         return Err("Direct block must end in RET64, CALL64 or a supported branch".into());
     }
@@ -548,11 +564,11 @@ pub(crate) fn translate_span(
         .collect();
     let end = decoded.last().unwrap().next_ip();
     let mut external = std::collections::BTreeSet::new();
-    if fallthrough || decoded.last().unwrap().is_jcc_short_or_near() {
+    if fallthrough || conditional_branch(decoded.last().unwrap()) {
         external.insert(end);
     }
     for i in &decoded {
-        if (i.is_jcc_short_or_near() || i.is_jmp_short_or_near())
+        if (conditional_branch(i) || i.is_jmp_short_or_near())
             && !boundaries.contains_key(&i.near_branch_target())
         {
             let target = i.near_branch_target();
@@ -1977,6 +1993,33 @@ pub(crate) fn translate_span(
             c.branch(boundaries[&i.near_branch_target()], Branch::Jump)?;
             continue;
         }
+        if let Some((wide, kind)) = counter_branch(i) {
+            c.context_access(9, 19, 8, wide, false)?;
+            if kind != 3 {
+                c.emit(if wide { 0xd1000529 } else { 0x51000529 })?; // sub x9/w9,#1
+                c.context_access(9, 19, 8, true, true)?;
+                if kind != 2 {
+                    c.emit(0xf100013f)?; // cmp x9,#0
+                    c.emit(0x9a9f07e9)?; // cset x9,ne
+                    c.context_access(10, 19, 136, true, false)?;
+                    c.emit(0xd346194a)?; // ubfx x10,x10,#6,#1: ZF
+                    if kind == 0 {
+                        c.load_u64(11, 1)?;
+                        c.emit(0xca0b014a)?;
+                    }
+                    c.emit(0x8a0a0129)?; // count nonzero AND flag condition
+                }
+            }
+            c.branch(
+                boundaries[&i.near_branch_target()],
+                Branch::CompareZero {
+                    register: 9,
+                    wide: true,
+                    nonzero: kind != 3,
+                },
+            )?;
+            continue;
+        }
         if i.is_jcc_short_or_near() {
             let condition = (i.condition_code() as u64)
                 .checked_sub(1)
@@ -2186,7 +2229,7 @@ pub(crate) fn translate_span(
             }
         }
     }
-    if fallthrough || decoded.last().unwrap().is_jcc_short_or_near() {
+    if fallthrough || conditional_branch(decoded.last().unwrap()) {
         c.branch(boundaries[&end], Branch::Jump)?;
     }
     for target in external {

@@ -103,7 +103,7 @@ fn main() {
         for bytes in [
             &[0xeb, 1, 0xb8, 1, 0, 0, 0, 0xc3][..],
             &[0xff, 0xe0, 0xc3],
-            &[0xe2, 0xfe, 0xc3],
+            &[0xe2, 0xff, 0xc3], // LOOP into its displacement byte
         ] {
             assert!(direct_cpu::translate(bytes, 0x100, 10).is_err());
         }
