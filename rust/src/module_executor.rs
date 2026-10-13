@@ -1026,6 +1026,28 @@ struct Block {
     function: unsafe extern "C" fn(*mut Cpu),
     _library: Option<Rc<crate::module_compiler::Library>>,
 }
+fn validate_translation_bytes(image: &Image, start: u64, bytes: &[u8]) -> Result<()> {
+    let address = image
+        .bias
+        .checked_add(start)
+        .ok_or("Compiled block address overflow")?;
+    let matches = image.segments.iter().any(|segment| {
+        if segment.flags & 1 == 0 || address < segment.address {
+            return false;
+        }
+        let Ok(offset) = usize::try_from(address - segment.address) else {
+            return false;
+        };
+        offset
+            .checked_add(bytes.len())
+            .and_then(|end| segment.bytes.get(offset..end))
+            == Some(bytes)
+    });
+    if !matches {
+        return Err("Live executable bytes differ from immutable ELF translation".into());
+    }
+    Ok(())
+}
 /// Explicit and opt-in automatic rebuilds share a finite attempt allowance.
 pub const MAX_TRANSLATION_REBUILDS: usize = 16;
 const MAX_TRANSLATION_SOURCE_BYTES: usize = 256 * 1024 * 1024;
@@ -2789,9 +2811,9 @@ impl NativeExecutor {
             .get(&bias)
             .map(|source| &source.roots)
     }
-    /// Recompile the immutable original ELF with one observed executable target
-    /// added to its root set. The same instruction limit applies to the complete
-    /// union. All old translations survive every rejected/failed replacement.
+    /// Discover the immutable ELF with one observed executable target added to
+    /// its root set, compiling only new instruction PCs. The instruction limit
+    /// applies to the complete union. Existing native blocks remain loaded.
     /// Call only while guest execution is quiescent; this does not resume a miss.
     /// Writable/self-modified executable bytes are not reinterpreted as code.
     /// # Safety
@@ -2837,8 +2859,19 @@ impl NativeExecutor {
             .get_mut(&image.bias)
             .unwrap()
             .rebuilds += 1;
-        let compiled =
-            crate::module_compiler::compile(&file, roots.clone(), limit, archive, directory)?;
+        let existing = self
+            .image_blocks
+            .keys()
+            .filter_map(|&(bias, pc)| (bias == image.bias).then_some(pc))
+            .collect();
+        let compiled = crate::module_compiler::compile_incremental(
+            &file,
+            roots.clone(),
+            limit,
+            archive,
+            directory,
+            &existing,
+        )?;
         if !compiled.entries.iter().any(|entry| entry.pc == pc) {
             let reason = compiled
                 .manifest
@@ -2849,31 +2882,23 @@ impl NativeExecutor {
                 .unwrap_or("no supported translation");
             return Err(format!("Observed target {pc:#x} is unsupported: {reason}"));
         }
+        // Preserve prior extension semantics: changed old executable bytes also
+        // reject publication, even though their native code is no longer rebuilt.
+        for block in self.image_blocks.iter().filter_map(|(&(bias, _), block)| {
+            (bias == image.bias).then_some(block)
+        }) {
+            validate_translation_bytes(image, block.start, &block.bytes)?;
+        }
         let mut replacement = BTreeMap::new();
         for entry in compiled.entries {
             image
                 .bias
                 .checked_add(entry.pc)
                 .ok_or("Compiled image address overflow")?;
-            let address = image
-                .bias
-                .checked_add(entry.start)
-                .ok_or("Compiled block address overflow")?;
-            let matches = image.segments.iter().any(|segment| {
-                if segment.flags & 1 == 0 || address < segment.address {
-                    return false;
-                }
-                let Ok(offset) = usize::try_from(address - segment.address) else {
-                    return false;
-                };
-                offset
-                    .checked_add(entry.bytes.len())
-                    .and_then(|end| segment.bytes.get(offset..end))
-                    == Some(entry.bytes.as_ref())
-            });
-            if !matches {
-                return Err("Live executable bytes differ from immutable ELF translation".into());
+            if self.image_blocks.contains_key(&(image.bias, entry.pc)) {
+                return Err("Incremental compiler replaced an existing entry".into());
             }
+            validate_translation_bytes(image, entry.start, &entry.bytes)?;
             replacement.insert(
                 (image.bias, entry.pc),
                 Block {
@@ -2884,9 +2909,8 @@ impl NativeExecutor {
                 },
             );
         }
-        // No fallible work remains. Existing libraries stay pinned until the
-        // replacement has been compiled, loaded and validated in its entirety.
-        self.image_blocks.retain(|&(bias, _), _| bias != image.bias);
+        // No fallible work remains. Append without unloading or replacing any
+        // old native entry; each batch remains pinned by its own Library Rc.
         self.image_blocks.append(&mut replacement);
         self.translation_sources.get_mut(&image.bias).unwrap().roots = roots;
         Ok(compiled.manifest)

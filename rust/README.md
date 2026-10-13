@@ -1,5 +1,13 @@
 # Rust migration
 
+CPU translator readiness is now the primary implementation track. Translation
+extensions compile only newly discovered instructions and retain old native
+code; cumulative discovery, instruction limits and publication checks remain.
+The build passes 599 library tests, three integration tests and strict Clippy.
+Native incremental-batch and existing explicit/automatic translation regressions
+pass. This still uses clang and does not establish production readiness or
+native-game performance. See [requirements and evidence](../docs/status/TRANSLATOR_READINESS.md).
+
 `Fgetc` now reads unsigned bytes through the owned unbuffered FILE model,
 including exposed buffer metadata and guarded EOF/error handling. The matching
 build passes 598 library tests, three integration tests and strict Clippy.
