@@ -412,8 +412,10 @@ and returns 42 using direct translated execution without clang/dlopen.
 687 library tests, three integration tests, strict Clippy and release build pass
 (process 54819 exit 0). Native addressing cases and the previous 4128 direct
 state/fuel/fault plus 512 invalid-PC regressions pass (process 4604 exit 0).
-The final verifier including the executor memory read passes (process 74013
-exit 0). Evidence is in `work/direct-mov-memory/`. Compile/run this standalone
+The initial executor fixture used unmapped offset 0x300 and correctly faulted
+(process 74013 exit 101). Correcting the data to mapped offset 0x180 makes the
+full verifier, including the executor memory read, pass (process 69500 exit 0,
+`corrected.log`). Evidence is in `work/direct-mov-memory/`. Compile/run this standalone
 verifier with the preceding release rlib/dependency flags; no arguments required.
 Byte/word MOV, memory-immediate MOV and other instruction families remain outside
 this direct path. The backend remains opt-in and incomplete.

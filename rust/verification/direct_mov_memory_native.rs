@@ -143,10 +143,10 @@ fn main() {
         };
         let mut file = memory_fixture();
         let mut bytes = vec![0x48, 0xb8];
-        bytes.extend_from_slice(&0x100300u64.to_le_bytes());
+        bytes.extend_from_slice(&0x100180u64.to_le_bytes());
         bytes.extend_from_slice(&[0x8b, 0x00, 0xc3]);
         file[0x100..0x100 + bytes.len()].copy_from_slice(&bytes);
-        file[0x300..0x304].copy_from_slice(&42u32.to_le_bytes());
+        file[0x180..0x184].copy_from_slice(&42u32.to_le_bytes());
         let mut image = Image::load(&file, 0x100000, 4096).unwrap();
         let mut executor = NativeExecutor::new(0x900000, 4096, 100, 100).unwrap();
         executor
