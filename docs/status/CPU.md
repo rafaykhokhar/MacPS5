@@ -85,3 +85,5 @@ An independent exact binary64-lattice oracle passes 79,714 native comparisons ag
 ## VEX128 VPXOR
 
 The exact VEX128 `VPXOR xmm,xmm,xmm/m128` form is implemented. An isolated native verifier passes 7,257 independent byte-XOR cases, including destination/source aliases, high registers, pinned memory displacements, unaligned full-width addresses, readonly inputs, upper YMM clearing and failed reads of every insufficient span from zero through fifteen bytes (`work/vpxor-review/native.log`, 93509). GPRs, flags and FP controls remain unchanged. Isolated build and strict Clippy pass; standard-release verification is separate. VEX256, EVEX and legacy forms are not covered by this increment.
+
+The same 7,257 cases pass against the standard protected-formatting release archive (`work/vpxor-review/release-native.log`, 56711). The verifier is now wired into the next full entry run.
