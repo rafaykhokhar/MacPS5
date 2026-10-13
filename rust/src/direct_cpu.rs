@@ -458,6 +458,7 @@ pub(crate) fn translate_span(
             _ if full_multiply(&i) => {}
             _ if divide_instruction(&i) => {}
             Code::Cbw | Code::Cwde | Code::Cdqe | Code::Cwd | Code::Cdq | Code::Cqo => {}
+            Code::Bswap_r32 | Code::Bswap_r64 => {}
             Code::VEX_Andn_r32_r32_rm32 | Code::VEX_Andn_r64_r64_rm64 => {}
             Code::VEX_Rorx_r32_rm32_imm8 | Code::VEX_Rorx_r64_rm64_imm8 => {}
             Code::VEX_Mulx_r32_r32_rm32 | Code::VEX_Mulx_r64_r64_rm64 => {}
@@ -975,6 +976,14 @@ pub(crate) fn translate_span(
                     c.context_access(9, 19, 16, true, true)?;
                 }
             }
+            continue;
+        }
+        if matches!(i.code(), Code::Bswap_r32 | Code::Bswap_r64) {
+            let wide = i.code() == Code::Bswap_r64;
+            let reg = register(i.op0_register(), wide)?;
+            c.context_access(9, 19, reg * 8, wide, false)?;
+            c.emit(if wide { 0xdac00d29 } else { 0x5ac00929 })?; // REV x9/w9
+            c.context_access(9, 19, reg * 8, true, true)?;
             continue;
         }
         if divide_instruction(i) {

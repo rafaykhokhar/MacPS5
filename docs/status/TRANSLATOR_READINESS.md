@@ -1956,3 +1956,22 @@ log is `/tmp/macps5-aot-accumext-paired.log`. The initial global-assembly attemp
 was replaced with the repository's existing `xcrun clang` object-file workflow
 to handle Mach-O local labels correctly. No runtime source changed, so this is
 additional backend validation, not expanded instruction support or gameplay.
+
+## Direct BSWAP
+
+Direct BSWAP32/64 now emits ARM64 REV on the selected register. Dword results
+zero-extend into the guest 64-bit register; qword results reverse all eight
+bytes. Flags and other registers remain unchanged. The undefined 16-bit form
+is not added to the supported instruction list.
+
+`rust/verification/direct_bswap_native.rs` independently reconstructs the
+reversed value byte by byte. It varies every byte position through all 256
+values, for both widths and all sixteen registers, with nonzero surrounding
+bytes. It checks full GPR state, flags, RIP, prior faults and zero/one/two
+instruction budgets. Reproduce with the release rlib/dependency flags above
+using `direct_bswap_native.rs`.
+
+Validation passes: 262144 native cases, 687 library tests, three integration
+tests, strict Clippy and release build. The standalone verifier compiles with
+warnings denied. Logs are `/tmp/macps5-bswap-{tests,clippy,build}.log`. This
+extends CPU coverage without establishing complete translation or gameplay.

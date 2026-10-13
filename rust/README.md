@@ -1,5 +1,9 @@
 # Rust migration
 
+Direct BSWAP32/64 now reverses register byte order with ARM64 REV. All 262144
+native state checks pass, including dword zero extension and preserved flags.
+See [BSWAP evidence](../docs/status/TRANSLATOR_READINESS.md#direct-bswap).
+
 An independent native comparison now checks accumulator extension in both the
 older AOT backend and the direct JIT. All 131406 paired cases pass. The suspected
 CWDE discrepancy was a source-reading mistake; runtime lowering needed no fix.
