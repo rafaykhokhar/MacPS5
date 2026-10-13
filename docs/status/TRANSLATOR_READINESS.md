@@ -708,3 +708,35 @@ indirect-call/jump and conditional-branch regressions. Reproduce the standalone
 verifier with the release rlib/dependency flags above; it takes no arguments.
 The direct backend remains opt-in with limited instruction coverage and a
 16-attempt source limit. PS5 game compatibility remains unverified.
+
+## Direct register stack operations and ELF probe
+
+Direct `PUSH r64` and `POP r64` now use the guarded memory helpers. A fault leaves
+the registers and flags unchanged. Successful PUSH commits RSP after storing
+the original operand value; POP commits the increment before assigning the
+destination, so PUSH RSP stores the old pointer and POP RSP uses the loaded
+value. Immediate/memory PUSH, memory POP and 16-bit stack forms remain unsupported.
+
+`direct_stack_native.rs` passes 1344 native cases across all registers, stack
+boundaries, unaligned addresses, writable/read-only mappings and fuel limits.
+It checks memory contents and register/flag preservation on faults. A complete
+automatically discovered register-save/frame/restore function returns 42.
+687 library tests, three integration tests, strict Clippy, release build and
+the strict-warning verifier pass (process 98054, exit 0). Automatic translation,
+span-join and indirect-call/jump native regressions also pass (83077, exit 0).
+
+`direct_elf_probe.rs` takes an ELF path and reports bounded raw entry execution
+through the direct backend. It does not bind imports, load dependencies or set
+up the guest process. The existing crispy-doom ELF (SHA256
+`308fbb17946974f0c2e888988d4f16f98681ea91a8a957a314b3518e5e45a567`)
+has entry 0x40. Before this change its entry span failed translation on
+`Push_r64`; afterward it fails on `Lea_r64_m` at 0x51. In both cases zero JIT
+bytes were published and the entry never executed. This is an instruction-gap
+probe, not evidence of homebrew startup or gameplay. The probe's initial build
+was corrected to print decoded instruction codes because the configured iced-x86
+Instruction type does not implement Display.
+
+Compile the stack verifier using the release rlib/dependency flags above. The
+ELF probe additionally needs `--extern iced_x86=<release deps/libiced_x86-*.rlib>`
+and takes the ELF pathname as its sole argument. Its STOP output must be read;
+a successful probe process exit does not mean guest execution succeeded.

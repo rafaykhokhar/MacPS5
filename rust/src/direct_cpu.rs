@@ -86,6 +86,7 @@ pub(crate) fn translate_span(
         let i = decode::instruction(&bytes[offset..], pc)?;
         match i.code() {
             Code::Nopd | Code::Nopq | Code::Retnq => {}
+            Code::Push_r64 | Code::Pop_r64 => {}
             Code::Mov_r32_imm32 | Code::Mov_r64_imm64 => {}
             Code::Mov_r32_rm32 | Code::Mov_rm32_r32 | Code::Mov_r64_rm64 | Code::Mov_rm64_r64 => {}
             _ if i.is_jcc_short_or_near() || i.is_jmp_short_or_near() => {}
@@ -194,6 +195,44 @@ pub(crate) fn translate_span(
         )?;
         c.emit(0xd1000529)?; // sub x9,x9,#1
         c.context_access(9, 19, 160, true, true)?;
+        if matches!(i.code(), Code::Push_r64 | Code::Pop_r64) {
+            let push = i.code() == Code::Push_r64;
+            let reg = register(i.op0_register(), true)?;
+            c.context_access(1, 19, 32, true, false)?;
+            c.emit(0xaa1303e0)?; // mov x0,x19
+            if push {
+                c.emit(0xd1002021)?; // sub x1,x1,#8
+                c.context_access(2, 19, reg * 8, true, false)?;
+                c.load_u64(3, 8)?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_store_v1 as *const () as u64,
+                )?;
+            } else {
+                c.load_u64(2, 8)?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_load_v1 as *const () as u64,
+                )?;
+            }
+            c.context_access(9, 19, 152, true, false)?;
+            c.branch(
+                EXIT,
+                Branch::CompareZero {
+                    register: 9,
+                    wide: true,
+                    nonzero: true,
+                },
+            )?;
+            // Helpers may clobber caller-saved registers; recompute RSP only
+            // after success. PUSH RSP stores the old value, POP RSP writes the
+            // loaded value after the ordinary increment.
+            c.context_access(9, 19, 32, true, false)?;
+            c.emit(if push { 0xd1002129 } else { 0x91002129 })?;
+            c.context_access(9, 19, 32, true, true)?;
+            if !push {
+                c.context_access(0, 19, reg * 8, true, true)?;
+            }
+            continue;
+        }
         if matches!(
             i.code(),
             Code::Call_rel32_64 | Code::Call_rm64 | Code::Jmp_rm64

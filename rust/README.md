@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct register PUSH/POP64 now uses guarded stack memory and preserves registers
+on faults. 1344 native cases and an automatically translated frame returning 42
+pass. A probe of the existing homebrew ELF moved its first translation blocker
+from PUSH to LEA; its entry still does not execute. See
+[stack and probe evidence](../docs/status/TRANSLATOR_READINESS.md#direct-register-stack-operations-and-elf-probe).
+
 On-demand direct translation now joins existing instruction boundaries when a
 new predecessor reaches cached code. Native checks verify exact instruction/fuel
 budgets and 40 cached repeats with no added JIT allocation. See
