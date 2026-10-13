@@ -2291,3 +2291,35 @@ warnings denied; reproduce with the release rlib/dependency flags above using
 `direct_packed_addsub_native.rs`. Logs are
 `/tmp/macps5-packed-addsub-{tests,clippy,build}.log`. These checks establish
 scoped correctness, not measured game performance or complete CPU/GPU support.
+
+## Compiled Rust integer workload
+
+`rust/verification/compiled_integer_guest.rs` is a freestanding Rust mixing
+workload with variable rotates, multiplication, shifts, XOR and loop control.
+`compiled_integer_native.rs` invokes rustc for x86_64-apple-darwin at opt-level 2,
+extracts its single relocation-free text section, places it in a synthetic ELF
+image, and executes it through NativeExecutor's automatic direct translator.
+The Mach-O extractor rejects text relocations and extra executable sections;
+this harness does not claim general Mach-O loading or PS5 binary compatibility.
+
+An independent u128 modular-arithmetic model checks the folded 32-bit result
+for six seeds and ten round counts, repeated twice. The fold exercises both
+halves of the 64-bit accumulator within the executor's 32-bit module-return
+contract. A second pass must preserve translation-attempt counts and JIT byte
+usage. A u64::MAX round count must terminate with an instruction-fuel error.
+No AOT/dylib fallback is allowed for the registered direct source.
+
+Measured validation passes: 120 result checks, stable warm cache, explicit
+fuel stop and zero loaded translation dylibs. This compiler build emitted 198
+guest text bytes; execution discovered 54 instructions in seven attempts and
+used 7328 JIT bytes. These sizes are observations, not hard-coded assertions
+or representative game memory/performance estimates. Only verification files
+changed; the previously passing library/Clippy checks were not rerun.
+
+Reproduce by compiling `compiled_integer_native.rs` with the release rlib and
+dependency flags above, then running its executable with the path to
+`rust/verification/compiled_integer_guest.rs`. Rust's x86_64-apple-darwin core
+target must be installed. Both verifier and guest compile with warnings denied.
+This adds evidence for mixed compiler-generated CPU execution and cache reuse;
+full instruction coverage, architectural fault delivery and gameplay remain
+unverified.

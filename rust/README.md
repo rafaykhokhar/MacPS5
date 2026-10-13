@@ -1,5 +1,11 @@
 # Rust migration
 
+A compiled Rust x86-64 integer workload now passes 120 independent result
+checks through automatic ARM64 translation, with stable warm-cache usage and
+verified fuel exhaustion. The measured build used 54 translated instructions,
+seven attempts and 7328 JIT bytes. See
+[compiled workload evidence](../docs/status/TRANSLATOR_READINESS.md#compiled-rust-integer-workload).
+
 Direct packed integer add/subtract now uses ARM64 SIMD for register operands
 at byte/word/dword/qword widths, with guarded memory sources for SSE128 and
 VEX128/256. All 540672 native cases, library/integration tests and strict Clippy
