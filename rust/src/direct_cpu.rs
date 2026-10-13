@@ -16,9 +16,13 @@ fn register_arithmetic(i: &Instruction) -> bool {
             | Mnemonic::Xor
             | Mnemonic::Test
     ) && i.op0_kind() == OpKind::Register
-        && i.op1_kind() == OpKind::Register
         && matches!(i.op0_register().size(), 4 | 8)
-        && i.op0_register().size() == i.op1_register().size()
+        && match i.op1_kind() {
+            OpKind::Register => i.op0_register().size() == i.op1_register().size(),
+            OpKind::Immediate32 | OpKind::Immediate8to32 => i.op0_register().size() == 4,
+            OpKind::Immediate32to64 | OpKind::Immediate8to64 => i.op0_register().size() == 8,
+            _ => false,
+        }
 }
 fn memory_address(c: &mut Arm64Code, i: &Instruction) -> Result<()> {
     if matches!(i.memory_segment(), Register::FS | Register::GS) {
@@ -173,7 +177,18 @@ pub fn translate(bytes: &[u8], address: u64, instruction_limit: usize) -> Result
             let wide = i.op0_register().size() == 8;
             let destination = register(i.op0_register(), wide)?;
             c.context_access(1, 19, destination * 8, wide, false)?;
-            c.context_access(2, 19, register(i.op1_register(), wide)? * 8, wide, false)?;
+            if i.op1_kind() == OpKind::Register {
+                c.context_access(2, 19, register(i.op1_register(), wide)? * 8, wide, false)?;
+            } else {
+                let immediate = match i.op1_kind() {
+                    OpKind::Immediate32 => u64::from(i.immediate32()),
+                    OpKind::Immediate8to32 => u64::from(i.immediate8to32() as u32),
+                    OpKind::Immediate32to64 => i.immediate32to64() as u64,
+                    OpKind::Immediate8to64 => i.immediate8to64() as u64,
+                    _ => return Err("Invalid direct arithmetic immediate".into()),
+                };
+                c.load_u64(2, immediate)?;
+            }
             let (opcode, operation) = match i.mnemonic() {
                 Mnemonic::Add => (0x0b020023, 1),
                 Mnemonic::Sub | Mnemonic::Cmp => (0x4b020023, 0),

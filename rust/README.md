@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct arithmetic now supports immediate constants with decoded sign extension.
+20640 independent native cases and an executor loop using `SUB ECX,1` pass,
+alongside existing direct-backend regressions. See
+[immediate-arithmetic evidence](../docs/status/TRANSLATOR_READINESS.md#direct-immediate-arithmetic).
+
 Direct register arithmetic now supports ADD/SUB/CMP/AND/OR/XOR/TEST at 32/64
 bits. 86016 independent result/flag cases pass, and the real executor computes
 the 10000-iteration sum 50005000 entirely through direct translation. See

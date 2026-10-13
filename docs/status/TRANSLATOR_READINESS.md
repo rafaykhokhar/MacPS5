@@ -473,3 +473,28 @@ against the same build (process 35157 exit 0). Logs: `work/direct-arithmetic/`.
 Compile/run the new standalone verifier with the preceding release rlib and
 dependency flags; no arguments required. The direct backend remains opt-in and
 incomplete; this integer-loop result is not game compatibility evidence.
+
+## Direct immediate arithmetic
+
+ADD/SUB/CMP/AND/OR/XOR/TEST direct lowering now accepts the corresponding
+immediate operands on 32/64-bit general-register destinations. It distinguishes
+unsigned 32-bit immediates in 32-bit operations from sign-extended imm8 and
+sign-extended imm32 in 64-bit operations using decoded operand kinds. Results
+and flags use the existing captured-operand arithmetic path. TEST has no imm8
+form. Memory and byte/word arithmetic remain unsupported in this direct path.
+
+`direct_immediate_native.rs` passes 20640 native cases with an independent
+widened/nibble/result-bit oracle: both widths, all destination registers,
+selected positive/negative/extreme imm8 and imm32 values, group and accumulator
+encodings, arithmetic and logical flags, and destination preservation for
+CMP/TEST. A real executor loop using `SUB ECX,1` computes 50005000 from 10000
+iterations without clang/dlopen. This is sampled constant coverage, not an
+exhaustive immediate-value inventory.
+
+687 library tests, three integration tests, strict Clippy, release build and
+the new strict-warning verifier pass (process 17829 exit 0). Register arithmetic
+(86016), register MOV (4128 plus 512 invalid PCs), memory MOV (10260), and branch
+(5120) regressions pass against the same build (process 21085 exit 0). Logs:
+`work/direct-immediate/`. Compile/run the standalone verifier with the preceding
+release rlib/dependency flags; no arguments required. Automatic translation,
+broader instruction coverage and retail compatibility remain unfinished.
