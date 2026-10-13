@@ -1975,3 +1975,29 @@ Validation passes: 262144 native cases, 687 library tests, three integration
 tests, strict Clippy and release build. The standalone verifier compiles with
 warnings denied. Logs are `/tmp/macps5-bswap-{tests,clippy,build}.log`. This
 extends CPU coverage without establishing complete translation or gameplay.
+
+## Direct bit scans and counts
+
+Direct BSF/BSR/LZCNT/TZCNT/POPCNT supports 16/32/64-bit register destinations
+and register or guarded-memory sources. A Rust helper computes the result and
+defined flags after the source has been captured. Word results preserve upper
+bits and dword results zero-extend. For zero-input BSF/BSR, ZF is set and the
+architecturally undefined destination is preserved deterministically, including
+its upper bits. Other undefined flags are preserved. LZCNT/TZCNT set CF from
+zero input and ZF from zero result; POPCNT clears the other arithmetic flags
+and sets ZF for zero input. Guarded-read faults preserve destination and flags.
+
+`rust/verification/direct_bit_scan_native.rs` independently enumerates set-bit
+positions to derive indices and counts. It tests every destination/source or
+base register pair, all widths and operations, zero, all-one, alternating and
+every single-bit input, including bits outside a narrow operand. Memory checks
+cover unaligned/short/unmapped/overflowing reads. Full GPR, flags, memory, RIP
+and fault/fuel/stop state are compared; separate helper guards check invalid
+widths, destinations, operations and pre-existing faults. Reproduce with the
+release rlib/dependency flags above using `direct_bit_scan_native.rs`.
+
+Validation passes: 1566720 native cases plus five helper guard cases, 687
+library tests, three integration tests, strict Clippy and release build. The
+standalone verifier compiles with warnings denied. Logs are
+`/tmp/macps5-bitscan-{tests,clippy,build}.log`. This adds instruction coverage
+through a native Rust helper, not a proof of full CPU readiness or gameplay.

@@ -5,6 +5,13 @@ use crate::{
     decode,
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
+fn bit_scan(i: &Instruction) -> bool {
+    matches!(
+        i.mnemonic(),
+        Mnemonic::Bsf | Mnemonic::Bsr | Mnemonic::Lzcnt | Mnemonic::Tzcnt | Mnemonic::Popcnt
+    ) && i.encoding() == iced_x86::EncodingKind::Legacy
+        && matches!(i.op0_register().size(), 2 | 4 | 8)
+}
 fn divide_instruction(i: &Instruction) -> bool {
     matches!(
         i.code(),
@@ -459,6 +466,7 @@ pub(crate) fn translate_span(
             _ if divide_instruction(&i) => {}
             Code::Cbw | Code::Cwde | Code::Cdqe | Code::Cwd | Code::Cdq | Code::Cqo => {}
             Code::Bswap_r32 | Code::Bswap_r64 => {}
+            _ if bit_scan(&i) => {}
             Code::VEX_Andn_r32_r32_rm32 | Code::VEX_Andn_r64_r64_rm64 => {}
             Code::VEX_Rorx_r32_rm32_imm8 | Code::VEX_Rorx_r64_rm64_imm8 => {}
             Code::VEX_Mulx_r32_r32_rm32 | Code::VEX_Mulx_r64_r64_rm64 => {}
@@ -984,6 +992,59 @@ pub(crate) fn translate_span(
             c.context_access(9, 19, reg * 8, wide, false)?;
             c.emit(if wide { 0xdac00d29 } else { 0x5ac00929 })?; // REV x9/w9
             c.context_access(9, 19, reg * 8, true, true)?;
+            continue;
+        }
+        if bit_scan(i) {
+            let size = i.op0_register().size();
+            let dst = register(i.op0_register().full_register(), true)?;
+            if i.op1_kind() == OpKind::Memory {
+                memory_address(&mut c, i)?;
+                c.emit(0xaa1303e0)?;
+                c.load_u64(2, size as u64)?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_load_v1 as *const () as u64,
+                )?;
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+                c.emit(0xaa0003e1)?;
+            } else {
+                let src = register(i.op1_register().full_register(), true)?;
+                if size == 2 {
+                    c.emit(0x79400261 | ((src as u32 * 4) << 10))?;
+                } else {
+                    c.context_access(1, 19, src * 8, size == 8, false)?;
+                }
+            }
+            c.emit(0xaa1303e0)?;
+            c.load_u64(2, dst as u64)?;
+            c.load_u64(3, size as u64)?;
+            c.load_u64(
+                4,
+                match i.mnemonic() {
+                    Mnemonic::Bsf => 0,
+                    Mnemonic::Bsr => 1,
+                    Mnemonic::Lzcnt => 2,
+                    Mnemonic::Tzcnt => 3,
+                    _ => 4,
+                },
+            )?;
+            c.call_absolute(crate::bit_scan::ffi::native_ps5_bit_scan_v1 as *const () as u64)?;
+            c.context_access(9, 19, 152, true, false)?;
+            c.branch(
+                EXIT,
+                Branch::CompareZero {
+                    register: 9,
+                    wide: true,
+                    nonzero: true,
+                },
+            )?;
             continue;
         }
         if divide_instruction(i) {

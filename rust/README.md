@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct BSF/BSR/LZCNT/TZCNT/POPCNT now supports all three operand widths and
+guarded memory sources. 1566720 native cases and five helper guard checks pass,
+along with library/integration tests and strict Clippy. See
+[bit-scan evidence](../docs/status/TRANSLATOR_READINESS.md#direct-bit-scans-and-counts).
+
 Direct BSWAP32/64 now reverses register byte order with ARM64 REV. All 262144
 native state checks pass, including dword zero extension and preserved flags.
 See [BSWAP evidence](../docs/status/TRANSLATOR_READINESS.md#direct-bswap).

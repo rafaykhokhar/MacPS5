@@ -3,6 +3,7 @@ pub mod direct_cpu;
 pub mod arm64_code;
 pub mod jit_memory;
 pub mod arithmetic;
+pub mod bit_scan;
 pub mod atomic_xadd;
 pub mod checks;
 pub mod condition;
