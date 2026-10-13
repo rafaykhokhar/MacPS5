@@ -1078,6 +1078,13 @@ struct TranslationSource {
     archive: std::path::PathBuf,
     directory: std::path::PathBuf,
 }
+struct DirectTranslationSource {
+    file: Rc<[u8]>,
+    arena: Rc<crate::jit_memory::JitArena>,
+    instruction_limit: usize,
+    instructions: usize,
+    attempts: usize,
+}
 #[derive(Clone, Copy)]
 pub enum Service {
     Getenv,
@@ -1942,6 +1949,7 @@ pub struct NativeExecutor {
     blocks: BTreeMap<u64, Block>,
     image_blocks: BTreeMap<(u64, u64), Block>,
     translation_sources: BTreeMap<u64, TranslationSource>,
+    direct_sources: BTreeMap<u64, DirectTranslationSource>,
     translation_source_bytes: usize,
     translation_cache_limits: TranslationCacheLimits,
     automatic_translation: bool,
@@ -2411,15 +2419,19 @@ impl NativeExecutor {
             .contains_key(&(owner.bias, entry - owner.bias))
             && !self.blocks.contains_key(&(entry - owner.bias))
         {
-            let source = self
-                .translation_sources
-                .get(&owner.bias)
-                .ok_or("Worker entry has no translation owner")?;
-            let archive = source.archive.clone();
-            let directory = source.directory.clone();
-            // SAFETY: the source archive inherits compile_image's trusted contract.
-            unsafe {
-                self.extend_image_translation(owner, entry, &archive, &directory)?;
+            if self.direct_sources.contains_key(&owner.bias) {
+                unsafe { self.extend_direct_translation(owner, entry)?; }
+            } else {
+                let source = self
+                    .translation_sources
+                    .get(&owner.bias)
+                    .ok_or("Worker entry has no translation owner")?;
+                let archive = source.archive.clone();
+                let directory = source.directory.clone();
+                // SAFETY: the source archive inherits compile_image's trusted contract.
+                unsafe {
+                    self.extend_image_translation(owner, entry, &archive, &directory)?;
+                }
             }
         }
         let mut address = self.stack_address;
@@ -2762,6 +2774,9 @@ impl NativeExecutor {
         archive: &std::path::Path,
         directory: &std::path::Path,
     ) -> Result<crate::discover::Manifest> {
+        if self.direct_sources.contains_key(&bias) {
+            return Err("Image already owns direct translation source".into());
+        }
         if self
             .image_blocks
             .keys()
@@ -2769,7 +2784,7 @@ impl NativeExecutor {
         {
             return Err("Image translations already registered".into());
         }
-        if self.translation_sources.len() >= MAX_TRANSLATION_SOURCES
+        if self.translation_sources.len() + self.direct_sources.len() >= MAX_TRANSLATION_SOURCES
             || file.len() > MAX_TRANSLATION_SOURCE_BYTES - self.translation_source_bytes
         {
             return Err("Immutable translation source budget exceeded".into());
@@ -2819,6 +2834,8 @@ impl NativeExecutor {
     /// Every archive supplied to `compile_image` must remain the exact trusted
     /// runtime build for the entire time this option is enabled. Compilation
     /// directories must remain host-controlled. Guest data must not select them.
+    /// Direct sources additionally retain the JitArena contract documented by
+    /// `register_direct_source` throughout every observed-target publication.
     pub unsafe fn set_automatic_translation(&mut self, enabled: bool) {
         self.automatic_translation = enabled;
     }
@@ -2981,6 +2998,9 @@ impl NativeExecutor {
     /// Call only after guest execution is quiescent; later calls fail until rebuilt.
     pub fn remove_image_translations(&mut self, bias: u64) {
         self.image_blocks.retain(|&(owner, _), _| owner != bias);
+        if let Some(source) = self.direct_sources.remove(&bias) {
+            self.translation_source_bytes -= source.file.len();
+        }
         if let Some(source) = self.translation_sources.remove(&bias) {
             self.translation_source_bytes -= source.file.len();
         }
@@ -3134,6 +3154,7 @@ impl NativeExecutor {
             translation_source_bytes: 0,
             translation_cache_limits: TranslationCacheLimits::default(),
             automatic_translation: false,
+            direct_sources: BTreeMap::new(),
             services: BTreeMap::new(),
             fuel,
             transitions,
@@ -3186,6 +3207,97 @@ impl NativeExecutor {
         &mut self, image: &Image, offset: u64, bytes: &[u8],
         instruction_limit: usize, arena: &crate::jit_memory::JitArena,
     ) -> Result<()> {
+        if self.direct_sources.contains_key(&image.bias) {
+            return Err("Image owns automatic direct translation source".into());
+        }
+        unsafe { self.publish_direct_in_image(image, offset, bytes, instruction_limit, arena) }
+    }
+    /// Retain an immutable ELF for bounded, observed-target direct translation.
+    /// Enable `set_automatic_translation` separately. Unsupported instructions
+    /// fail explicitly; there is no compiler/dylib fallback for this image.
+    /// # Safety
+    /// The executor must be quiescent. The arena's thread, signing and signal
+    /// handler contract must hold throughout execution and every translation miss.
+    pub unsafe fn register_direct_source(
+        &mut self, image: &Image, instruction_limit: usize,
+        arena: Rc<crate::jit_memory::JitArena>,
+    ) -> Result<()> {
+        if instruction_limit == 0 || self.direct_sources.contains_key(&image.bias)
+            || self.translation_sources.contains_key(&image.bias)
+            || self.image_blocks.keys().any(|&(bias, _)| bias == image.bias) {
+            return Err("Invalid or duplicate direct source".into());
+        }
+        if self.translation_sources.len() + self.direct_sources.len() >= MAX_TRANSLATION_SOURCES
+            || image.file.len() > MAX_TRANSLATION_SOURCE_BYTES - self.translation_source_bytes {
+            return Err("Immutable translation source budget exceeded".into());
+        }
+        crate::elf::Elf::parse(&image.file)?;
+        let mut snapshot = Vec::new();
+        snapshot.try_reserve_exact(image.file.len()).map_err(|_| "Cannot allocate direct source")?;
+        snapshot.extend_from_slice(&image.file);
+        self.translation_source_bytes += snapshot.len();
+        self.direct_sources.insert(image.bias, DirectTranslationSource {
+            file: snapshot.into(), arena, instruction_limit, instructions: 0, attempts: 0,
+        });
+        Ok(())
+    }
+    unsafe fn extend_direct_translation(&mut self, image: &Image, target: u64) -> Result<()> {
+        let source = self.direct_sources.get_mut(&image.bias).ok_or("Missing direct source")?;
+        if source.file.as_ref() != image.file.as_slice() {
+            return Err("Direct source image identity differs".into());
+        }
+        if source.attempts >= MAX_TRANSLATION_REBUILDS {
+            return Err("Direct translation attempt budget exhausted".into());
+        }
+        source.attempts += 1;
+        let limit = source.instruction_limit.checked_sub(source.instructions)
+            .ok_or("Direct instruction accounting overflow")?;
+        let file = source.file.clone();
+        let arena = source.arena.clone();
+        let elf = crate::elf::Elf::parse(&file)?;
+        let start = target.checked_sub(image.bias).ok_or("Direct target below image")?;
+        let mut pc = start;
+        let mut bytes = Vec::new();
+        let mut count = 0;
+        let mut entries = Vec::new();
+        loop {
+            if count >= limit { return Err("Direct source instruction budget exhausted".into()); }
+            let raw = elf.code(pc, 15)?;
+            let instruction = crate::decode::instruction(raw, pc)?;
+            let next = pc.checked_add(instruction.len() as u64).ok_or("Direct PC overflow")?;
+            // Prevent a newly observed target from reinterpreting an existing
+            // instruction interior or publishing overlapping native spans.
+            for (&(bias, _), block) in &self.image_blocks {
+                if bias == image.bias && pc < block.start + block.bytes.len() as u64
+                    && block.start < next {
+                    return Err("Overlapping direct translation span".into());
+                }
+            }
+            bytes.extend_from_slice(&raw[..instruction.len()]);
+            entries.push(pc);
+            count += 1;
+            if instruction.flow_control() != iced_x86::FlowControl::Next { break; }
+            pc = next;
+        }
+        for (&(bias, _), block) in &self.image_blocks {
+            if bias == image.bias { validate_translation_bytes(image, block.start, &block.bytes)?; }
+        }
+        unsafe { self.publish_direct_in_image(image, start, &bytes, count, &arena)?; }
+        // Every decoded instruction is a valid dispatcher entry into the same
+        // generated function. Share backing bytes and the pinned JIT allocation.
+        for pc in entries.into_iter().skip(1) {
+            let block = &self.image_blocks[&(image.bias, start)];
+            let alias = Block { start, bytes: block.bytes.clone(), function: block.function,
+                _library: None, _jit: block._jit.clone() };
+            self.image_blocks.insert((image.bias, pc), alias);
+        }
+        self.direct_sources.get_mut(&image.bias).unwrap().instructions += count;
+        Ok(())
+    }
+    unsafe fn publish_direct_in_image(
+        &mut self, image: &Image, offset: u64, bytes: &[u8],
+        instruction_limit: usize, arena: &crate::jit_memory::JitArena,
+    ) -> Result<()> {
         if self.image_blocks.contains_key(&(image.bias,offset)) || self.translation_sources.contains_key(&image.bias) {
             return Err("Image translation already registered".into());
         }
@@ -3214,6 +3326,7 @@ impl NativeExecutor {
             || bias.checked_add(offset).is_none()
             || self.image_blocks.contains_key(&(bias, offset))
             || self.translation_sources.contains_key(&bias)
+            || self.direct_sources.contains_key(&bias)
         {
             return Err("Invalid image translation registration".into());
         }
@@ -3620,12 +3733,6 @@ impl NativeExecutor {
                         std::mem::take(&mut saved.stack),
                         saved.stack_lease.clone(),
                     );
-                    let source = self
-                        .translation_sources
-                        .get(&bias)
-                        .ok_or("Translation miss lost its compilation owner")?;
-                    let archive = source.archive.clone();
-                    let directory = source.directory.clone();
                     let owner = if image.bias == bias {
                         &*image
                     } else {
@@ -3637,7 +3744,16 @@ impl NativeExecutor {
                     };
                     // SAFETY: opt-in's contract pins the matching trusted archive;
                     // execution is suspended with no native block on the stack.
-                    unsafe { self.extend_image_translation(owner, target, &archive, &directory) }
+                    let result = if self.direct_sources.contains_key(&bias) {
+                        unsafe { self.extend_direct_translation(owner, target) }
+                    } else {
+                        let source = self.translation_sources.get(&bias)
+                            .ok_or("Translation miss lost its compilation owner")?;
+                        let archive = source.archive.clone();
+                        let directory = source.directory.clone();
+                        unsafe { self.extend_image_translation(owner, target, &archive, &directory) }.map(|_| ())
+                    };
+                    result
                         .map_err(|error| {
                         format!("Translation miss at {target:#x} (bias {bias:#x}): {error}")
                     })?;
@@ -3986,7 +4102,8 @@ impl NativeExecutor {
                         .ok_or("Translation target overflow")?;
                     if self.automatic_translation
                         && cpu.fuel != 0
-                        && self.translation_sources.contains_key(&missing_bias)
+                        && (self.translation_sources.contains_key(&missing_bias)
+                            || self.direct_sources.contains_key(&missing_bias))
                         && memory.executable(missing_target)
                     {
                         drop(memory);

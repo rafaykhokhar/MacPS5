@@ -644,3 +644,44 @@ builds/runs. Compile the two standalone verifiers with the release rlib and
 dependency flags documented above; neither takes arguments. Automatic direct
 translation, broader instruction coverage and production readiness remain
 unfinished; this evidence does not establish PS5 game execution.
+
+## Observed-target direct translation
+
+`NativeExecutor::register_direct_source` retains an immutable ELF snapshot and
+an `Rc<JitArena>`. With `set_automatic_translation(true)`, the existing suspended
+translation-miss path can decode and lower a newly observed entry, call, return
+or branch target directly. It retries the saved dispatch phase after publication,
+without replaying guest instructions or creating a dylib. Worker entry preparation
+also selects this backend for direct-owned images; worker scheduling itself is
+not covered by the new native verifier.
+
+Discovery scans one straight-line span through its first control-flow boundary.
+Each decoded instruction PC shares the emitted function's dispatcher and pinned
+allocation. New overlapping spans are rejected, including instruction-interior
+targets. This conservative rule also rejects valid newly discovered predecessors
+that run into an existing span; merging such spans remains unfinished. Live
+executable bytes must match the immutable source before publication and execution.
+Unsupported instructions fail explicitly with no dylib fallback.
+
+The initial limits are the caller's cumulative instruction budget, 16 translation
+attempts per source (including failures), shared immutable-source byte/count
+limits, and the arena's append-only capacity. Arena accounting remains separate
+from the dylib cache; these limits are not a whole-process 16 GB memory proof.
+Retirement removes the source and instruction entries; arena bytes are not reused.
+Default backend selection remains unchanged.
+
+`direct_automatic_native.rs` verifies 20 executions returning 42 through newly
+discovered entry/callee/return/tail blocks, entry at an existing internal boundary,
+overlap rejection, instruction and attempt budgets, stale-byte rejection, and
+unsupported instructions without arena allocation. Dylib library usage is zero.
+The first overlap test exhausted its deliberately tight seven-instruction budget;
+giving that test more budget isolated overlap rejection, while a separate
+one-instruction case verifies exhaustion. The corrected strict-warning verifier
+passes (process 67040, exit 0).
+
+687 library tests, three integration tests, strict Clippy and release build passed
+before that first verifier assertion (process 57679). Existing indirect-call,
+indirect-jump, cross-block and register-MOV native regressions pass (process 72649,
+exit 0). Reproduce the new verifier with the release rlib/dependency flags above;
+it takes no arguments. This is initial opt-in automatic direct execution, not
+production readiness or PS5 game compatibility.

@@ -1,5 +1,11 @@
 # Rust migration
 
+The direct backend now supports opt-in observed-target translation from an
+immutable ELF source. A native executor test discovers its entry, callee, return
+continuation and indirect tail target on demand, returning 42 across 20 runs
+without dylibs. Instruction coverage and discovery remain limited; see
+[automatic-direct evidence and limits](../docs/status/TRANSLATOR_READINESS.md#observed-target-direct-translation).
+
 Direct indirect JMP64 now transfers through the executor without pushing a
 return address. Register and RIP-relative executor jumps preserve the stack,
 reject missing targets and stop a self-loop at the fuel limit. The shared native
