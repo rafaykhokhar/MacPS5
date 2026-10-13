@@ -2426,6 +2426,43 @@ impl Emitter {
                     self.write(i, 0, scalar_width, 20)?;
                 }
             }
+            M::Vmovlhps | M::Vmovhlps => {
+                let high_to_low = match i.code() {
+                    iced_x86::Code::VEX_Vmovlhps_xmm_xmm_xmm => false,
+                    iced_x86::Code::VEX_Vmovhlps_xmm_xmm_xmm => true,
+                    _ => return Err("Only VEX128 register half moves are implemented".into()),
+                };
+                let dst = vector(i.op0_register())?;
+                let first = vector(i.op1_register())?;
+                let second = vector(i.op2_register())?;
+                let (low, high) = if high_to_low {
+                    (216 + second * 32, 216 + first * 32)
+                } else {
+                    (208 + first * 32, 208 + second * 32)
+                };
+                self.emit(format!("ldr x9, [x19, #{low}]\nldr x10, [x19, #{high}]\nstr x9, [x19, #{}]\nstr x10, [x19, #{}]\nstr xzr, [x19, #{}]\nstr xzr, [x19, #{}]",208+dst*32,216+dst*32,224+dst*32,232+dst*32));
+            }
+            M::Vmovmskps | M::Vmovmskpd => {
+                use iced_x86::Code;
+                let (lane_bytes, size) = match i.code() {
+                    Code::VEX_Vmovmskps_r32_xmm | Code::VEX_Vmovmskps_r64_xmm => (4, 16),
+                    Code::VEX_Vmovmskps_r32_ymm | Code::VEX_Vmovmskps_r64_ymm => (4, 32),
+                    Code::VEX_Vmovmskpd_r32_xmm | Code::VEX_Vmovmskpd_r64_xmm => (8, 16),
+                    Code::VEX_Vmovmskpd_r32_ymm | Code::VEX_Vmovmskpd_r64_ymm => (8, 32),
+                    _ => return Err("Only VEX128/256 register sign masks are implemented".into()),
+                };
+                let (dst, _) = gpr(i.op0_register())?;
+                let src = vector(i.op1_register())?;
+                self.emit("mov x9, #0");
+                for lane in 0..size / lane_bytes {
+                    self.emit(format!(
+                        "ldrb w10, [x19, #{}]\nlsr w10, w10, #7\norr x9, x9, x10, lsl #{lane}",
+                        208 + src * 32 + (lane + 1) * lane_bytes - 1
+                    ));
+                }
+                // Both r32 and r64 forms zero every bit above the mask.
+                self.emit(format!("str x9, [x19, #{dst}]"));
+            }
             M::Vmovss | M::Vmovsd => {
                 use iced_x86::Code;
                 let scalar_width = match i.code() {

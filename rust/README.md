@@ -1,5 +1,13 @@
 # Rust migration
 
+VEX vector half moves and sign-mask extraction now support ten exact decoded
+forms, including r32/r64 mask destinations. The matching build passes 674
+library tests, three integration tests, strict Clippy and 86,144 native checks.
+Discovery reaches 58,030 instructions with 141 unsupported sites. Startup
+remains at missing `fscanf`, before game main. See
+[CPU evidence](../docs/status/CPU.md). Production readiness and retail gameplay
+remain unverified.
+
 VEX VMOVSS/VMOVSD now support eight scalar memory/register forms, including
 register merging, load zeroing and exact four/eight-byte stores. The matching
 build passes 674 library tests, three integration tests, strict Clippy, 80,952

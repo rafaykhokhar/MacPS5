@@ -1,5 +1,42 @@
 # CPU completion criteria
 
+## Register half moves and sign masks
+
+VEX VMOVLHPS/VMOVHLPS now combine the appropriate 64-bit halves of two XMM
+sources, capturing both before writes and clearing destination bits255:128.
+VEX VMOVMSKPS/PD extract each 32/64-bit lane's sign into the corresponding low
+GPR bit, zero all remaining GPR bits, and preserve the complete source vector.
+Both XMM/YMM source widths and r32/r64 decoded destination forms are supported,
+for ten exact decoded forms across this change. These are integer bit copies
+and extraction, without FP arithmetic or guest flag changes.
+
+References: AMD APM Volume 4 rev.3.24 pp.194–195, 200–201 and 206–209
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)); Intel
+SDM Volume 2B MOVMSKPD operation definition
+([manual](https://cdrdv2-public.intel.com/868141/253667-089-sdm-vol-2b.pdf)).
+The Intel definition confirms the GPR-only write; the AMD MOVMSKPD XMM prose's
+reference to a destination YMM upper half does not apply to a GPR destination.
+Legacy/EVEX and invalid length/operand/reserved-field forms remain rejected.
+
+The matching build passes 674 library tests, three integration tests, strict
+Clippy and release compilation (`work/vector-register-native/{tests,clippy,release}.log`,
+process 37696 exit 0). The [native verifier](../../rust/verification/vector_register_native.rs)
+passes 86,144 checks across 192 decoded fixtures, with independent byte-merge
+and sign-mask expectations: all mask combinations, nonsign-bit poison, every
+source bit position, all 16 GPR destinations, complete GPR zero extension,
+vector preservation, raw FP/random patterns, aliases/high registers and
+flags/FP/fuel/prior faults (`work/vector-register-native/native.log`, process
+82016 exit 0).
+
+Discovery reaches 58,030 instructions and 13,146 blocks with 141 unsupported
+sites: two former stops removed and one later stop exposed. These counts do
+not establish CPU completion. The entry runner compiles with warnings denied;
+startup-only verification passes at missing `fscanf`, with ten accepted
+dependencies, 20,288 owned dependency bytes and pending cleanup. Game main has
+not executed (`work/vector-register-native/entry.log`, process 69745 exit 0).
+No full GPU suite was run for this CPU change. Production readiness and retail
+gameplay remain unverified.
+
 ## Scalar single/double moves
 
 VEX VMOVSS and VMOVSD now support all eight decoded memory and register-merge
