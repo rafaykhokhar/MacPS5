@@ -758,6 +758,66 @@ pub fn vector_cmpgtd256(
     vectors[destination as usize] = result;
     Ok(())
 }
+/// Packed multiply: 0=MADDWD, 1=MULUDQ, 2=MULDQ.
+#[derive(Clone, Copy)]
+pub struct VectorMultiply {
+    pub destination: u64,
+    pub first: u64,
+    pub size: u64,
+    pub operation: u64,
+}
+pub fn vector_multiply(
+    memory: &Memory<'_>,
+    vectors: &mut [[u8; 32]; 16],
+    address: u64,
+    operation: VectorMultiply,
+) -> Result<()> {
+    let VectorMultiply {
+        destination,
+        first,
+        size,
+        operation,
+    } = operation;
+    vector_operand(address, destination, size, 0)?;
+    if first >= 16 || operation > 2 {
+        return Err("Invalid packed multiply operand".into());
+    }
+    let source = memory.read(address, size as usize)?;
+    let mut result = [0; 32];
+    if operation == 0 {
+        for start in (0..size as usize).step_by(4) {
+            let mut sum = 0i32;
+            for offset in [0, 2] {
+                let index = start + offset;
+                let a = i16::from_le_bytes(
+                    vectors[first as usize][index..index + 2]
+                        .try_into()
+                        .unwrap(),
+                );
+                let b = i16::from_le_bytes(source[index..index + 2].try_into().unwrap());
+                sum = sum.wrapping_add(i32::from(a) * i32::from(b));
+            }
+            result[start..start + 4].copy_from_slice(&sum.to_le_bytes());
+        }
+    } else {
+        for start in (0..size as usize).step_by(8) {
+            let a = u32::from_le_bytes(
+                vectors[first as usize][start..start + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            let b = u32::from_le_bytes(source[start..start + 4].try_into().unwrap());
+            let product = if operation == 1 {
+                u64::from(a) * u64::from(b)
+            } else {
+                (i64::from(a as i32) * i64::from(b as i32)) as u64
+            };
+            result[start..start + 8].copy_from_slice(&product.to_le_bytes());
+        }
+    }
+    vectors[destination as usize] = result;
+    Ok(())
+}
 /// Packed integer minimum/maximum parameters.
 #[derive(Clone, Copy)]
 pub struct VectorMinMax {
@@ -1294,6 +1354,41 @@ pub mod ffi {
                 destination,
                 first,
                 size,
+            )
+            .is_ok()
+        {
+            return;
+        }
+        cpu.fault = 1;
+    }
+    /// # Safety
+    /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn native_ps5_module_vector_multiply_v1(
+        cpu: *mut Cpu,
+        address: u64,
+        destination: u64,
+        first: u64,
+        size: u64,
+        operation: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if cpu.memory != 0
+            && vector_multiply(
+                unsafe { &*(cpu.memory as *const Memory<'_>) },
+                &mut cpu.vectors,
+                address,
+                VectorMultiply {
+                    destination,
+                    first,
+                    size,
+                    operation,
+                },
             )
             .is_ok()
         {
@@ -2289,6 +2384,191 @@ mod tests {
         assert_eq!(memory.read(0x1001, 16).unwrap(), &original[15][16..]);
         assert_eq!(cpu.vectors, original);
         assert_eq!(cpu.flags, u64::MAX);
+    }
+    #[test]
+    fn packed_multiply_extrema_ignored_lanes_and_aliases() {
+        for size in [16usize, 32] {
+            for operation in 0..3 {
+                for destination in [3usize, 15] {
+                    for rotation in 0..7 {
+                        for poison in [0, 255] {
+                            let mut vectors = [[0xa5; 32]; 16];
+                            let mut data = [0; 32];
+                            let mut result = [0; 32];
+                            if operation == 0 {
+                                let values = [i16::MIN, i16::MIN, -1, 0, 1, i16::MAX, -2];
+                                for start in (0..size).step_by(4) {
+                                    let lane = start / 2;
+                                    let mut sum = 0i64;
+                                    for word in 0..2 {
+                                        let a = values[(lane + word) % 7];
+                                        let b = values[(lane + word + rotation) % 7];
+                                        let index = start + word * 2;
+                                        vectors[15][index..index + 2]
+                                            .copy_from_slice(&a.to_le_bytes());
+                                        data[index..index + 2].copy_from_slice(&b.to_le_bytes());
+                                        sum += i64::from(a) * i64::from(b);
+                                    }
+                                    result[start..start + 4]
+                                        .copy_from_slice(&(sum as u32).to_le_bytes());
+                                }
+                                if rotation == 0 {
+                                    assert_eq!(&result[..4], &0x8000_0000u32.to_le_bytes());
+                                }
+                            } else {
+                                let values = [
+                                    0u32,
+                                    1,
+                                    0x7fff_ffff,
+                                    0x8000_0000,
+                                    0x8000_0001,
+                                    0xffff_fffe,
+                                    0xffff_ffff,
+                                ];
+                                for (lane, start) in (0..size).step_by(8).enumerate() {
+                                    let a = values[(lane + rotation) % 7];
+                                    let b = values[(lane * 2 + rotation) % 7];
+                                    vectors[15][start..start + 4].copy_from_slice(&a.to_le_bytes());
+                                    data[start..start + 4].copy_from_slice(&b.to_le_bytes());
+                                    vectors[15][start + 4..start + 8].fill(poison);
+                                    data[start + 4..start + 8].fill(poison);
+                                    let numeric = |v: u32| -> i128 {
+                                        if operation == 2 && v >= 0x8000_0000 {
+                                            i128::from(v) - (1i128 << 32)
+                                        } else {
+                                            i128::from(v)
+                                        }
+                                    };
+                                    result[start..start + 8].copy_from_slice(
+                                        &((numeric(a) * numeric(b)) as u64).to_le_bytes(),
+                                    );
+                                }
+                            }
+                            let mut expected = vectors;
+                            expected[destination] = result;
+                            let mut memory = Memory::default();
+                            memory
+                                .add(0x1_0000_0001, &mut data[..size], false, false)
+                                .unwrap();
+                            vector_multiply(
+                                &memory,
+                                &mut vectors,
+                                0x1_0000_0001,
+                                VectorMultiply {
+                                    destination: destination as u64,
+                                    first: 15,
+                                    size: size as u64,
+                                    operation,
+                                },
+                            )
+                            .unwrap();
+                            assert_eq!(vectors, expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn packed_multiply_full_span_and_invalid_operands_are_atomic() {
+        let original = [[0xa5; 32]; 16];
+        for size in [16u64, 32] {
+            for operation in 0..3 {
+                for length in 0..size as usize {
+                    let mut data = vec![0; length];
+                    let mut memory = Memory::default();
+                    if length != 0 {
+                        memory.add(0x1001, &mut data, false, false).unwrap();
+                    }
+                    let mut vectors = original;
+                    assert!(
+                        vector_multiply(
+                            &memory,
+                            &mut vectors,
+                            0x1001,
+                            VectorMultiply {
+                                destination: 0,
+                                first: 0,
+                                size,
+                                operation
+                            }
+                        )
+                        .is_err()
+                    );
+                    assert_eq!(vectors, original);
+                }
+            }
+        }
+        let mut data = [0; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        for (destination, first, size, operation) in [
+            (16, 0, 16, 0),
+            (u64::MAX, 0, 16, 0),
+            (0, 16, 16, 0),
+            (0, u64::MAX, 16, 0),
+            (0, 0, 0, 0),
+            (0, 0, 8, 0),
+            (0, 0, 64, 0),
+            (0, 0, u64::MAX, 0),
+            (0, 0, 16, 3),
+            (0, 0, 16, u64::MAX),
+        ] {
+            let mut vectors = original;
+            assert!(
+                vector_multiply(
+                    &memory,
+                    &mut vectors,
+                    0x1001,
+                    VectorMultiply {
+                        destination,
+                        first,
+                        size,
+                        operation
+                    }
+                )
+                .is_err()
+            );
+            assert_eq!(vectors, original);
+        }
+    }
+    #[test]
+    #[allow(unsafe_code)]
+    fn packed_multiply_ffi_faults_and_preserved_controls() {
+        use crate::legacy_cpu::Cpu;
+        unsafe { ffi::native_ps5_module_vector_multiply_v1(std::ptr::null_mut(), 0, 0, 0, 16, 0) };
+        let mut cpu = Cpu {
+            vectors: [[0xff; 32]; 16],
+            flags: u64::MAX,
+            mxcsr: 0xffff,
+            x87_control: 0x137f,
+            x87_status: 0x5555,
+            ..Cpu::default()
+        };
+        for fault in [0, 2, 13] {
+            cpu.fault = fault;
+            unsafe { ffi::native_ps5_module_vector_multiply_v1(&mut cpu, 0x1001, 0, 0, 16, 2) };
+            assert_eq!(cpu.fault, if fault == 0 { 1 } else { fault });
+            assert_eq!(cpu.vectors, [[0xff; 32]; 16]);
+        }
+        let mut data = [0xff; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        cpu.memory = (&mut memory as *mut Memory<'_>) as u64;
+        cpu.fault = 0;
+        unsafe { ffi::native_ps5_module_vector_multiply_v1(&mut cpu, 0x1001, 0, 0, 16, 2) };
+        assert_eq!(cpu.fault, 0);
+        assert_eq!(&cpu.vectors[0][..8], &1u64.to_le_bytes());
+        assert_eq!(&cpu.vectors[0][8..16], &1u64.to_le_bytes());
+        assert_eq!(&cpu.vectors[0][16..], &[0; 16]);
+        let before = cpu.vectors;
+        unsafe { ffi::native_ps5_module_vector_multiply_v1(&mut cpu, 0x1001, 0, 0, 16, 3) };
+        assert_eq!(cpu.fault, 1);
+        assert_eq!(cpu.vectors, before);
+        assert_eq!(
+            (cpu.flags, cpu.mxcsr, cpu.x87_control, cpu.x87_status),
+            (u64::MAX, 0xffff, 0x137f, 0x5555)
+        );
     }
     #[test]
     fn packed_minmax_signed_boundaries_and_aliases() {

@@ -1,5 +1,13 @@
 # Rust migration
 
+VEX VPMADDWD/VPMULUDQ/VPMULDQ now support six XMM/YMM forms with native ARM64
+widening arithmetic and guarded memory operands. The matching build passes
+663 library tests, three integration tests, strict Clippy and 19,152 native
+checks. Discovery reaches 57,726 instructions with 150 unsupported sites.
+Startup remains at missing `fscanf`, before game main. See
+[CPU evidence](../docs/status/CPU.md). Production readiness and retail
+gameplay remain unverified.
+
 VEX signed/unsigned integer vector min/max now supports all 24 byte/word/dword
 XMM/YMM forms. The matching build passes 659 library tests, three integration
 tests, strict Clippy and 599,872 native checks. Discovery reaches 57,665

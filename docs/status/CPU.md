@@ -1,5 +1,39 @@
 # CPU completion criteria
 
+## Packed widening multiply and word multiply-add
+
+VEX VPMADDWD, VPMULUDQ and VPMULDQ now support their six XMM/YMM forms.
+ARM64 lowering uses signed widening word multiplication plus pairwise wrapping
+addition for VPMADDWD. Its all-0x8000 input case produces 0x80000000 rather
+than saturating. Dword multiplication selects only the even dword lanes and
+writes full signed/unsigned 64-bit products. Both destination halves are
+committed after the old sources are read, preserving aliases. Memory helpers
+guard the complete 16/32-byte operand before committing. XMM writes clear the
+upper half; flags and FP state remain unchanged.
+
+Reference: AMD APM Volume 4 rev.3.24 pp.366–367, 418–419 and 430–431
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)).
+Architectural alignment-control behavior and full exception delivery remain
+outside the current guard model.
+
+The matching build passes 663 library tests, three integration tests, strict
+Clippy and release compilation (`work/packed-multiply-native/{tests,clippy,release}.log`,
+process 57802 exit 0). The [native verifier](../../rust/verification/packed_multiply_native.rs)
+passes 19,152 checks across 72 decoded fixtures using an independent i128
+oracle: overflow, signed/unsigned extrema, cancellation, random lanes, ignored
+odd-dword poison, aliases/high registers/WIG, readonly high/unaligned/RIP
+operands, every short span, flags/FP/fuel/prior faults
+(`work/packed-multiply-native/native.log`, process 89903 exit 0).
+
+Discovery reaches 57,726 instructions and 13,093 blocks with 150 unsupported
+sites: three former stops removed and one later stop exposed. These are not
+CPU coverage percentages. The entry runner compiles with warnings denied and
+startup-only verification passes at the unchanged missing `fscanf` boundary:
+ten accepted dependencies, 20,288 owned dependency bytes and cleanup pending.
+Game main has not executed (`work/packed-multiply-native/entry.log`, process
+33726 exit 0). No full GPU suite was run for this change. Production readiness
+and retail gameplay remain unverified.
+
 ## Packed integer minimum and maximum
 
 VEX VPMIN/MAX signed and unsigned byte, word and dword operations now support

@@ -37,6 +37,27 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn packed_multiply_absolute_address_guard() {
+        for (map, opcode) in [(1, 0xf5), (1, 0xf4), (2, 0x28)] {
+            for length in [0, 4] {
+                let bytes = [
+                    0x67,
+                    0xc4,
+                    0xe0 | map,
+                    0x79 | length,
+                    opcode,
+                    0x04,
+                    0x25,
+                    0,
+                    0,
+                    0,
+                    0,
+                ];
+                assert!(super::translate_rust_memory_region(&bytes, 0, "address").is_err());
+            }
+        }
+    }
+    #[test]
     fn packed_minmax_absolute_address_guard() {
         for (map, opcode) in [
             (1, 0xda),
@@ -1817,6 +1838,59 @@ impl Emitter {
                         self.emit("movi v2.16b, #0");
                     }
                     // Preserve both old sources for every destination alias.
+                    self.emit(format!(
+                        "str q0, [x19, #{}]\nstr q2, [x19, #{}]",
+                        208 + dst * 32,
+                        224 + dst * 32
+                    ));
+                }
+            }
+            M::Vpmaddwd | M::Vpmuludq | M::Vpmuldq => {
+                use iced_x86::Code;
+                let (operation, wide) = match i.code() {
+                    Code::VEX_Vpmaddwd_xmm_xmm_xmmm128 => (0, false),
+                    Code::VEX_Vpmaddwd_ymm_ymm_ymmm256 => (0, true),
+                    Code::VEX_Vpmuludq_xmm_xmm_xmmm128 => (1, false),
+                    Code::VEX_Vpmuludq_ymm_ymm_ymmm256 => (1, true),
+                    Code::VEX_Vpmuldq_xmm_xmm_xmmm128 => (2, false),
+                    Code::VEX_Vpmuldq_ymm_ymm_ymmm256 => (2, true),
+                    _ => return Err("Only VEX128/256 packed widening multiply and word multiply-add are implemented".into()),
+                };
+                let dst = vector(i.op0_register())?;
+                let first = vector(i.op1_register())?;
+                if i.op2_kind() == OpKind::Memory {
+                    if i.memory_base() == R::None
+                        && i.memory_index() == R::None
+                        && i.memory_displ_size() != 8
+                    {
+                        return Err("32-bit absolute addressing is not implemented".into());
+                    }
+                    self.address(i)?;
+                    self.emit(format!("mov x0, x19\nmov x2, #{dst}\nmov x3, #{first}\nmov x4, #{}\nmov x5, #{operation}\nbl _native_ps5_module_vector_multiply_v1",if wide {32} else {16}));
+                    self.fault();
+                } else {
+                    let second = vector(i.op2_register())?;
+                    for half in 0..if wide { 2 } else { 1 } {
+                        let left = half * 2;
+                        let right = left + 1;
+                        self.emit(format!(
+                            "ldr q{left}, [x19, #{}]\nldr q{right}, [x19, #{}]",
+                            208 + first * 32 + half * 16,
+                            208 + second * 32 + half * 16
+                        ));
+                        if operation == 0 {
+                            // Pairwise wrapping addition preserves PMADDWD's
+                            // unique all-0x8000 overflow result.
+                            self.emit(format!("smull v4.4s, v{left}.4h, v{right}.4h\nsmull2 v5.4s, v{left}.8h, v{right}.8h\naddp v{left}.4s, v4.4s, v5.4s"));
+                        } else {
+                            let multiply = if operation == 1 { "umull" } else { "smull" };
+                            self.emit(format!("uzp1 v4.4s, v{left}.4s, v{left}.4s\nuzp1 v5.4s, v{right}.4s, v{right}.4s\n{multiply} v{left}.2d, v4.2s, v5.2s"));
+                        }
+                    }
+                    if !wide {
+                        self.emit("movi v2.16b, #0");
+                    }
+                    // Delay both writes until every aliased source was read.
                     self.emit(format!(
                         "str q0, [x19, #{}]\nstr q2, [x19, #{}]",
                         208 + dst * 32,
