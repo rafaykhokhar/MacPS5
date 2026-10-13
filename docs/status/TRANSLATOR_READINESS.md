@@ -1799,3 +1799,28 @@ memory-input cases, plus 687 library tests, three integration tests, strict
 Clippy and release build. The standalone verifiers compile with warnings denied.
 Logs are `/tmp/macps5-wordarith-{tests,clippy,build}.log`. This expands CPU
 coverage; the homebrew library boundary and lack of PS5 gameplay remain.
+
+## Direct INC and DEC at every integer width
+
+Direct INC/DEC now supports unlocked 8/16/32/64-bit registers and guarded
+memory. Byte/word register loads and stores preserve the surrounding bits,
+including legacy high-byte aliases. Dword results zero-extend. Memory operations
+16/17 in the shared RMW helper add/subtract one and commit flags only after the
+guarded store succeeds. The arithmetic flag helper preserves incoming CF while
+updating the other defined arithmetic flags. LOCK memory forms remain rejected.
+
+`rust/verification/direct_incdec_all_native.rs` compares against independent
+modular increment/decrement, nibble, parity, sign and overflow rules. It covers
+all register/base encodings, all byte inputs, sign-boundary values at every
+width, both carry states, upper-bit preservation, unaligned/short/unmapped
+operands, read-only stores, prior faults and zero/one/two instruction budgets.
+Checks include the full GPR bank, mapped bytes, flags, RIP and fault/fuel/stop.
+The shared memory-arithmetic verifier updates its invalid-operation case to 18.
+Reproduce using the release rlib/dependency flags above with
+`direct_incdec_all_native.rs` and `direct_memory_arithmetic_native.rs`.
+
+Validation passes: 525312 native INC/DEC cases, 407205 shared RMW regression
+cases, 687 library tests, three integration tests, strict Clippy and release
+build. Both standalone verifiers compile with warnings denied. Logs are
+`/tmp/macps5-incdecall-{tests,clippy,build}.log`. This closes the unlocked
+INC/DEC width/addressing gap; it does not establish full CPU coverage or gameplay.

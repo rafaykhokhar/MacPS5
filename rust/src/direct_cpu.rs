@@ -271,7 +271,14 @@ fn arithmetic_supported(i: &Instruction) -> bool {
     }
     if matches!(
         i.code(),
-        Code::Inc_rm32 | Code::Inc_rm64 | Code::Dec_rm32 | Code::Dec_rm64
+        Code::Inc_rm8
+            | Code::Inc_rm16
+            | Code::Inc_rm32
+            | Code::Inc_rm64
+            | Code::Dec_rm8
+            | Code::Dec_rm16
+            | Code::Dec_rm32
+            | Code::Dec_rm64
     ) {
         return i.op0_kind() == OpKind::Register;
     }
@@ -294,6 +301,12 @@ fn arithmetic_supported(i: &Instruction) -> bool {
             OpKind::Immediate32to64 | OpKind::Immediate8to64 => i.op0_register().size() == 8,
             _ => false,
         }
+}
+fn memory_incdec(i: &Instruction) -> bool {
+    matches!(i.mnemonic(), Mnemonic::Inc | Mnemonic::Dec)
+        && i.op0_kind() == OpKind::Memory
+        && !i.has_lock_prefix()
+        && matches!(i.memory_size().size(), 1 | 2 | 4 | 8)
 }
 fn memory_address(c: &mut Arm64Code, i: &Instruction) -> Result<()> {
     if i.mnemonic() != Mnemonic::Lea && matches!(i.memory_segment(), Register::FS | Register::GS) {
@@ -399,6 +412,7 @@ pub(crate) fn translate_span(
             _ if conditional_move(&i) => {}
             _ if memory_arithmetic(&i) => {}
             _ if memory_shift(&i) => {}
+            _ if memory_incdec(&i) => {}
             Code::Not_rm8 | Code::Not_rm16 | Code::Not_rm32 | Code::Not_rm64
                 if !i.has_lock_prefix() => {}
             Code::Neg_rm8 | Code::Neg_rm16 | Code::Neg_rm32 | Code::Neg_rm64
@@ -951,10 +965,12 @@ pub(crate) fn translate_span(
             c.context_access(1, 19, 152, true, true)?;
             continue;
         }
-        if memory_arithmetic(i) || memory_shift(i) {
+        if memory_arithmetic(i) || memory_shift(i) || memory_incdec(i) {
             let size = i.memory_size().size();
             memory_address(&mut c, i)?;
-            if i.op1_kind() == OpKind::Register {
+            if memory_incdec(i) {
+                c.load_u64(2, 1)?;
+            } else if i.op1_kind() == OpKind::Register {
                 if size == 1 {
                     c.emit(0x39400262 | (byte_offset(i.op1_register())? << 10))?;
                 } else {
@@ -987,6 +1003,8 @@ pub(crate) fn translate_span(
                     Mnemonic::Ror => 13,
                     Mnemonic::Rcl => 14,
                     Mnemonic::Rcr => 15,
+                    Mnemonic::Inc => 16,
+                    Mnemonic::Dec => 17,
                     _ => unreachable!(),
                 },
             )?;
@@ -1517,7 +1535,9 @@ pub(crate) fn translate_span(
                 c.load_u64(2, immediate)?;
             }
             if let Some(destination) = destination {
-                if size == 2 {
+                if size == 1 {
+                    c.emit(0x39400261 | (byte_offset(i.op0_register())? << 10))?;
+                } else if size == 2 {
                     c.emit(0x79400261 | ((destination as u32 * 4) << 10))?;
                 } else {
                     c.context_access(1, 19, destination * 8, wide, false)?;
@@ -1535,7 +1555,9 @@ pub(crate) fn translate_span(
             };
             c.emit(opcode | if wide { 0x80000000 } else { 0 })?;
             if !matches!(i.mnemonic(), Mnemonic::Cmp | Mnemonic::Test) {
-                if size == 2 {
+                if size == 1 {
+                    c.emit(0x39000263 | (byte_offset(i.op0_register())? << 10))?;
+                } else if size == 2 {
                     c.emit(
                         0x79000263
                             | ((destination.ok_or("Direct arithmetic needs destination")? as u32

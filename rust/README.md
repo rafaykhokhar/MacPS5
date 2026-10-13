@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct INC/DEC now supports all four integer widths for registers and guarded
+memory, preserving carry and partial-register state. 525312 native cases and
+407205 shared RMW regression cases pass, along with the library/integration
+suites and strict Clippy. See
+[INC/DEC evidence](../docs/status/TRANSLATOR_READINESS.md#direct-inc-and-dec-at-every-integer-width).
+
 Direct 16-bit ADD/SUB/CMP/AND/OR/XOR/TEST now supports register destinations
 with register, immediate and guarded-memory inputs. 1142784 native word cases
 and 294912 mixed-width memory-input cases pass. Upper register bits and failed-

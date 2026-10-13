@@ -1435,6 +1435,7 @@ pub mod ffi {
     }
     /// Unlocked integer memory arithmetic: 0=ADD, 1=SUB, 2=AND, 3=OR, 4=XOR, 5=NOT, 6=NEG, 7=ADC, 8=SBB.
     /// Shift/rotate operations: 9=SHL, 10=SHR, 11=SAR, 12=ROL, 13=ROR, 14=RCL, 15=RCR; rhs is the unmasked count.
+    /// 16=INC, 17=DEC; rhs is ignored and CF is preserved.
     /// Flags commit only after the guarded store succeeds. This is not a host atomic operation.
     /// # Safety
     /// Same exclusive, disjoint CPU/Memory ownership contract as native_ps5_module_load_v1.
@@ -1452,7 +1453,7 @@ pub mod ffi {
         if cpu.fault != 0 {
             return;
         }
-        if ![1, 2, 4, 8].contains(&size) || operation > 15 {
+        if ![1, 2, 4, 8].contains(&size) || operation > 17 {
             cpu.fault = 3;
             return;
         }
@@ -1466,7 +1467,7 @@ pub mod ffi {
             return;
         };
         let count = (rhs & if size == 8 { 63 } else { 31 }) as u32;
-        if operation >= 14 {
+        if (14..=15).contains(&operation) {
             let Some((value, flags)) = crate::shift_flags::rotate_carry(
                 cpu.flags,
                 lhs,
@@ -1496,6 +1497,8 @@ pub mod ffi {
             8 => lhs.wrapping_sub(rhs).wrapping_sub(cpu.flags & 1),
             9 => lhs << count,
             10 => lhs >> count,
+            16 => lhs.wrapping_add(1),
+            17 => lhs.wrapping_sub(1),
             11 => {
                 let extension = (64 - size * 8) as u32;
                 let signed = ((lhs << extension) as i64) >> extension;
@@ -1513,7 +1516,17 @@ pub mod ffi {
                 }
             }
         };
-        let flags = if operation >= 9 {
+        let flags = if operation >= 16 {
+            crate::arithmetic::flags(
+                cpu.flags,
+                lhs,
+                1,
+                result,
+                size * 8,
+                if operation == 16 { 3 } else { 5 },
+            )
+            .flags
+        } else if operation >= 9 {
             crate::shift_flags::flags(cpu.flags, lhs, rhs, result, size * 8, operation - 9).flags
         } else if operation == 5 {
             cpu.flags
