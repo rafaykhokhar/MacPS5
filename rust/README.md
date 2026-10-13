@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct two-/three-operand IMUL now handles 16/32/64-bit registers, guarded-memory
+sources and encoded immediates. 470016 native product/overflow checks pass,
+along with the library/integration suites and strict Clippy. The implicit
+double-width form remains unsupported. See
+[IMUL evidence](../docs/status/TRANSLATOR_READINESS.md#direct-truncated-imul).
+
 Direct INC/DEC now supports all four integer widths for registers and guarded
 memory, preserving carry and partial-register state. 525312 native cases and
 407205 shared RMW regression cases pass, along with the library/integration

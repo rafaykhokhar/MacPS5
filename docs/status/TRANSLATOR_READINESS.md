@@ -1824,3 +1824,28 @@ cases, 687 library tests, three integration tests, strict Clippy and release
 build. Both standalone verifiers compile with warnings denied. Logs are
 `/tmp/macps5-incdecall-{tests,clippy,build}.log`. This closes the unlocked
 INC/DEC width/addressing gap; it does not establish full CPU coverage or gameplay.
+
+## Direct truncated IMUL
+
+Direct two- and three-operand IMUL supports 16/32/64-bit register destinations,
+register or guarded-memory sources, and short/full encoded immediates. Operands
+are captured before aliasing destination writes. ARM64 MUL supplies the low
+product; word writes preserve upper bits and dword writes zero-extend. The
+existing signed-product flag helper sets CF/OF according to whether the full
+product fits the signed destination width and preserves other undefined flags.
+Guarded load faults leave the destination and flags unchanged. The one-operand
+IMUL form with implicit double-width output remains unsupported by this path.
+
+`rust/verification/direct_imul_native.rs` uses a signed-magnitude oracle that
+sums shifted operands into a full i128 product. Cases cover every destination/
+source or base register combination, both instruction forms, sign-extended
+immediates, positive/negative boundaries, aliasing, partial-register state,
+unaligned/short/unmapped and overflowing reads, and full GPR/flag/memory/RIP/
+fault/fuel/stop comparisons. Reproduce using the release rlib/dependency flags
+above with `direct_imul_native.rs`.
+
+Validation passes: 470016 native IMUL cases, 687 library tests, three integration
+tests, strict Clippy and release build. The standalone verifier compiles with
+warnings denied after correcting a spacing error in its initial source. Logs
+are `/tmp/macps5-imul-{tests,clippy,build}.log`. This is instruction coverage,
+not completed CPU translation or PS5 gameplay.

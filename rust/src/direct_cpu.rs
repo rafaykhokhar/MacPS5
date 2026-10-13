@@ -5,6 +5,13 @@ use crate::{
     decode,
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
+fn truncated_imul(i: &Instruction) -> bool {
+    i.mnemonic() == Mnemonic::Imul
+        && i.encoding() == iced_x86::EncodingKind::Legacy
+        && matches!(i.op_count(), 2 | 3)
+        && i.op0_kind() == OpKind::Register
+        && matches!(i.op0_register().size(), 2 | 4 | 8)
+}
 fn carry_arithmetic(i: &Instruction) -> bool {
     matches!(i.mnemonic(), Mnemonic::Adc | Mnemonic::Sbb)
         && i.encoding() == iced_x86::EncodingKind::Legacy
@@ -421,6 +428,7 @@ pub(crate) fn translate_span(
             _ if bmi_shift(&i).is_some() => {}
             _ if movbe(&i) => {}
             _ if carry_arithmetic(&i) => {}
+            _ if truncated_imul(&i) => {}
             Code::VEX_Andn_r32_r32_rm32 | Code::VEX_Andn_r64_r64_rm64 => {}
             Code::VEX_Rorx_r32_rm32_imm8 | Code::VEX_Rorx_r64_rm64_imm8 => {}
             Code::VEX_Mulx_r32_r32_rm32 | Code::VEX_Mulx_r64_r64_rm64 => {}
@@ -904,6 +912,57 @@ pub(crate) fn translate_span(
                     c.context_access(1, 19, 152, true, true)?;
                 }
             }
+            continue;
+        }
+        if truncated_imul(i) {
+            let size = i.op0_register().size();
+            let dst = register(i.op0_register().full_register(), true)?;
+            let three = i.op_count() == 3;
+            let operand = if three { 1 } else { 2 };
+            if i.op1_kind() == OpKind::Memory {
+                memory_address(&mut c, i)?;
+                c.emit(0xaa1303e0)?;
+                c.load_u64(2, size as u64)?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_load_v1 as *const () as u64,
+                )?;
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+                c.emit(0xaa0003e0 | operand)?;
+            } else {
+                let src = register(i.op1_register().full_register(), true)?;
+                if size == 2 {
+                    c.emit(0x79400260 | operand | ((src as u32 * 4) << 10))?;
+                } else {
+                    c.context_access(operand as u8, 19, src * 8, size == 8, false)?;
+                }
+            }
+            if three {
+                c.load_u64(2, i.immediate(2))?;
+            } else if size == 2 {
+                c.emit(0x79400261 | ((dst as u32 * 4) << 10))?;
+            } else {
+                c.context_access(1, 19, dst * 8, size == 8, false)?;
+            }
+            c.emit(if size == 8 { 0x9b027c23 } else { 0x1b027c23 })?; // MUL x3/w3,x1/w1,x2/w2
+            if size == 2 {
+                c.emit(0x79000263 | ((dst as u32 * 4) << 10))?;
+            } else {
+                c.context_access(3, 19, dst * 8, true, true)?;
+            }
+            c.context_access(0, 19, 136, true, false)?;
+            c.load_u64(4, size as u64 * 8)?;
+            c.load_u64(5, 6)?;
+            c.call_absolute(crate::arithmetic::native_ps5_arithmetic_flags_v1 as *const () as u64)?;
+            c.context_access(0, 19, 136, true, true)?;
+            c.context_access(1, 19, 152, true, true)?;
             continue;
         }
         if carry_arithmetic(i) {
