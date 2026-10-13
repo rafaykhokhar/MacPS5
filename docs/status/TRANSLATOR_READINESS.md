@@ -1093,3 +1093,31 @@ rustc --edition=2024 -O -Dwarnings rust/verification/direct_vector_xor_native.rs
 
 The configured startup command is unchanged; the next direct CPU gap is vector
 move lowering with guarded reads/writes and VEX register semantics.
+
+## Direct VEX packed vector moves
+
+Direct lowering now explicitly accepts the 24 VEX128/256 load/store encodings
+of VMOVUPS, VMOVUPD, VMOVAPS, VMOVAPD, VMOVDQA and VMOVDQU. Register copies use
+ARM64 context loads/stores and support either encoding direction, including
+self-copies. VEX128 clears the destination's modeled upper 128 bits. Guarded
+memory helpers enforce full operand bounds, destination writability and, for
+aligned forms, 16/32-byte alignment before committing. Stores preserve the
+source vector including its upper half. RFLAGS and MXCSR remain unchanged.
+Legacy SSE, EVEX and scalar vector move forms are not added by this change.
+
+`rust/verification/direct_vector_move_native.rs` passes 92160 native state
+checks: every vector register pair and GPR memory base, both widths and encoding
+directions, aliases, unaligned addresses, aligned-form failures, exact mapping
+ends, short operands, address overflow, and read-only versus writable mappings.
+The verifier compares the entire vector register bank, GPR bank, mapped bytes,
+flags, MXCSR and fault/fuel/stop state. FS/GS and address-size overrides fail
+translation. The strict-warning verifier, 687 library tests, three integration
+tests, strict Clippy and release build pass. Reproduce using the standalone
+release rlib/dependency flags above with `direct_vector_move_native.rs`.
+
+The configured `--direct-startup` run now proceeds beyond the previous block at
+image-relative 0x2d2f and exits 1 at 0x31e8 with
+`Direct lowering unsupported: Cmovl_r32_rm32`. It still records the first real
+dlsym lookup. Logs are `/tmp/macps5-vector-move-{tests,clippy,build,startup}.log`.
+The next observed CPU gap is conditional moves; complete bootstrap and PS5
+gameplay remain unverified. This startup-only run skips Metal presentation.

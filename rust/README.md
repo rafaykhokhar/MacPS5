@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct VEX packed moves now support 128/256-bit register copies and guarded
+loads/stores for VMOVUPS/UPD/APS/APD/DQA/DQU. 92160 native state checks pass.
+Configured startup proceeds beyond the block at 0x2d2f and stops on CMOVL32 at
+0x31e8. See [vector move evidence](../docs/status/TRANSLATOR_READINESS.md#direct-vex-packed-vector-moves).
+
 Direct VEX VXORPS/VXORPD now handles 128/256-bit register and guarded memory
 operands, including aliases and upper-lane clearing. 98308 native state checks
 pass. Configured startup's block at 0x2d2f now translates past XOR and rejects

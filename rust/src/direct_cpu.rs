@@ -5,6 +5,35 @@ use crate::{
     decode,
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
+fn vector_move(i: &Instruction) -> Option<(u64, bool)> {
+    match i.code() {
+        Code::VEX_Vmovups_xmm_xmmm128
+        | Code::VEX_Vmovups_xmmm128_xmm
+        | Code::VEX_Vmovupd_xmm_xmmm128
+        | Code::VEX_Vmovupd_xmmm128_xmm
+        | Code::VEX_Vmovdqu_xmm_xmmm128
+        | Code::VEX_Vmovdqu_xmmm128_xmm => Some((16, false)),
+        Code::VEX_Vmovaps_xmm_xmmm128
+        | Code::VEX_Vmovaps_xmmm128_xmm
+        | Code::VEX_Vmovapd_xmm_xmmm128
+        | Code::VEX_Vmovapd_xmmm128_xmm
+        | Code::VEX_Vmovdqa_xmm_xmmm128
+        | Code::VEX_Vmovdqa_xmmm128_xmm => Some((16, true)),
+        Code::VEX_Vmovups_ymm_ymmm256
+        | Code::VEX_Vmovups_ymmm256_ymm
+        | Code::VEX_Vmovupd_ymm_ymmm256
+        | Code::VEX_Vmovupd_ymmm256_ymm
+        | Code::VEX_Vmovdqu_ymm_ymmm256
+        | Code::VEX_Vmovdqu_ymmm256_ymm => Some((32, false)),
+        Code::VEX_Vmovaps_ymm_ymmm256
+        | Code::VEX_Vmovaps_ymmm256_ymm
+        | Code::VEX_Vmovapd_ymm_ymmm256
+        | Code::VEX_Vmovapd_ymmm256_ymm
+        | Code::VEX_Vmovdqa_ymm_ymmm256
+        | Code::VEX_Vmovdqa_ymmm256_ymm => Some((32, true)),
+        _ => None,
+    }
+}
 fn vector_xor(i: &Instruction) -> Option<u64> {
     match i.code() {
         Code::VEX_Vxorps_xmm_xmm_xmmm128 | Code::VEX_Vxorpd_xmm_xmm_xmmm128 => Some(16),
@@ -195,6 +224,7 @@ pub(crate) fn translate_span(
             _ if byte_arithmetic(&i) => {}
             _ if immediate_shift(&i) => {}
             _ if vector_xor(&i).is_some() => {}
+            _ if vector_move(&i).is_some() => {}
             _ => return Err(format!("Direct lowering unsupported: {:?}", i.code())),
         }
         offset += i.len();
@@ -298,6 +328,44 @@ pub(crate) fn translate_span(
         )?;
         c.emit(0xd1000529)?; // sub x9,x9,#1
         c.context_access(9, 19, 160, true, true)?;
+        if let Some((size, aligned)) = vector_move(i) {
+            if i.op0_kind() == OpKind::Register && i.op1_kind() == OpKind::Register {
+                let dst = vector_register(i.op0_register(), size)?;
+                let src = vector_register(i.op1_register(), size)?;
+                for offset in (0..size as usize).step_by(8) {
+                    c.context_access(9, 19, 208 + src * 32 + offset, true, false)?;
+                    c.context_access(9, 19, 208 + dst * 32 + offset, true, true)?;
+                }
+                if size == 16 {
+                    c.load_u64(9, 0)?;
+                    c.context_access(9, 19, 224 + dst * 32, true, true)?;
+                    c.context_access(9, 19, 232 + dst * 32, true, true)?;
+                }
+            } else {
+                let load = i.op1_kind() == OpKind::Memory;
+                let reg = vector_register(i.op_register(if load { 0 } else { 1 }), size)?;
+                memory_address(&mut c, i)?;
+                c.emit(0xaa1303e0)?; // mov x0,x19
+                c.load_u64(2, reg as u64)?;
+                c.load_u64(3, size)?;
+                c.load_u64(4, u64::from(aligned))?;
+                c.call_absolute(if load {
+                    crate::guest_memory::ffi::native_ps5_module_vector_load_v1 as *const () as u64
+                } else {
+                    crate::guest_memory::ffi::native_ps5_module_vector_store_v1 as *const () as u64
+                })?;
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+            }
+            continue;
+        }
         if let Some(size) = vector_xor(i) {
             let dst = vector_register(i.op0_register(), size)?;
             let first = vector_register(i.op1_register(), size)?;
