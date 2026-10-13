@@ -1079,6 +1079,7 @@ pub enum Service {
     Strtof,
     Strtold,
     Vsscanf,
+    Sscanf,
     Gettimeofday,
     File(crate::stdio_file::Operation),
     Fgets,
@@ -1286,6 +1287,7 @@ impl Service {
             | Self::Strtof
             | Self::Strtold
             | Self::Vsscanf
+            | Self::Sscanf
             | Self::Gettimeofday
             | Self::File(_)
             | Self::Fgets
@@ -5787,14 +5789,23 @@ impl NativeExecutor {
                             memory.write(write.address, &write.bytes)?;
                         }
                         0
-                    } else if matches!(service, Service::Vsscanf) {
-                        let plan = crate::scan::guest_plan_with_rounding(
+                    } else if matches!(service, Service::Vsscanf | Service::Sscanf) {
+                        let plan = if matches!(service, Service::Sscanf) {
+                            crate::scan::call_plan_with_rounding(
+                                &memory,
+                                cpu.registers[7],
+                                cpu.registers[6],
+                                [cpu.registers[2], cpu.registers[1], cpu.registers[8], cpu.registers[9]],
+                                sp.checked_add(8).ok_or("Scanf stack argument overflow")?,
+                                crate::float_service::rounding(&cpu).ok(),
+                            )?
+                        } else { crate::scan::guest_plan_with_rounding(
                             &memory,
                             cpu.registers[7],
                             cpu.registers[6],
                             cpu.registers[2],
                             crate::float_service::rounding(&cpu).ok(),
-                        )?;
+                        )? };
                         for write in &plan.writes {
                             validate_net_output(
                                 &memory,

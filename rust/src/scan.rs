@@ -4,7 +4,7 @@
 //! long-double, wide and positional assignments remain unsupported.
 //! Input/format/va-list aliasing with outputs is rejected by the guest planner;
 //! committing a snapshot in those cases would change sequential scanf behavior.
-use crate::{guest_memory::Memory, Result};
+use crate::{Result, guest_memory::Memory};
 pub const LIMIT: usize = 65_536;
 const ARG_LIMIT: usize = 256;
 #[derive(Debug)]
@@ -216,11 +216,7 @@ pub fn scan_with_rounding(
             // FreeBSD GETARG occurs before string/scanset conversion, even if no match.
             let address = if suppress { None } else { Some(next()?) };
             let count = if width == 0 {
-                if conversion == b'c' {
-                    1
-                } else {
-                    LIMIT
-                }
+                if conversion == b'c' { 1 } else { LIMIT }
             } else {
                 width
             };
@@ -369,6 +365,49 @@ fn overlaps(address: u64, len: usize, other: u64, count: usize) -> Result<bool> 
 pub fn guest_plan(memory: &Memory<'_>, source: u64, format: u64, va: u64) -> Result<Plan> {
     guest_plan_with_rounding(memory, source, format, va, None)
 }
+/// Direct SysV sscanf call: two named GP arguments leave four pointer slots.
+/// Overflow points to the first stack argument, after the return address.
+/// No guest va_list is fabricated or updated. Unused arguments are not read.
+pub fn call_plan_with_rounding(
+    memory: &Memory<'_>,
+    source: u64,
+    format: u64,
+    registers: [u64; 4],
+    overflow: u64,
+    rounding: Option<crate::float_parse::Rounding>,
+) -> Result<Plan> {
+    let input = text(memory, source)?;
+    let fmt = text(memory, format)?;
+    let mut protected = vec![(source, input.len() + 1), (format, fmt.len() + 1)];
+    let mut calls = 0usize;
+    let mut next = || {
+        if calls >= ARG_LIMIT {
+            return Err("Scanf argument limit".into());
+        }
+        let value = if calls < registers.len() {
+            registers[calls]
+        } else {
+            let address = overflow
+                .checked_add(((calls - registers.len()) * 8) as u64)
+                .ok_or("Scanf stack argument overflow")?;
+            let value = memory.load(address, 8)?;
+            protected.push((address, 8));
+            value
+        };
+        calls += 1;
+        Ok(value)
+    };
+    let mut plan = scan_with_rounding(&input, &fmt, &mut next, rounding)?;
+    for write in &plan.writes {
+        for &(address, count) in &protected {
+            if overlaps(write.address, write.bytes.len(), address, count)? {
+                return Err("Scanf output aliases input/format/argument storage".into());
+            }
+        }
+    }
+    plan.protected_ranges = protected;
+    Ok(plan)
+}
 pub fn guest_plan_with_rounding(
     memory: &Memory<'_>,
     source: u64,
@@ -463,6 +502,57 @@ pub fn guest_plan_with_rounding(
 mod tests {
     use super::*;
     #[test]
+    fn direct_call_register_stack_suppression_and_alias_guards() {
+        let mut source = *b"99 1 2 3 4 5\0";
+        let mut format = *b"%*d%d%d%d%d%d%n\0";
+        let registers = [0x1_00001000, 0x1_00001004, 0x1_00001008, 0x1_0000100c];
+        let mut stack = [0u8; 16];
+        stack[..8].copy_from_slice(&0x1_00001010u64.to_le_bytes());
+        stack[8..].copy_from_slice(&0x1_00001014u64.to_le_bytes());
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut source, false, false).unwrap();
+        memory.add(0x1100, &mut format, false, false).unwrap();
+        memory.add(0x2000, &mut stack, false, false).unwrap();
+        let plan =
+            call_plan_with_rounding(&memory, 0x1000, 0x1100, registers, 0x2000, None).unwrap();
+        assert_eq!(plan.result, 5);
+        assert_eq!(plan.writes.len(), 6);
+        for (index, write) in plan.writes.iter().enumerate() {
+            assert_eq!(write.address, 0x1_00001000 + index as u64 * 4);
+            assert_eq!(
+                write.bytes,
+                (if index == 5 { 12 } else { index as u32 + 1 }).to_le_bytes()
+            );
+        }
+        assert_eq!(
+            plan.protected_ranges,
+            [(0x1000, 13), (0x1100, 16), (0x2000, 8), (0x2008, 8)]
+        );
+        let mut alias = registers;
+        alias[0] = 0x2008;
+        assert!(
+            call_plan_with_rounding(&memory, 0x1000, 0x1100, alias, 0x2000, None)
+                .unwrap_err()
+                .contains("aliases")
+        );
+        assert!(
+            call_plan_with_rounding(&memory, 0x1000, 0x1100, registers, u64::MAX, None).is_err()
+        );
+    }
+    #[test]
+    fn direct_call_does_not_read_unused_stack_or_register_pointers() {
+        let mut source = *b"99 x\0";
+        let mut format = *b"%*d%d\0";
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut source, false, false).unwrap();
+        memory.add(0x1100, &mut format, false, false).unwrap();
+        let plan = call_plan_with_rounding(&memory, 0x1000, 0x1100, [u64::MAX; 4], u64::MAX, None)
+            .unwrap();
+        assert_eq!(plan.result, 0);
+        assert!(plan.writes.is_empty());
+        assert_eq!(plan.protected_ranges.len(), 2);
+    }
+    #[test]
     fn double_fields_rollback_rounding_and_sticky_effects() {
         use crate::float_parse::Rounding;
         let mut next = || Ok(0x2000);
@@ -505,9 +595,11 @@ mod tests {
         memory.add(0x1000, &mut input, false, false).unwrap();
         memory.add(0x1100, &mut format, false, false).unwrap();
         memory.add(0x2000, &mut va, true, false).unwrap();
-        assert!(guest_plan(&memory, 0x1000, 0x1100, 0x2000)
-            .unwrap_err()
-            .contains("cursor aliases"));
+        assert!(
+            guest_plan(&memory, 0x1000, 0x1100, 0x2000)
+                .unwrap_err()
+                .contains("cursor aliases")
+        );
     }
     fn run(input: &[u8], fmt: &[u8]) -> Plan {
         let mut n = 0;

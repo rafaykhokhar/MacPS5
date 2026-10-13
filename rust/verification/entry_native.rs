@@ -53,6 +53,7 @@ mod fprintf_native;
 mod remove_native;
 mod rename_native;
 mod strncpy_native;
+mod sscanf_native;
 mod strcoll_native;
 mod strxfrm_native;
 mod wcscoll_native;
@@ -150,6 +151,7 @@ fn main() -> Result<(), String> {
         remove_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("remove"))?;
         rename_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("rename"))?;
         strncpy_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strncpy"))?;
+        sscanf_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("sscanf"))?;
         strcoll_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strcoll"))?;
         strxfrm_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strxfrm"))?;
         wcscoll_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("wcscoll"))?;
@@ -581,6 +583,7 @@ fn main() -> Result<(), String> {
         ("remove", Service::Remove),
         ("rename", Service::Rename),
         ("strncpy", Service::Strncpy),
+        ("sscanf", Service::Sscanf),
     ]
     .into_iter()
     .enumerate()
@@ -1555,6 +1558,7 @@ fn main() -> Result<(), String> {
                 (1216, "ftell"),
                 (1224, "fseek"),
                 (1232, "strncpy"),
+                (1240, "sscanf"),
             ] {
                 let expected = libc_exports.iter().find(|(symbol, _)| *symbol == name)
                     .ok_or("Missing registered libc service")?.1;
@@ -1583,12 +1587,12 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 158 libc exports: 159*24=3816 symbol bytes (rounded3824)
-                // and 1+158*12=1897 NID bytes (rounded1904).
-                || native.bytes_allocated() != 20064
+                // 159 libc exports: 160*24=3840 symbol bytes
+                // and 1+159*12=1909 NID bytes (rounded1920).
+                || native.bytes_allocated() != 20096
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'sscanf'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'opendir'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1598,7 +1602,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; strncpy import bound; unresolved sscanf causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; sscanf import bound; unresolved opendir causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1660,7 +1664,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved sscanf triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved opendir triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     if let Some(result) = presentation_result {

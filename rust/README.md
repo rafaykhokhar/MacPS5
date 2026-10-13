@@ -1,12 +1,21 @@
 # Rust migration
 
+Guest `Sscanf` now shares the bounded scanner with `Vsscanf`, supplying four
+register destination pointers and subsequent stack arguments without a guest
+va_list. The matching build passes 569 library tests, three integration tests
+and strict Clippy. Native M_StrToInt and existing SDL_vsscanf checks pass.
+See [sscanf evidence and limits](../docs/status/SSCANF.md).
+Startup-only import/ownership assertions pass with sscanf bound and 20,096
+retained dependency bytes. The next missing import is `opendir`; game main has
+not executed.
+
 Guest `Strncpy` now handles bounded copying, exact NUL padding, truncation, and
 full-width count/return values, with atomic memory and return-frame guards.
 The matching build passes 567 library tests, three integration tests and strict
 Clippy; 90 native direct/pinned-call cases and existing narrow-string regressions
 pass. The operation retains an explicit 64 KiB runtime limit. See
 [strncpy evidence](../docs/status/STRNCPY.md).
-Startup-only import/ownership assertions pass with strncpy bound; the next
+The preceding startup-only import/ownership assertions passed with strncpy bound; the next
 missing import is `sscanf`, with 20,064 retained dependency bytes. Game main
 has not executed.
 
