@@ -1,27 +1,22 @@
 # Rust migration
 
-Internal directory batch reads now validate namespace/cursor revisions and
-copy complete guest records before advancing. Failed copies preserve the
-cursor; stale plans are rejected. 584 library tests, three integration tests
-and strict Clippy pass. Guest DIR lifecycle and service wiring remain pending.
-
-Directory identities and internal descriptor ownership now survive rename and
-reject stale/reused handles. The integrated build passes 579 library tests,
-three integration tests and strict Clippy. Guest directory streams still need
-buffer/cursor/lifecycle integration; `opendir` remains unresolved.
-
-Directory-stream groundwork now enumerates the owned namespace and encodes
-guest directory entries, with 572 library tests, three integration tests and
-strict Clippy passing. `opendir` still needs descriptor and stream integration;
-it remains the startup blocker. See [directory status](../docs/status/DIRECTORY_STREAMS.md).
+Owned `Opendir`, `Readdir` and `Closedir` services now use guest heap buffers
+and the shared descriptor table. Native checks pass 102 entries across batches,
+EOF/errno preservation, cleanup and descriptor-reuse protection. The integrated
+build passes 589 library tests, three integration tests, strict Clippy and
+release compilation. Raw directory syscalls, mutation-tolerant cursors and
+additional directory APIs remain incomplete. See [directory status](../docs/status/DIRECTORY_STREAMS.md).
+Startup-only import/ownership assertions pass with the three directory imports
+bound and 20,208 retained dependency bytes. The next missing import is `putenv`;
+game main has not executed.
 
 Guest `Sscanf` now shares the bounded scanner with `Vsscanf`, supplying four
 register destination pointers and subsequent stack arguments without a guest
 va_list. The matching build passes 569 library tests, three integration tests
 and strict Clippy. Native M_StrToInt and existing SDL_vsscanf checks pass.
 See [sscanf evidence and limits](../docs/status/SSCANF.md).
-Startup-only import/ownership assertions pass with sscanf bound and 20,096
-retained dependency bytes. The next missing import is `opendir`; game main has
+The preceding startup-only import/ownership assertions passed with sscanf bound and 20,096
+retained dependency bytes at missing `opendir`; game main had
 not executed.
 
 Guest `Strncpy` now handles bounded copying, exact NUL padding, truncation, and

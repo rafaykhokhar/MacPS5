@@ -5,6 +5,7 @@ pub mod checks;
 pub mod condition;
 pub mod decode;
 pub mod descriptors;
+pub mod directory_stream;
 pub mod discover;
 pub mod elf;
 pub mod format;

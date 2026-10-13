@@ -1045,6 +1045,9 @@ pub enum Service {
     Mkdir,
     Remove,
     Rename,
+    Opendir,
+    Readdir,
+    Closedir,
     Setenv,
     Wcslen,
     Wcstombs,
@@ -1253,6 +1256,9 @@ impl Service {
             | Self::Mkdir
             | Self::Remove
             | Self::Rename
+            | Self::Opendir
+            | Self::Readdir
+            | Self::Closedir
             | Self::Setenv
             | Self::Wcslen
             | Self::Wcstombs
@@ -1870,6 +1876,7 @@ pub struct NativeExecutor {
     stdout_pointer: [u8; 8],
     pub stdio: crate::guest_stdio::GuestStdio,
     file_streams: crate::stdio_file::Store,
+    directory_streams: crate::directory_stream::Store,
     file_metadata: Vec<u8>,
     stdin_metadata: Option<[u8; crate::stdio_file::SLOT_SIZE]>,
     stdin_pointer: [u8; 8],
@@ -3016,6 +3023,7 @@ impl NativeExecutor {
             stdout: crate::captured_stdout::CapturedStdout::default(),
             stdio: crate::guest_stdio::GuestStdio::default(),
             file_streams: crate::stdio_file::Store::default(),
+            directory_streams: crate::directory_stream::Store::default(),
             file_metadata: vec![0; crate::stdio_file::ARENA_SIZE],
             stdin_metadata: None,
             stdin_pointer: crate::stdio_file::stdin_pointer_bytes(),
@@ -5988,6 +5996,39 @@ impl NativeExecutor {
                             cpu.registers[6],
                             cpu.registers[2],
                         )? as u32 as u64
+                    } else if matches!(service, Service::Opendir | Service::Readdir | Service::Closedir) {
+                        if memory.load(sp, 8)? != ret {
+                            return Err("Directory service return frame changed before mutation".into());
+                        }
+                        let kernel = self.kernel.as_mut().ok_or("Missing directory service kernel context")?;
+                        let outcome = if matches!(service, Service::Opendir) {
+                            match crate::kernel::read_path(&memory, cpu.registers[7]) {
+                                Ok(path) => {
+                                    let cwd = kernel.working_directory_bytes().map(<[u8]>::to_vec);
+                                    self.directory_streams.open(&mut memory, &kernel.files, &mut kernel.descriptors, &path, cwd.as_deref())?
+                                }
+                                Err(errno) => Err(errno),
+                            }
+                        } else if matches!(service, Service::Readdir) {
+                            self.directory_streams.read(&mut memory, &kernel.files, &kernel.descriptors, cpu.registers[7])?
+                        } else {
+                            // closedir releases owned storage even when its fd was
+                            // closed earlier. Guard that errno publication first.
+                            if self.directory_streams.close_error(&kernel.descriptors, cpu.registers[7])?.is_some() {
+                                validate_net_output(&memory, kernel.errno_address(), 4, sp, ret)?;
+                                memory.validate_write(kernel.errno_address(), 4)?;
+                            }
+                            self.directory_streams.close(&mut memory, &mut kernel.descriptors, cpu.registers[7])?.map(|()| 0)
+                        };
+                        match outcome {
+                            Ok(value) => value,
+                            Err(errno) => {
+                                let address = kernel.errno_address();
+                                validate_net_output(&memory, address, 4, sp, ret)?;
+                                memory.store(address, errno.into(), 4)?;
+                                if matches!(service, Service::Closedir) { u32::MAX.into() } else { 0 }
+                            }
+                        }
                     } else if matches!(service, Service::Remove | Service::Rename) {
                         if memory.load(sp, 8)? != ret {
                             return Err("Namespace service return frame changed before mutation".into());

@@ -1,7 +1,33 @@
-# Directory stream prerequisites
+# Directory streams
 
-The current startup blocker is `opendir`. There is no registered opendir,
-readdir or closedir service yet; startup has not advanced past this import.
+`Opendir`, `Readdir` and `Closedir` are now implemented and registered in the
+startup provider. Startup-only verification passes (64758 exit0,
+`work/arm64-prototype/directory-entry-verified.log`): all three named imports
+are bound, all ten named dependencies are accepted, and the next missing import
+is `putenv`. It retains 20,208 owned dependency bytes; cleanup remains pending
+and game main has not executed.
+
+The owned stream profile allocates a protected 64-byte opaque handle and
+1024-byte batch buffer from guest heap storage. These sizes are prototype
+choices, not a claim about the console's private DIR layout. Refills advance
+the descriptor cursor only after validating and copying a whole batch. Cached
+records remain readable after an external fd close; the next refill reports
+EBADF. EOF preserves errno. Close frees stream storage before closing its fd,
+and generation checks protect a replacement descriptor when the old one was
+closed externally. Errno output is guarded before teardown when needed.
+
+The integrated build passes 589 library tests, three integration tests, strict
+Clippy and release compilation (13051 exit0;
+`work/directory-streams-{tests,clippy,release}.log`). Native verification passes
+(12407 exit0, `work/directory-native/native.log`): 102 records over repeated
+batch refills, exact names and boundaries, EOF/errno, runtime-heap cleanup,
+open errors, cached data after external fd close and stale-close protection.
+The verifier confirms import names/addresses before testing direct translated
+calls; it does not claim to execute a retail-game directory caller.
+
+Raw directory syscalls, fdopendir, rewinddir/telldir/seekdir services, locking,
+detached-directory refills, and mutation-tolerant directory cookies remain
+incomplete. The following sections record the prerequisites and their tests.
 
 `Files::directory_entries` now enumerates the owned namespace, returning dot
 and dot-dot entries followed by byte-sorted immediate children. Inodes match
@@ -18,8 +44,7 @@ It does not use macOS's host dirent layout.
 
 This is an owned enumeration snapshot, not an open directory handle. It does
 not establish stream behavior across rename/unlink or concurrent mutations.
-Remaining requirements include DIR allocation/lifecycle, errno behavior and native
-caller verification before adding the service exports. Existing namespace
+At that checkpoint DIR lifecycle and native verification were still pending. Existing namespace
 limits, virtual uid/gid policy and lack of host mounting remain in force.
 
 Retained identity is now implemented separately as `DirectoryToken`. It keeps
@@ -35,7 +60,8 @@ or another table from reviving an old handle. Live directory endpoints also
 retain namespace binding. Close retires the endpoint normally. This is not yet
 connected to guest open/opendir: raw directory read/write/stat/seek/truncate
 syscalls report explicit runtime limitations before guest side effects.
-Guest-visible buffers, detached-directory metadata and DIR lifecycle integration remain open.
+Guest-visible buffers and DIR lifecycle were pending at that checkpoint;
+detached-directory metadata remains incomplete.
 
 Verification: 572 library tests, three integration tests and strict all-target
 Clippy pass (25001 exit0; `work/directory-enumeration-{tests,clippy}.log`). New
@@ -61,9 +87,9 @@ this avoids silently reinterpreting an index in a changed sorted listing.
 The pinned SDK exposes DIR as opaque in its
 [public directory API](https://raw.githubusercontent.com/ps5-payload-dev/sdk/10b539de8f2b6773a9a78caa7576a97dbd99b29a/include/freebsd/dirent.h).
 FreeBSD's [readdir implementation](https://raw.githubusercontent.com/freebsd/freebsd-src/releng/11.4/lib/libc/gen/readdir.c)
-returns a pointer within a retained batch and refills it as needed. Connecting
-the internal read plans to that guest-visible lifecycle remains necessary;
-an internal descriptor batch alone is not a working readdir service.
+returns a pointer within a retained batch and refills it as needed. The stream
+layer now connects these batches to guest-visible pointers; an internal batch
+alone was not a working readdir service.
 
 Read plans are capped at 1 MiB and never split a record. A too-small buffer for
 the next record gives an explicit runtime diagnostic. Copy validates plan and

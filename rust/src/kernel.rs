@@ -4,6 +4,7 @@ use crate::{Result, descriptors::Descriptors, guest_memory::Memory};
 #[path = "guest_files.rs"]
 mod guest_files;
 pub(crate) use guest_files::{FileBacking, Quota};
+pub(crate) use guest_files::read_path;
 pub use guest_files::{DirectoryEntry, DirectoryRevision, DirectoryToken};
 pub use guest_files::{Files, MkdirPlan, RenamePlan, NamespaceProfile, STAT_SIZE, StatRequest, StatTrace};
 
