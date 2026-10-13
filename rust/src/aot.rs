@@ -2479,9 +2479,11 @@ impl Emitter {
                 };
                 self.emit(format!("ldr x9, [x19, #{low}]\nldr x10, [x19, #{high}]\nstr x9, [x19, #{}]\nstr x10, [x19, #{}]\nstr xzr, [x19, #{}]\nstr xzr, [x19, #{}]",208+dst*32,216+dst*32,224+dst*32,232+dst*32));
             }
-            M::Vmovmskps | M::Vmovmskpd => {
+            M::Vmovmskps | M::Vmovmskpd | M::Vpmovmskb => {
                 use iced_x86::Code;
                 let (lane_bytes, size) = match i.code() {
+                    Code::VEX_Vpmovmskb_r32_xmm | Code::VEX_Vpmovmskb_r64_xmm => (1, 16),
+                    Code::VEX_Vpmovmskb_r32_ymm | Code::VEX_Vpmovmskb_r64_ymm => (1, 32),
                     Code::VEX_Vmovmskps_r32_xmm | Code::VEX_Vmovmskps_r64_xmm => (4, 16),
                     Code::VEX_Vmovmskps_r32_ymm | Code::VEX_Vmovmskps_r64_ymm => (4, 32),
                     Code::VEX_Vmovmskpd_r32_xmm | Code::VEX_Vmovmskpd_r64_xmm => (8, 16),

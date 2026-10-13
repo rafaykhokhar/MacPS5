@@ -1,5 +1,13 @@
 # Rust migration
 
+VEX VPMOVMSKB now supports four XMM/YMM and r32/r64 forms through the existing
+sign-mask path. The matching build passes 678 library tests, three integration
+tests, strict Clippy, 862,784 new native checks and 86,144 register-operation
+regression checks. Discovery reaches 58,049 instructions with 139 unsupported
+sites. Startup remains at missing `fscanf`, before game main. See
+[CPU evidence](../docs/status/CPU.md). Production readiness and retail gameplay
+remain unverified.
+
 VEX VTESTPS/PD now support four XMM/YMM sign-bit flag tests while preserving
 the separate full-bit VPTEST behavior. The matching build passes 678 library
 tests, three integration tests, strict Clippy, 527,556 new native checks and

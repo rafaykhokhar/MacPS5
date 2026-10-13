@@ -1,5 +1,36 @@
 # CPU completion criteria
 
+## Byte sign-mask extraction
+
+VEX VPMOVMSKB now supports four XMM/YMM and r32/r64 decoded forms through
+the existing register sign-mask path. Each byte's bit7 becomes one GPR mask
+bit, including bit31 for a YMM source. Bits above the 16/32-bit mask clear,
+and every source vector bit, guest flag and FP-state field remains unchanged.
+Only register forms are accepted; reserved vvvv, legacy/EVEX and memory forms
+remain rejected.
+
+Reference: AMD APM Volume 4 rev.3.24 pp.392–393
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)).
+
+The matching build passes 678 library tests, three integration tests, strict
+Clippy and release compilation (`work/byte-mask-native/{tests,clippy,release}.log`,
+process 59834 exit 0). The [native verifier](../../rust/verification/byte_mask_native.rs)
+passes 862,784 checks across 64 decoded fixtures: every XMM mask, all low16
+patterns with varied upper16 YMM patterns, full/alternating/walking/random
+masks, bit31, nonsign poison, all GPR destinations/vector registers, complete
+zero extension and flags/FP/fuel/prior faults. This is not exhaustive over all
+2^32 YMM masks. The existing vector-register verifier passes 86,144 regression
+checks (`work/byte-mask-native/{native,regression}.log`, process 10356 exit 0).
+
+Discovery reaches 58,049 instructions and 13,152 blocks with 139 unsupported
+sites: one former stop removed and no new stops. These counts do not establish
+CPU completion. The entry runner compiles with warnings denied; startup-only
+verification passes at missing `fscanf`, with ten accepted dependencies,
+20,288 owned dependency bytes and pending cleanup. Game main has not executed
+(`work/byte-mask-native/entry.log`, process 9438 exit 0). No full GPU suite was
+run for this CPU change. Production readiness and retail gameplay remain
+unverified.
+
 ## Vector sign-bit tests
 
 VEX VTESTPS/PD now support four XMM/YMM forms. ZF tests whether any matching
