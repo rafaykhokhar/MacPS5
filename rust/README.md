@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct translation now handles guarded memory MOV32/MOV64, including indexed
+and RIP-relative addresses. 10260 native cases and an actual executor image
+read pass. Faulting loads preserve destination registers; failed stores preserve
+memory. See [direct memory MOV evidence](../docs/status/TRANSLATOR_READINESS.md#direct-memory-mov-lowering).
+
 Selected x86 register/immediate MOV, NOP and RET blocks now translate directly
 to ARM64 and run through NativeExecutor with pinned JIT ownership, fuel and
 fault checks. The real executor returns 42 from `MOV EAX,42; RET` without a

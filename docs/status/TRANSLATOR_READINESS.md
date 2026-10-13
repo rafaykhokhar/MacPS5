@@ -390,3 +390,30 @@ the existing backend. This does not demonstrate retail game compatibility.
 Final native verifier and integrated startup-only regression pass (process
 11361 exit 0, `native-final.log` and `entry.log`). Existing startup still stops
 at missing `fscanf`, after accepting ten dependencies and before game main.
+
+## Direct memory MOV lowering
+
+The direct translator now lowers MOV32/MOV64 between general registers and
+memory through the existing Rust guarded load/store helpers. Effective-address
+generation handles 64-bit base/index/scale/displacement and RIP-relative image
+bias; arithmetic wraps at 64 bits. FS/GS and 32-bit addressing remain explicit
+errors. Loads commit their destination only after a successful guard check;
+stores stop on faults before subsequent guest instructions execute. Existing
+fuel and PC behavior is preserved at the faulting instruction.
+
+`direct_mov_memory_native.rs` passes 10260 native cases: all data/base register
+aliases, both widths/directions, signed negative displacement, unaligned spans,
+read-only/unmapped/overflow addresses, RIP-relative, absolute and every index
+scale with and without a base. Expected register and memory bytes are calculated
+from the fixture, independently of the guard helper. An integrated Image and
+NativeExecutor block loads an immediate guest pointer, reads 42 from the image,
+and returns 42 using direct translated execution without clang/dlopen.
+
+687 library tests, three integration tests, strict Clippy and release build pass
+(process 54819 exit 0). Native addressing cases and the previous 4128 direct
+state/fuel/fault plus 512 invalid-PC regressions pass (process 4604 exit 0).
+The final verifier including the executor memory read passes (process 74013
+exit 0). Evidence is in `work/direct-mov-memory/`. Compile/run this standalone
+verifier with the preceding release rlib/dependency flags; no arguments required.
+Byte/word MOV, memory-immediate MOV and other instruction families remain outside
+this direct path. The backend remains opt-in and incomplete.

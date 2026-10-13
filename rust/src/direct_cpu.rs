@@ -4,7 +4,37 @@ use crate::{
     arm64_code::{Arm64Code, Branch},
     decode,
 };
-use iced_x86::{Code, OpKind, Register};
+use iced_x86::{Code, Instruction, OpKind, Register};
+fn memory_address(c: &mut Arm64Code, i: &Instruction) -> Result<()> {
+    if matches!(i.memory_segment(), Register::FS | Register::GS) {
+        return Err("Direct FS/GS addressing unsupported".into());
+    }
+    if i.is_ip_rel_memory_operand() {
+        if i.memory_base() != Register::RIP {
+            return Err("Direct 32-bit addressing unsupported".into());
+        }
+        c.context_access(1, 19, 144, true, false)?;
+        c.load_u64(9, i.ip_rel_memory_address())?;
+        return c.emit(0x8b090021); // add x1,x1,x9
+    }
+    if i.memory_base() == Register::None {
+        if i.memory_index() == Register::None && i.memory_displ_size() != 8 {
+            return Err("Direct absolute 32-bit addressing unsupported".into());
+        }
+        c.load_u64(1, 0)?;
+    } else {
+        c.context_access(1, 19, register(i.memory_base(), true)? * 8, true, false)?;
+    }
+    if i.memory_index() != Register::None {
+        c.context_access(9, 19, register(i.memory_index(), true)? * 8, true, false)?;
+        c.emit(0x8b090021 | (i.memory_index_scale().trailing_zeros() << 10))?;
+    }
+    if i.memory_displacement64() != 0 {
+        c.load_u64(9, i.memory_displacement64())?;
+        c.emit(0x8b090021)?;
+    }
+    Ok(())
+}
 fn register(register: Register, wide: bool) -> Result<usize> {
     let first = if wide { Register::RAX } else { Register::EAX } as u32;
     let value = register as u32;
@@ -28,8 +58,7 @@ pub fn translate(bytes: &[u8], address: u64, instruction_limit: usize) -> Result
         match i.code() {
             Code::Nopd | Code::Nopq | Code::Retnq => {}
             Code::Mov_r32_imm32 | Code::Mov_r64_imm64 => {}
-            Code::Mov_r32_rm32 | Code::Mov_rm32_r32 | Code::Mov_r64_rm64 | Code::Mov_rm64_r64
-                if i.op0_kind() == OpKind::Register && i.op1_kind() == OpKind::Register => {}
+            Code::Mov_r32_rm32 | Code::Mov_rm32_r32 | Code::Mov_r64_rm64 | Code::Mov_rm64_r64 => {}
             _ => return Err(format!("Direct lowering unsupported: {:?}", i.code())),
         }
         offset += i.len();
@@ -97,6 +126,44 @@ pub fn translate(bytes: &[u8], address: u64, instruction_limit: usize) -> Result
                 c.branch(EXIT, Branch::Jump)?;
             }
             _ => {
+                if i.op0_kind() == OpKind::Memory || i.op1_kind() == OpKind::Memory {
+                    let store = i.op0_kind() == OpKind::Memory;
+                    let operand = if store {
+                        i.op1_register()
+                    } else {
+                        i.op0_register()
+                    };
+                    let wide = operand.size() == 8;
+                    let reg = register(operand, wide)?;
+                    memory_address(&mut c, i)?;
+                    c.emit(0xaa1303e0)?; // mov x0,x19
+                    if store {
+                        c.context_access(2, 19, reg * 8, wide, false)?;
+                        c.load_u64(3, if wide { 8 } else { 4 })?;
+                        c.call_absolute(
+                            crate::guest_memory::ffi::native_ps5_module_store_v1 as *const ()
+                                as u64,
+                        )?;
+                    } else {
+                        c.load_u64(2, if wide { 8 } else { 4 })?;
+                        c.call_absolute(
+                            crate::guest_memory::ffi::native_ps5_module_load_v1 as *const () as u64,
+                        )?;
+                    }
+                    c.context_access(9, 19, 152, true, false)?;
+                    c.branch(
+                        EXIT,
+                        Branch::CompareZero {
+                            register: 9,
+                            wide: true,
+                            nonzero: true,
+                        },
+                    )?;
+                    if !store {
+                        c.context_access(0, 19, reg * 8, true, true)?;
+                    }
+                    continue;
+                }
                 let wide = i.op0_register().size() == 8;
                 let destination = register(i.op0_register(), wide)?;
                 if i.op1_kind() == OpKind::Register {
