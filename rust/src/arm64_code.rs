@@ -98,6 +98,48 @@ impl Arm64Code {
         self.labels.insert(label, self.words.len());
         Ok(())
     }
+    /// Materialize all 64 bits with MOVZ/MOVK, without changing flags.
+    /// X31 is excluded because this API promises a stored register value.
+    pub fn load_u64(&mut self, register: u8, value: u64) -> Result<()> {
+        if register >= 31 {
+            return Err("ARM64 constant destination must be X0..X30".into());
+        }
+        self.reserve_words(4)?;
+        for half in 0..4 {
+            let opcode = if half == 0 { 0xd2800000 } else { 0xf2800000 };
+            self.words.push(
+                opcode
+                    | (half << 21)
+                    | (((value >> (half * 16)) as u32 & 0xffff) << 5)
+                    | u32::from(register),
+            );
+        }
+        Ok(())
+    }
+    /// Call a trusted absolute host target using ABI scratch register X16.
+    /// The caller must save LR, align SP and marshal arguments before this
+    /// sequence, and preserve any caller-saved state needed after it.
+    /// Target lifetime/ABI validity are checked by the publisher, not here.
+    pub fn call_absolute(&mut self, address: u64) -> Result<()> {
+        if address == 0 || address % 4 != 0 {
+            return Err("ARM64 call target must be nonzero and aligned".into());
+        }
+        self.reserve_words(5)?;
+        self.load_u64(16, address)?;
+        self.words.push(0xd63f0200); // BLR X16
+        Ok(())
+    }
+    fn reserve_words(&self, count: usize) -> Result<()> {
+        if self
+            .words
+            .len()
+            .checked_add(count)
+            .is_none_or(|end| end > self.limit)
+        {
+            return Err("ARM64 emission budget exceeded".into());
+        }
+        Ok(())
+    }
     pub fn branch(&mut self, target: u32, kind: Branch) -> Result<()> {
         kind.encoding()?;
         let at = self.words.len();
@@ -123,6 +165,20 @@ impl Arm64Code {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn multiword_emission_is_atomic_on_rejection() {
+        let mut code = Arm64Code::new(5);
+        code.emit(0xd503201f).unwrap();
+        assert!(code.call_absolute(4).is_err());
+        assert!(code.load_u64(31, 0).is_err());
+        assert!(code.call_absolute(0).is_err());
+        assert!(code.call_absolute(3).is_err());
+        code.load_u64(0, 0).unwrap();
+        assert_eq!(
+            code.finish().unwrap(),
+            [0xd503201f, 0xd2800000, 0xf2a00000, 0xf2c00000, 0xf2e00000]
+        );
+    }
     #[test]
     fn signed_branch_limits_and_operand_validation() {
         for (kind, bits) in [

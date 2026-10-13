@@ -300,3 +300,29 @@ rustc --edition=2024 -O -Dwarnings rust/verification/arm64_code_native.rs \
 The oracle output directory must not exist. Clang is used only as the encoding
 oracle here; the tested buffer construction and native loop publication use
 Rust and MAP_JIT directly.
+
+## Direct helper calls
+
+The ARM64 buffer now emits full-width constants into X0–X30 with four MOVZ/MOVK
+instructions, plus absolute calls through ABI scratch register X16 and BLR.
+Constant materialization preserves condition flags. Multiword emission checks
+the complete instruction budget before modifying the buffer; rejected targets,
+registers or insufficient capacity leave previous emission intact. Null and
+unaligned call addresses are rejected. The caller still owns stack alignment,
+LR/caller-saved preservation, target lifetime and function-ABI validity.
+
+The extended `arm64_code_native.rs` matches 155 constant sequences and an
+absolute-call sequence to clang bytes, in addition to all 8480 branch cases.
+A generated stack-preserving call stub invokes the actual Rust
+`native_ps5_arithmetic_flags_v1` helper for 1440 argument combinations, checking
+six integer arguments and its two-register result against direct invocation.
+Invalid operation/width cases verify fault results too. This is an ABI test;
+independent arithmetic semantics remain covered by the helper's existing tests.
+The 100 direct loop runs also pass. Matching release build, strict Clippy,
+686 library tests and three integration tests pass (process 73719 exit 0,
+`work/arm64-helper-call/`). Use the preceding verifier command to reproduce.
+
+This removes the need for linker-resolved calls in this direct emission path.
+It does not yet connect guest instruction translation, guarded-memory calls,
+CPU context handling or executor publication to the new backend. The normal
+guest execution path still uses dylibs.

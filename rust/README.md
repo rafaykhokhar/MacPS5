@@ -1,5 +1,11 @@
 # Rust migration
 
+The direct emitter now materializes 64-bit constants and calls runtime helpers
+through X16/BLR. A generated stub passes 1440 ABI checks against the existing
+Rust arithmetic helper; encoding and native-loop regressions also pass.
+Guest translator integration remains unfinished. See
+[helper-call evidence](../docs/status/TRANSLATOR_READINESS.md#direct-helper-calls).
+
 Direct ARM64 emission now supports bounded local branch/call fixups. Verification
 matches 8480 encodings against clang and executes a generated loop correctly in
 100 native runs. Guest x86 translation is not connected to this emitter yet.
