@@ -763,3 +763,31 @@ operand form. The entry span still publishes zero JIT bytes and never executes;
 accepting preceding instructions during translation is not homebrew startup.
 Reproduce the LEA verifier with the release rlib/dependency flags above and no
 arguments; use the preceding ELF probe instructions for the real-file boundary.
+
+## Direct arithmetic with memory sources
+
+Direct ADD/SUB/CMP/AND/OR/XOR now accept 32/64-bit register destinations with
+memory source operands. Address calculation and a guarded load precede any
+destination or flag commit. The register operand is reloaded after the helper
+call, preserving base/destination alias behavior and avoiding caller-saved host
+register assumptions. Faults preserve all guest registers and flags. The checked
+emission allowance grows to 96 words per instruction to accommodate both memory
+and flag helper sequences; arena capacity still bounds actual publication.
+Memory destinations and byte/word arithmetic remain unsupported here.
+
+`direct_arithmetic_memory_native.rs` passes 196608 native cases with an independent
+widened arithmetic/flag oracle: six operations, 32/64-bit widths, all destination
+and base registers, selected overflow/carry values, aligned/unaligned pointers
+and guarded failures. Read-only source memory is unchanged. The first verifier
+format attempt required a space between `<` and unary `-`; after that correction,
+687 library tests, three integration tests, strict Clippy, release build and the
+strict-warning native verifier pass (process 74100, exit 0). Register arithmetic,
+immediate arithmetic and automatic translation regressions pass (53077, exit 0).
+
+The same raw crispy-doom ELF probe now passes initial entry translation and
+execution, reaching a miss at image-relative 0x3a0 on `Mov_rm64_imm32`.
+It reports 2040 published JIT bytes and zero dylibs. This probe provides no
+imports, dependencies or process setup; the result proves bounded direct entry
+progress only, not initialized homebrew or gameplay. Reproduce the new verifier
+with the release rlib/dependency flags above and no arguments; the existing
+ELF probe reproduces the real-file boundary.

@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct ADD/SUB/CMP/AND/OR/XOR32/64 now accept guarded memory source operands.
+196608 native cases pass. The raw homebrew probe executes its initial entry
+block and reaches an immediate-to-memory MOV translation blocker at 0x3a0,
+with 2040 JIT bytes and no dylibs. This is not a game launch; see
+[memory arithmetic and probe evidence](../docs/status/TRANSLATOR_READINESS.md#direct-arithmetic-with-memory-sources).
+
 Direct LEA32/64 with 64-bit addressing now computes addresses without accessing
 memory. 92268 native cases pass. The raw homebrew entry probe now stops on a
 memory-operand CMP, after accepting PUSH and LEA during translation; the entry
