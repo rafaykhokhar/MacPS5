@@ -1391,8 +1391,50 @@ pub fn vector_xor(
 pub mod ffi {
     use super::*;
     use crate::legacy_cpu::Cpu;
+    /// Register RCL/RCR with a byte offset into the GPR bank.
+    /// # Safety
+    /// CPU must be live and exclusively owned for the call.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn native_ps5_module_register_rotate_carry_v1(
+        cpu: *mut Cpu,
+        offset: u64,
+        size: u64,
+        count: u64,
+        right: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if ![1, 2, 4, 8].contains(&size) || offset >= 128 || offset % 8 + size > 8 || right > 1 {
+            cpu.fault = 3;
+            return;
+        }
+        let slot = (offset / 8) as usize;
+        let shift = (offset % 8 * 8) as u32;
+        let bits = (size * 8) as u32;
+        let Some((value, flags)) = crate::shift_flags::rotate_carry(
+            cpu.flags,
+            cpu.registers[slot] >> shift,
+            count,
+            bits,
+            right != 0,
+        ) else {
+            cpu.fault = 3;
+            return;
+        };
+        let mask = u64::MAX >> (64 - bits);
+        cpu.registers[slot] = if size == 4 {
+            value
+        } else {
+            (cpu.registers[slot] & !(mask << shift)) | (value << shift)
+        };
+        cpu.flags = flags;
+    }
     /// Unlocked integer memory arithmetic: 0=ADD, 1=SUB, 2=AND, 3=OR, 4=XOR, 5=NOT, 6=NEG, 7=ADC, 8=SBB.
-    /// Shift/rotate operations: 9=SHL, 10=SHR, 11=SAR, 12=ROL, 13=ROR; rhs is the unmasked count.
+    /// Shift/rotate operations: 9=SHL, 10=SHR, 11=SAR, 12=ROL, 13=ROR, 14=RCL, 15=RCR; rhs is the unmasked count.
     /// Flags commit only after the guarded store succeeds. This is not a host atomic operation.
     /// # Safety
     /// Same exclusive, disjoint CPU/Memory ownership contract as native_ps5_module_load_v1.
@@ -1410,7 +1452,7 @@ pub mod ffi {
         if cpu.fault != 0 {
             return;
         }
-        if ![1, 2, 4, 8].contains(&size) || operation > 13 {
+        if ![1, 2, 4, 8].contains(&size) || operation > 15 {
             cpu.fault = 3;
             return;
         }
@@ -1424,6 +1466,24 @@ pub mod ffi {
             return;
         };
         let count = (rhs & if size == 8 { 63 } else { 31 }) as u32;
+        if operation >= 14 {
+            let Some((value, flags)) = crate::shift_flags::rotate_carry(
+                cpu.flags,
+                lhs,
+                rhs,
+                (size * 8) as u32,
+                operation == 15,
+            ) else {
+                cpu.fault = 3;
+                return;
+            };
+            if memory.store(address, value, size).is_err() {
+                cpu.fault = 2;
+                return;
+            }
+            cpu.flags = flags;
+            return;
+        }
         let result = match operation {
             0 => lhs.wrapping_add(rhs),
             1 => lhs.wrapping_sub(rhs),

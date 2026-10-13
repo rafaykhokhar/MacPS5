@@ -217,7 +217,13 @@ fn setcc(i: &Instruction) -> bool {
 fn register_shift(i: &Instruction) -> bool {
     matches!(
         i.mnemonic(),
-        Mnemonic::Shl | Mnemonic::Shr | Mnemonic::Sar | Mnemonic::Rol | Mnemonic::Ror
+        Mnemonic::Shl
+            | Mnemonic::Shr
+            | Mnemonic::Sar
+            | Mnemonic::Rol
+            | Mnemonic::Ror
+            | Mnemonic::Rcl
+            | Mnemonic::Rcr
     ) && i.op0_kind() == OpKind::Register
         && matches!(i.op0_register().size(), 1 | 2 | 4 | 8)
         && (i.op1_kind() == OpKind::Immediate8
@@ -226,7 +232,13 @@ fn register_shift(i: &Instruction) -> bool {
 fn memory_shift(i: &Instruction) -> bool {
     matches!(
         i.mnemonic(),
-        Mnemonic::Shl | Mnemonic::Shr | Mnemonic::Sar | Mnemonic::Rol | Mnemonic::Ror
+        Mnemonic::Shl
+            | Mnemonic::Shr
+            | Mnemonic::Sar
+            | Mnemonic::Rol
+            | Mnemonic::Ror
+            | Mnemonic::Rcl
+            | Mnemonic::Rcr
     ) && i.encoding() == iced_x86::EncodingKind::Legacy
         && !i.has_lock_prefix()
         && i.op0_kind() == OpKind::Memory
@@ -972,6 +984,8 @@ pub(crate) fn translate_span(
                     Mnemonic::Sar => 11,
                     Mnemonic::Rol => 12,
                     Mnemonic::Ror => 13,
+                    Mnemonic::Rcl => 14,
+                    Mnemonic::Rcr => 15,
                     _ => unreachable!(),
                 },
             )?;
@@ -1129,6 +1143,38 @@ pub(crate) fn translate_span(
             let size = i.op0_register().size();
             let wide = size == 8;
             let destination = register(i.op0_register().full_register(), true)?;
+            if matches!(i.mnemonic(), Mnemonic::Rcl | Mnemonic::Rcr) {
+                if i.op1_kind() == OpKind::Register {
+                    c.context_access(3, 19, 8, false, false)?;
+                } else {
+                    c.load_u64(3, i.immediate(1))?;
+                }
+                c.emit(0xaa1303e0)?;
+                c.load_u64(
+                    1,
+                    if size == 1 {
+                        u64::from(byte_offset(i.op0_register())?)
+                    } else {
+                        destination as u64 * 8
+                    },
+                )?;
+                c.load_u64(2, size as u64)?;
+                c.load_u64(4, u64::from(i.mnemonic() == Mnemonic::Rcr))?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_register_rotate_carry_v1
+                        as *const () as u64,
+                )?;
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+                continue;
+            }
             if size == 1 {
                 c.emit(0x39400261 | (byte_offset(i.op0_register())? << 10))?;
             } else if size == 2 {

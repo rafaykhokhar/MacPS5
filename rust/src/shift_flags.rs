@@ -3,6 +3,39 @@
 //! Rev.3.31 pp.315/318/334 specifies CF as the last shifted-out bit, including
 //! narrow counts at/beyond width. Rotate counts are masked before width reduction.
 use crate::arithmetic::FlagsResult;
+/// Rotate a width+carry ring. Undefined multi-bit OF retains its old value.
+pub fn rotate_carry(old: u64, value: u64, raw: u64, bits: u32, right: bool) -> Option<(u64, u64)> {
+    if ![8, 16, 32, 64].contains(&bits) {
+        return None;
+    }
+    let masked = raw & if bits == 64 { 63 } else { 31 };
+    let count = masked as u32 % (bits + 1);
+    let mask = (1u128 << bits) - 1;
+    let value = u128::from(value) & mask;
+    if count == 0 {
+        return Some((value as u64, old));
+    }
+    let width = bits + 1;
+    let ring_mask = (1u128 << width) - 1;
+    let ring = value | (u128::from(old & 1) << bits);
+    let rotated = (if right {
+        (ring >> count) | (ring << (width - count))
+    } else {
+        (ring << count) | (ring >> (width - count))
+    }) & ring_mask;
+    let result = (rotated & mask) as u64;
+    let carry = (rotated >> bits) as u64;
+    let mut flags = (old & !1) | carry;
+    if masked == 1 {
+        let overflow = if right {
+            ((value as u64 >> (bits - 1)) ^ old) & 1
+        } else {
+            (result >> (bits - 1)) ^ carry
+        };
+        flags = (flags & !0x800) | (overflow << 11);
+    }
+    Some((result, flags))
+}
 pub fn flags(
     old: u64,
     original: u64,

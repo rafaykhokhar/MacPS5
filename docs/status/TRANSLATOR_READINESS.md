@@ -1742,3 +1742,37 @@ build pass; all four standalone verifiers compile with warnings denied. Logs
 are `/tmp/macps5-rotate-{tests,clippy,build}.log`. These combined counts include
 existing shifts, not just newly added rotations. Gameplay and full CPU
 translation remain incomplete.
+
+## Direct RCL and RCR
+
+Direct RCL/RCR supports 8/16/32/64-bit registers and guarded memory with
+immediate, implicit-one and CL counts. A Rust helper represents the operand
+and incoming carry as a 9/17/33/65-bit ring in u128. The masked count is reduced
+by the ring width for narrow operands; zero effective counts preserve flags.
+One-bit masked counts set OF from the appropriate sign/carry relation, while
+undefined multi-bit OF retains its prior value. SF/ZF/AF/PF remain unchanged.
+These count and flag rules follow the
+[Intel RCL/RCR reference, volume 2B](https://cdrdv2-public.intel.com/868141/253667-089-sdm-vol-2b.pdf).
+
+Register lowering captures CL before the helper can change ECX/RCX. The helper
+preserves partial byte/word destinations and zero-extends dword results.
+Memory operations 14/15 of the shared RMW helper commit flags only after a
+successful store. The invalid-operation regression is now 16. The helper is
+compiled to native ARM64 with the Rust runtime; this path does not emit the
+entire carry rotation inline in the JIT block.
+
+`rust/verification/direct_rotate_carry_native.rs` passes 6894720 native cases
+and 262144 pure byte reference cases (7156864 combined). The independent oracle
+rotates one bit at a time. Native cases cover all four widths, every count,
+both incoming carry states, implicit-one encodings, legacy high bytes, REX
+registers, CL destination/base aliases, sign boundaries, read-only and invalid
+memory operands, and complete GPR/flags/memory/fault/fuel/stop/RIP state.
+The pure sweep exhausts all byte values, counts and carry inputs in both
+directions. The shared memory-arithmetic verifier passes 407205 cases.
+
+The 687 library tests, three integration tests, strict Clippy and release build
+pass; standalone verifiers compile with warnings denied. Reproduce with the
+release rlib/dependency flags above using `direct_rotate_carry_native.rs` and
+`direct_memory_arithmetic_native.rs`. Logs are
+`/tmp/macps5-rotatecarry-{tests,clippy,build}.log`. This adds instruction coverage;
+it does not establish complete CPU translation or PS5 gameplay.

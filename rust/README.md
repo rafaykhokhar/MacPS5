@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct RCL/RCR now supports registers and guarded memory at all four widths,
+with immediate, implicit-one and CL counts. 6894720 native cases and 262144
+exhaustive byte-model checks pass, plus shared memory-arithmetic regressions.
+See [carry rotation evidence](../docs/status/TRANSLATOR_READINESS.md#direct-rcl-and-rcr).
+
 Direct ROL/ROR now supports registers and guarded memory at all four widths,
 including immediate and CL counts. Expanded shift/rotate checks pass: 983046
 wider-register, 16190280 narrow-register, 8208000 memory and 407205 shared RMW
