@@ -1,5 +1,41 @@
 # CPU completion criteria
 
+## Packed integer broadcasts
+
+VEX VPBROADCASTB/W/D/Q now support both XMM and YMM destinations. Register
+sources use only the low scalar bits; memory sources read exactly 1/2/4/8
+bytes. Input is captured before aliasing writes. XMM destinations clear the
+upper YMM half, and integer copies leave flags and floating-point controls
+unchanged. The decoder rejects reserved W=1 and vvvv fields. EVEX and
+FS/GS/address32 remain unsupported; this change also closes the former D
+branch's missing address32-absolute rejection.
+
+Reference: AMD APM Volume 4 rev.3.24, pp.700–707
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)).
+The matching build passes 607 library tests, three integration tests, strict
+Clippy and release compilation (`work/packed-broadcast-native/{tests,clippy,release}.log`,
+process 78108 exit 0). An earlier run failed an obsolete test that expected
+B/W/Q rejection; these now have positive acceptance tests, while EVEX and
+unsupported-addressing rejection tests remain.
+
+[Independent native verification](../../rust/verification/packed_broadcast_native.rs)
+passes 25,074 checks over 72 decoded forms. It covers repeated/distinct byte
+patterns, narrow source masking, aliases/high registers, both destination
+sizes, exact-end readonly scalar loads, high/unaligned/RIP-relative memory,
+every insufficient span, fault atomicity, FP/flags and execution guards.
+The existing VPBROADCASTD verifier also passes 65,579 checks over every XMM
+source/destination pairing (`work/packed-broadcast-native/native.log`, process
+79699 exit 0). These comparisons use independent Rust byte-array references,
+not x86 hardware differential measurements.
+
+Pinned homebrew discovery reaches 55,128 instructions and 12,619 blocks, up
+862 instructions from the prior checkpoint. Eight former boundaries disappear;
+seven newly reachable ones appear, giving 207 unsupported boundaries. The
+combined entry verifier compiles, and its startup-only run retains the expected
+missing `fscanf` exit boundary: ten named dependencies accepted, 20,288 owned
+dependency bytes, cleanup pending and game main not executed
+(`work/packed-broadcast-native/entry.log`, process 79699 exit 0).
+
 ## VEX scalar vector moves
 
 All four VEX VMOVQ encoding families now lower: GPR/m64 to XMM, XMM to

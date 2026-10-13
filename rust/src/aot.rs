@@ -37,6 +37,41 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn packed_integer_broadcast_forms_and_guards() {
+        for opcode in [0x78, 0x79, 0x58, 0x59] {
+            for length in [0, 4] {
+                for operand in [0xc1, 0xc0, 0x07] {
+                    let bytes = [0xc4, 0xe2, 0x79 | length, opcode, operand];
+                    assert!(super::translate_rust_memory_region(&bytes, 0, "broadcast").is_ok());
+                    for invalid_prefix in [0xf9 | length, 0x71 | length] {
+                        let invalid = [0xc4, 0xe2, invalid_prefix, opcode, operand];
+                        assert!(
+                            super::translate_rust_memory_region(&invalid, 0, "invalid").is_err()
+                        );
+                    }
+                }
+                for prefix in [0x64, 0x65, 0x67] {
+                    let bytes = [prefix, 0xc4, 0xe2, 0x79 | length, opcode, 0x07];
+                    assert!(super::translate_rust_memory_region(&bytes, 0, "address").is_err());
+                }
+                let absolute32 = [
+                    0x67,
+                    0xc4,
+                    0xe2,
+                    0x79 | length,
+                    opcode,
+                    0x04,
+                    0x25,
+                    0,
+                    0,
+                    0,
+                    0,
+                ];
+                assert!(super::translate_rust_memory_region(&absolute32, 0, "address").is_err());
+            }
+        }
+    }
+    #[test]
     fn scalar_vector_moves_accept_exact_vex_forms() {
         for bytes in [
             &[0xc5, 0xf9, 0x6e, 0xc1][..],   // VMOVD xmm0,ecx
@@ -210,10 +245,7 @@ mod rust_memory_tests {
             assert!(super::translate_rust_memory_region(bytes, 0, "broadcast").is_ok());
         }
         for bytes in [
-            &[0xc4, 0xe2, 0x79, 0x59, 0xc0][..],
-            &[0xc4, 0xe2, 0x79, 0x78, 0xc0],
-            &[0xc4, 0xe2, 0x79, 0x79, 0xc0],
-            &[0x62, 0xf2, 0x7d, 0x08, 0x58, 0xc0],
+            &[0x62, 0xf2, 0x7d, 0x08, 0x58, 0xc0][..],
             &[0x67, 0xc4, 0xe2, 0x79, 0x58, 0x00],
             &[0x64, 0xc4, 0xe2, 0x79, 0x58, 0x00],
         ] {
@@ -812,26 +844,50 @@ impl Emitter {
                     224 + dst * 32
                 ));
             }
-            M::Vpbroadcastd => {
-                let wide = match i.code() {
-                    iced_x86::Code::VEX_Vpbroadcastd_xmm_xmmm32 => false,
-                    iced_x86::Code::VEX_Vpbroadcastd_ymm_xmmm32 => true,
-                    _ => {
-                        return Err(
-                            "Only VEX VPBROADCASTD XMM/YMM from XMM/m32 is implemented".into()
-                        );
-                    }
+            M::Vpbroadcastb | M::Vpbroadcastw | M::Vpbroadcastd | M::Vpbroadcastq => {
+                use iced_x86::Code;
+                let (scalar_width, wide) = match i.code() {
+                    Code::VEX_Vpbroadcastb_xmm_xmmm8 => (8, false),
+                    Code::VEX_Vpbroadcastb_ymm_xmmm8 => (8, true),
+                    Code::VEX_Vpbroadcastw_xmm_xmmm16 => (16, false),
+                    Code::VEX_Vpbroadcastw_ymm_xmmm16 => (16, true),
+                    Code::VEX_Vpbroadcastd_xmm_xmmm32 => (32, false),
+                    Code::VEX_Vpbroadcastd_ymm_xmmm32 => (32, true),
+                    Code::VEX_Vpbroadcastq_xmm_xmmm64 => (64, false),
+                    Code::VEX_Vpbroadcastq_ymm_xmmm64 => (64, true),
+                    _ => return Err("Only VEX packed integer broadcasts are implemented".into()),
                 };
+                if i.op1_kind() == OpKind::Memory
+                    && i.memory_base() == R::None
+                    && i.memory_index() == R::None
+                    && i.memory_displ_size() != 8
+                {
+                    return Err("32-bit absolute addressing is not implemented".into());
+                }
                 let dst = 208 + vector(i.op_register(0))? * 32;
                 if i.op_kind(1) == OpKind::Register {
                     let src = 208 + vector(i.op_register(1))? * 32;
-                    self.emit(format!("ldr w20, [x19, #{src}]"));
+                    let (op, register) = match scalar_width {
+                        8 => ("ldrb", "w20"),
+                        16 => ("ldrh", "w20"),
+                        32 => ("ldr", "w20"),
+                        _ => ("ldr", "x20"),
+                    };
+                    self.emit(format!("{op} {register}, [x19, #{src}]"));
                 } else {
-                    self.read(i, 1, 32, 20)?;
+                    self.read(i, 1, scalar_width, 20)?;
                 }
-                // AMD APM Vol4 VPBROADCASTD: snapshot low32 before aliases,
-                // replicate integer bits without FP effects; read/fault before commit.
-                self.emit(format!("mov w20, w20\norr x20, x20, x20, lsl #32\nstr x20, [x19, #{dst}]\nstr x20, [x19, #{}]", dst + 8));
+                // Build one repeated 64-bit lane from the guarded scalar input,
+                // before any destination writes. These are integer bit copies.
+                let mut shift = scalar_width;
+                while shift < 64 {
+                    self.emit(format!("orr x20, x20, x20, lsl #{shift}"));
+                    shift *= 2;
+                }
+                self.emit(format!(
+                    "str x20, [x19, #{dst}]\nstr x20, [x19, #{}]",
+                    dst + 8
+                ));
                 let upper = if wide { "x20" } else { "xzr" };
                 self.emit(format!(
                     "str {upper}, [x19, #{}]\nstr {upper}, [x19, #{}]",

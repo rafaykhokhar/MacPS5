@@ -1,5 +1,11 @@
 # Rust migration
 
+VEX packed integer broadcasts now cover byte, word, dword and quadword inputs
+with XMM/YMM destinations. The build passes 607 library tests, three integration
+tests, strict Clippy, 25,074 new native checks and 65,579 dword regressions.
+Discovery reaches 55,128 instructions; startup still stops before game main at
+missing `fscanf`. [CPU evidence](../docs/status/CPU.md) records the exact scope.
+
 VEX VMOVQ now supports all four encoding families; reverse VMOVD is supported
 too. The matching build passes 606 library tests, three integration tests,
 strict Clippy and 86,352 new native checks plus the 8,219 forward-VMOVD
