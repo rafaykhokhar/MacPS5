@@ -353,3 +353,40 @@ Compile/run `rust/verification/jit_guarded_memory_native.rs` with the matching r
 rlib/dependency flags used by the preceding verifiers; it needs no arguments.
 The normal guest translator/executor still uses dylibs. Guest decoding, fuel,
 PC progression and block publication have not yet been connected to this path.
+
+## Initial direct guest translation integrated with executor
+
+`direct_cpu.rs` now decodes selected x86 register MOV32/MOV64, immediate
+MOV32/MOV64, NOP and RET64 forms and emits ARM64 words directly. Blocks must end
+in RET; unsupported instructions, memory operands, truncated bytes, trailing
+bytes after RET and guest/emission budget exhaustion return explicit errors.
+32-bit writes zero-extend the destination. The generated Cpu ABI entry preserves
+callee-saved state, honors preexisting faults, selects an instruction boundary
+from guest RIP, charges fuel per instruction, and uses the existing return/fuel
+dispatcher stop values. Invalid entry PCs fault before consuming fuel.
+
+`NativeExecutor::register_direct_in_image` validates live executable bytes and
+registration conflicts before publication, compiles and publishes to the caller's
+JitArena, and pins the code in the registered block. Removal releases that code
+ownership. Arena capacity remains an explicit separate budget from the dylib
+cache; capacity is not reclaimed per block. This opt-in registration does not
+silently fall back or replace automatic dylib compilation. It is a first
+integrated slice, not a complete backend migration.
+
+`direct_cpu_native.rs` verifies 4096 native register-move state/fuel/fault cases
+(both widths and all source/destination registers), 512 invalid-PC cases, and
+32 full-width/immediate/NOP sequences. An actual Image/NativeExecutor run of
+`MOV EAX,42; RET` returns 42 after the arena allocator is dropped, proving code
+ownership survives registration. Wrong and modified guest bytes are rejected;
+duplicate registration consumes no code space, and removing the final block
+allows a new arena. Native execution performs no clang or dlopen operation.
+
+Matching release build, strict Clippy, 687 library tests and three integration
+tests pass (process 58988 exit 0). The standalone verifier uses the same release
+rlib/dependency flags as previous native verifiers and requires no arguments.
+Logs are in `work/direct-cpu/`. Guest arithmetic, memory operands, branches,
+calls, vectors, floating point and automatic translation discovery remain on
+the existing backend. This does not demonstrate retail game compatibility.
+Final native verifier and integrated startup-only regression pass (process
+11361 exit 0, `native-final.log` and `entry.log`). Existing startup still stops
+at missing `fscanf`, after accepting ten dependencies and before game main.

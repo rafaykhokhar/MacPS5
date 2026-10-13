@@ -1,5 +1,11 @@
 # Rust migration
 
+Selected x86 register/immediate MOV, NOP and RET blocks now translate directly
+to ARM64 and run through NativeExecutor with pinned JIT ownership, fuel and
+fault checks. The real executor returns 42 from `MOV EAX,42; RET` without a
+compiler/linker subprocess. This opt-in backend is incomplete; automatic guest
+translation still uses dylibs. See [integration evidence](../docs/status/TRANSLATOR_READINESS.md#initial-direct-guest-translation-integrated-with-executor).
+
 Direct CPU-context loads/stores now match 12288 clang encodings. Generated
 runtime bridges pass 392 guarded-memory calls, including unchanged state on
 faults. Guest decoding and executor integration remain unfinished. See

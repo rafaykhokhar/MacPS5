@@ -1,4 +1,5 @@
 pub mod aot;
+pub mod direct_cpu;
 pub mod arm64_code;
 pub mod jit_memory;
 pub mod arithmetic;

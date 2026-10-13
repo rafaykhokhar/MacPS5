@@ -1025,6 +1025,7 @@ struct Block {
     bytes: Rc<[u8]>,
     function: unsafe extern "C" fn(*mut Cpu),
     _library: Option<Rc<crate::module_compiler::Library>>,
+    _jit: Option<crate::jit_memory::JitCode>,
 }
 fn validate_translation_bytes(image: &Image, start: u64, bytes: &[u8]) -> Result<()> {
     let address = image
@@ -2795,6 +2796,7 @@ impl NativeExecutor {
                     bytes: entry.bytes,
                     function: entry.function,
                     _library: Some(compiled.library.clone()),
+                    _jit: None,
                 },
             );
         }
@@ -2966,6 +2968,7 @@ impl NativeExecutor {
                     bytes: entry.bytes,
                     function: entry.function,
                     _library: Some(compiled.library.clone()),
+                    _jit: None,
                 },
             );
         }
@@ -3166,8 +3169,36 @@ impl NativeExecutor {
                 bytes: bytes.into(),
                 function,
                 _library: None,
+                _jit: None,
             },
         );
+        Ok(())
+    }
+    /// Compile an explicitly selected block using the direct ARM64 backend.
+    /// Arena capacity is independently budgeted by its owner; dylib cache
+    /// accounting does not include it. No automatic fallback is performed.
+    ///
+    /// # Safety
+    /// The executor must be quiescent and the caller must satisfy JitArena's
+    /// host-thread/signing/write-protection contract. Registered code owns a
+    /// handle that pins the mapping through execution and until removal.
+    pub unsafe fn register_direct_in_image(
+        &mut self, image: &Image, offset: u64, bytes: &[u8],
+        instruction_limit: usize, arena: &crate::jit_memory::JitArena,
+    ) -> Result<()> {
+        if self.image_blocks.contains_key(&(image.bias,offset)) || self.translation_sources.contains_key(&image.bias) {
+            return Err("Image translation already registered".into());
+        }
+        validate_translation_bytes(image,offset,bytes)?;
+        let words = crate::direct_cpu::translate(bytes,offset,instruction_limit)?;
+        // SAFETY: trusted direct lowering emits the Cpu ABI; caller provides
+        // exclusive/quiescent publication and the block pins its code below.
+        let code = unsafe { arena.publish(&words)? };
+        let pointer = code.entry(0)?;
+        let function = unsafe { std::mem::transmute::<*const std::ffi::c_void,unsafe extern "C" fn(*mut Cpu)>(pointer) };
+        self.image_blocks.insert((image.bias,offset), Block {
+            start:offset, bytes:bytes.into(), function, _library:None, _jit:Some(code),
+        });
         Ok(())
     }
     /// # Safety
@@ -3193,6 +3224,7 @@ impl NativeExecutor {
                 bytes: bytes.into(),
                 function,
                 _library: None,
+                _jit: None,
             },
         );
         Ok(())
@@ -7596,6 +7628,7 @@ mod abort_dispatch_tests {
                 bytes: Rc::from(&file[0x100..0x101]),
                 function: not_executed,
                 _library: None,
+                _jit: None,
             },
         );
         let mut state = pending(&image);
@@ -7638,6 +7671,7 @@ mod abort_dispatch_tests {
                 bytes: Rc::from(&file[0x100..0x101]),
                 function: not_executed,
                 _library: None,
+                _jit: None,
             },
         );
         let mut state = pending(&image);
