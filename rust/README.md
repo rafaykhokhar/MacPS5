@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct SHLX/SHRX/SARX now supports 32/64-bit registers and guarded memory sources
+with flag preservation and masked counts. 1975296 native cases and 1277952 BEXTR
+regression cases pass. Startup advances to MOVBE32 at 0xc90. See
+[BMI shift evidence](../docs/status/TRANSLATOR_READINESS.md#direct-bmi-variable-shifts).
+
 Direct NOT now supports all integer widths for registers and guarded memory,
 preserving flags. 27648 native cases and 407205 shared-helper regression checks
 pass. Startup translates past NOT in the block at 0xa2a but now rejects SHRX32;

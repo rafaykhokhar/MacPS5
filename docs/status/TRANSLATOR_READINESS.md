@@ -1358,3 +1358,32 @@ translation, but the entire span has not executed. Logs are
 `/tmp/macps5-not-{tests,clippy,build,startup}.log`. The next gap is BMI variable
 shift lowering. Bootstrap and PS5 gameplay remain incomplete; this startup-only
 run skips Metal presentation.
+
+## Direct BMI variable shifts
+
+The direct backend now accepts VEX SHLX/SHRX/SARX at 32 and 64 bits with register
+or guarded memory data sources and a register count. Data/count resolution is
+shared with BEXTR, capturing both inputs before any destination write. ARM64
+LSLV/LSRV/ASRV use the same five/six-bit count masks; W-register results clear
+the upper half of the destination. All guest flags remain unchanged, including
+for zero counts. Memory is still read for a zero count and faults preserve the
+destination and flags. Other variable-shift instruction families are unchanged.
+
+`rust/verification/direct_bmi_shift_native.rs` uses repeated single-bit arithmetic
+steps as its independent reference. It exercises all GPR destination/source/count
+triples, aliases including address bases, masked and high count bits, counts
+0..255 with six input patterns, both widths, all three operations, unaligned and
+short memory reads, and address overflow. Expected state includes the full GPR
+bank, flags, mapped bytes and fault/fuel/stop. The existing BEXTR verifier is
+rerun because its operand-resolution path is shared. Reproduce with the release
+rlib/dependency flags above using `direct_bmi_shift_native.rs` and
+`direct_bextr_native.rs`.
+
+Validation passes: 1975296 native BMI-shift cases, 1277952 BEXTR regression cases,
+687 library tests, three integration tests, strict Clippy and release build.
+Both standalone verifiers compile with warnings denied. Configured
+`--direct-startup` passes the former block at 0xa2a and exits 1 at image-relative
+0xc90 with `Direct lowering unsupported: Movbe_m32_r32`. Logs are
+`/tmp/macps5-bmi-shift-{tests,clippy,build,startup}.log` and record the first real
+dlsym lookup. The next CPU gap is MOVBE byte-swapping memory moves. Bootstrap
+and PS5 gameplay remain incomplete; this startup-only run skips Metal presentation.

@@ -5,6 +5,14 @@ use crate::{
     decode,
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
+fn bmi_shift(i: &Instruction) -> Option<u32> {
+    match i.code() {
+        Code::VEX_Shlx_r32_rm32_r32 | Code::VEX_Shlx_r64_rm64_r64 => Some(0x1ac12000),
+        Code::VEX_Shrx_r32_rm32_r32 | Code::VEX_Shrx_r64_rm64_r64 => Some(0x1ac12400),
+        Code::VEX_Sarx_r32_rm32_r32 | Code::VEX_Sarx_r64_rm64_r64 => Some(0x1ac12800),
+        _ => None,
+    }
+}
 fn memory_arithmetic(i: &Instruction) -> bool {
     matches!(
         i.mnemonic(),
@@ -327,6 +335,7 @@ pub(crate) fn translate_span(
             Code::Not_rm8 | Code::Not_rm16 | Code::Not_rm32 | Code::Not_rm64
                 if !i.has_lock_prefix() => {}
             Code::VEX_Bextr_r32_rm32_r32 | Code::VEX_Bextr_r64_rm64_r64 => {}
+            _ if bmi_shift(&i).is_some() => {}
             _ => return Err(format!("Direct lowering unsupported: {:?}", i.code())),
         }
         offset += i.len();
@@ -564,7 +573,8 @@ pub(crate) fn translate_span(
         if matches!(
             i.code(),
             Code::VEX_Bextr_r32_rm32_r32 | Code::VEX_Bextr_r64_rm64_r64
-        ) {
+        ) || bmi_shift(i).is_some()
+        {
             let wide = i.op0_register().size() == 8;
             let dst = register(i.op0_register(), wide)?;
             if i.op1_kind() == OpKind::Memory {
@@ -587,6 +597,12 @@ pub(crate) fn translate_span(
                 c.context_access(0, 19, register(i.op1_register(), wide)? * 8, wide, false)?;
             }
             c.context_access(1, 19, register(i.op2_register(), wide)? * 8, wide, false)?;
+            if let Some(opcode) = bmi_shift(i) {
+                // ARM W/X variable shifts mask counts to five/six bits, matching BMI.
+                c.emit(opcode | if wide { 0x80000000 } else { 0 })?;
+                c.context_access(0, 19, dst * 8, true, true)?;
+                continue; // BMI shifts preserve guest flags, including for a zero count.
+            }
             c.emit(0xd3401c29)?; // ubfx x9,x1,#0,#8: start
             c.emit(0xd3483c2a)?; // ubfx x10,x1,#8,#8: length
             c.load_u64(11, if wide { 64 } else { 32 })?;
