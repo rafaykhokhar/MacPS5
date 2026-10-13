@@ -1,12 +1,22 @@
 # Rust migration
 
+Guest `Remove` now deletes file names and empty directories from the owned
+namespace. Open descriptors retain old data/inodes after unlink; recreated
+paths obtain distinct identities. The matching build passes 558 library tests,
+three integration tests and strict Clippy. Native checks pass the actual
+M_remove wrapper and existing mkdir/stat/file regressions. This is a bounded
+virtual filesystem, with no host-path deletion or persistent save storage.
+See [remove evidence and limitations](../docs/status/REMOVE.md).
+Startup-only import/ownership assertions pass at missing `rename`, with remove
+bound and 20,000 retained dependency bytes (`remove-entry-verified.log`).
+
 Owned stdout/stderr `Fprintf` and `Vfprintf` now share the typed formatter.
 Fprintf's four GP argument slots, FP arguments and overflow stack have native
 checks; the previous stderr and printf verifiers also pass. The matching build
 passes 553 library tests, three integration tests and strict Clippy. Regular FILE
 formatting remains explicitly unsupported pending its distinct buffering and
 descriptor integration. See [stdout status](../docs/status/STDOUT.md).
-Startup import/ownership assertions pass at missing `remove`, after binding
+The preceding startup import/ownership assertions passed at missing `remove`, after binding
 vfprintf, with 19,952 retained dependency bytes (`fprintf-entry-verified.log`).
 
 Guest `Printf` and `Vprintf` services now use the typed renderer and fixed stream

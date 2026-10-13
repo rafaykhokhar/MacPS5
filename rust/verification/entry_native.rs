@@ -50,6 +50,7 @@ mod vasprintf_native;
 mod vasprintf_hex_native;
 mod printf_stdout_native;
 mod fprintf_native;
+mod remove_native;
 mod strcoll_native;
 mod strxfrm_native;
 mod wcscoll_native;
@@ -144,6 +145,7 @@ fn main() -> Result<(), String> {
         vasprintf_hex_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("vasprintf-hex"))?;
         printf_stdout_native::verify(Path::new(&archive), &Path::new(&directory).join("printf-stdout"))?;
         fprintf_native::verify(Path::new(&archive), &Path::new(&directory).join("fprintf"))?;
+        remove_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("remove"))?;
         strcoll_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strcoll"))?;
         strxfrm_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strxfrm"))?;
         wcscoll_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("wcscoll"))?;
@@ -572,6 +574,7 @@ fn main() -> Result<(), String> {
         ("printf", Service::Printf),
         ("vprintf", Service::Vprintf),
         ("vfprintf", Service::Vfprintf),
+        ("remove", Service::Remove),
     ]
     .into_iter()
     .enumerate()
@@ -1541,6 +1544,7 @@ fn main() -> Result<(), String> {
                 (1176, "putc"),
                 (1184, "__swbuf"),
                 (1192, "vfprintf"),
+                (1200, "remove"),
             ] {
                 let expected = libc_exports.iter().find(|(symbol, _)| *symbol == name)
                     .ok_or("Missing registered libc service")?.1;
@@ -1569,12 +1573,12 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 155 libc exports: 156*24=3744 symbol bytes
-                // and 1+155*12=1861 NID bytes (rounded1872).
-                || native.bytes_allocated() != 19952
+                // 156 libc exports: 157*24=3768 symbol bytes (rounded3776)
+                // and 1+156*12=1873 NID bytes (rounded1888).
+                || native.bytes_allocated() != 20000
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'remove'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'rename'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1584,7 +1588,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; printf/stdout/putc/swbuf/vfprintf imports bound; unresolved remove causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; remove import bound; unresolved rename causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1646,7 +1650,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved remove triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved rename triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     if let Some(result) = presentation_result {

@@ -1043,6 +1043,7 @@ pub enum Service {
     Getenv,
     Getcwd,
     Mkdir,
+    Remove,
     Setenv,
     Wcslen,
     Wcstombs,
@@ -1247,6 +1248,7 @@ impl Service {
             | Self::Sigaddset
             | Self::Getcwd
             | Self::Mkdir
+            | Self::Remove
             | Self::Setenv
             | Self::Wcslen
             | Self::Wcstombs
@@ -5969,6 +5971,20 @@ impl NativeExecutor {
                             cpu.registers[6],
                             cpu.registers[2],
                         )? as u32 as u64
+                    } else if matches!(service, Service::Remove) {
+                        if memory.load(sp, 8)? != ret {
+                            return Err("Remove return frame changed before namespace mutation".into());
+                        }
+                        let kernel = self.kernel.as_mut().ok_or("Missing remove kernel context")?;
+                        match kernel.remove_path(&memory, cpu.registers[7])? {
+                            Ok(()) => 0,
+                            Err(errno) => {
+                                let address = kernel.errno_address();
+                                validate_net_output(&memory, address, 4, sp, ret)?;
+                                memory.store(address, errno.into(), 4)?;
+                                u32::MAX.into()
+                            }
+                        }
                     } else if matches!(service, Service::Mkdir) {
                         let kernel = self.kernel.as_mut().ok_or("Missing mkdir kernel context")?;
                         // Snapshot and resolve the pathname before publishing errno.

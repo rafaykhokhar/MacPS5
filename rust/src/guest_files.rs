@@ -61,6 +61,7 @@ pub(crate) struct FileBacking {
     pub quota: Rc<Quota>,
     pub writable: bool,
     inode: u32,
+    links: Cell<u16>,
     mode: u16,
     uid: u32,
     gid: u32,
@@ -72,7 +73,7 @@ impl FileBacking {
         record[0..4].copy_from_slice(&1u32.to_le_bytes());
         record[4..8].copy_from_slice(&self.inode.to_le_bytes());
         record[8..10].copy_from_slice(&(0o100000 | self.mode).to_le_bytes());
-        record[10..12].copy_from_slice(&1u16.to_le_bytes());
+        record[10..12].copy_from_slice(&self.links.get().to_le_bytes());
         record[12..16].copy_from_slice(&self.uid.to_le_bytes());
         record[16..20].copy_from_slice(&self.gid.to_le_bytes());
         record[72..80].copy_from_slice(&(length as i64).to_le_bytes());
@@ -404,6 +405,80 @@ impl Files {
         self.revision = revision;
         Ok(())
     }
+    /// Remove a guest namespace entry; never consult or delete a host path.
+    /// FreeBSD11.4 libc remove.c performs lstat first, then rmdir for directories
+    /// or unlink otherwise. Resolve/type/existence checks therefore precede
+    /// deletion permission checks. No symlink, hardlink, mountpoint, ACL, inode
+    /// flags or sticky-directory support is claimed: registration rejects sticky
+    /// modes, and the existing guest mkdir profile keeps permission bits only.
+    /// Directory read_only controls mutation of its children, not a mount root;
+    /// a readonly regular file can be unlinked from a writable parent.
+    /// Cwd is supplied as a pathname, not a retained directory inode: relative
+    /// traversal after unlinking the cwd by absolute name is outside this profile.
+    /// https://raw.githubusercontent.com/freebsd/freebsd-src/releng/11.4/lib/libc/stdio/remove.c
+    /// https://raw.githubusercontent.com/freebsd/freebsd-src/releng/11.4/sys/kern/vfs_lookup.c
+    /// https://raw.githubusercontent.com/freebsd/freebsd-src/releng/11.4/sys/kern/vfs_syscalls.c
+    pub fn remove(&mut self, path: &[u8], cwd: Option<&[u8]>) -> std::result::Result<(), u32> {
+        // Lookup must preserve errors in intermediates before dot/dotdot
+        // normalization. In particular, missing/../existing is not existing.
+        let resolved = self.resolve(path, cwd)?;
+        let resolved = trimmed(&resolved);
+        let is_directory = self.directories.contains_key(resolved);
+        if !is_directory && !self.files.contains_key(resolved) {
+            return Err(2);
+        }
+        // DELETE lookup rejects these final spellings even when ordinary
+        // lstat/lookup successfully resolves them to an existing directory.
+        match path
+            .rsplit(|&byte| byte == b'/')
+            .find(|part| !part.is_empty())
+        {
+            None => return Err(21), // all-slash root: EISDIR before rmdir's root test
+            Some(b"." | b"..") => return Err(22),
+            _ => (),
+        }
+        let p = parent(resolved);
+        let directory = self.directories.get(p).ok_or(2u32)?;
+        if directory.read_only {
+            return Err(30);
+        }
+        if !self.access(directory, 3) {
+            return Err(13);
+        }
+        let parent_links = if is_directory {
+            if self
+                .files
+                .keys()
+                .chain(self.directories.keys())
+                .any(|child| child.as_slice() != resolved && parent(child) == resolved)
+            {
+                return Err(66); // ENOTEMPTY
+            }
+            Some(
+                directory
+                    .links
+                    .checked_sub(1)
+                    .filter(|&n| n >= 2)
+                    .ok_or(22u32)?,
+            )
+        } else {
+            None
+        };
+        let revision = self.revision.checked_add(1).ok_or(28u32)?;
+        // No fallible work follows namespace publication. Open descriptors keep
+        // their Rc backing, inode and content; final Rc drop releases its quota.
+        if let Some(links) = parent_links {
+            self.directories
+                .remove(resolved)
+                .expect("Checked directory");
+            self.directories.get_mut(p).expect("Checked parent").links = links;
+        } else {
+            let backing = self.files.remove(resolved).expect("Checked file");
+            backing.links.set(0);
+        }
+        self.revision = revision;
+        Ok(())
+    }
     /// Register owned contents at a canonical absolute guest path. Missing
     /// ancestors become real searchable readonly virtual directory nodes.
     pub fn register(&mut self, path: &[u8], bytes: Vec<u8>) -> Result<()> {
@@ -444,6 +519,7 @@ impl Files {
                 quota: self.quota.clone(),
                 writable,
                 inode,
+                links: Cell::new(1),
                 mode: if writable { 0o666 } else { 0o444 },
                 uid: self.profile.uid,
                 gid: self.profile.gid,
@@ -653,6 +729,104 @@ pub(crate) fn read_path(user: &Memory<'_>, address: u64) -> std::result::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unlink_retains_open_backing_inode_zero_links_and_quota_until_last_close() {
+        let mut files = Files::default();
+        files.allow_create_directory(b"/save").unwrap();
+        files
+            .register_writable(b"/save/file", b"old".to_vec())
+            .unwrap();
+        let live = files.backing(b"/save/file").unwrap();
+        let second = live.clone();
+        let old_inode = live.stat()[4..8].to_vec();
+        files.remove(b"file", Some(b"/save\0")).unwrap();
+        assert!(matches!(files.backing(b"/save/file"), Err(2)));
+        assert_eq!(live.stat()[10..12], [0, 0]);
+        assert_eq!(live.stat()[4..8], old_inode);
+        assert_eq!(&*live.state.borrow().bytes, b"old");
+        assert_eq!(files.content_bytes(), 3);
+        files
+            .register_writable(b"/save/file", b"new!".to_vec())
+            .unwrap();
+        let recreated = files.backing(b"/save/file").unwrap();
+        assert_ne!(recreated.stat()[4..8], old_inode);
+        assert_eq!(recreated.stat()[10..12], [1, 0]);
+        assert_eq!(files.content_bytes(), 7);
+        live.state.borrow_mut().bytes[0] = b'O';
+        assert_eq!(&*recreated.state.borrow().bytes, b"new!");
+        drop(live);
+        assert_eq!(files.content_bytes(), 7);
+        drop(second);
+        assert_eq!(files.content_bytes(), 4);
+        drop(recreated);
+        files.remove(b"/save/file", None).unwrap();
+        assert_eq!(files.content_bytes(), 0);
+    }
+    #[test]
+    fn remove_directories_requires_empty_children_and_updates_parent_link_count() {
+        let mut files = Files::default();
+        files.allow_create_directory(b"/save").unwrap();
+        files.allow_create_directory(b"/save/dir").unwrap();
+        files.register(b"/save/dir/readonly", vec![1]).unwrap();
+        assert_eq!(files.remove(b"/save/dir/", None), Err(66));
+        files.remove(b"/save/dir/readonly", None).unwrap(); // target content mode is irrelevant
+        files.allow_create_directory(b"/save/dir/sub").unwrap();
+        assert_eq!(files.remove(b"/save/dir", None), Err(66));
+        files.remove(b"/save/dir/sub///", None).unwrap();
+        assert_eq!(files.stat_record(b"/save").unwrap()[10..12], [3, 0]);
+        files.register_directory(b"/save/dir", 0o555, true).unwrap();
+        files.remove(b"/save/dir", None).unwrap(); // readonly child is not a mounted root
+        assert_eq!(files.stat_record(b"/save").unwrap()[10..12], [2, 0]);
+        assert_eq!(files.content_bytes(), 0);
+    }
+    #[test]
+    fn remove_error_order_preserves_dot_spellings_and_actual_lookup_failures() {
+        let mut files = Files::default();
+        files.allow_create_directory(b"/save").unwrap();
+        files.register(b"/save/file", vec![1]).unwrap();
+        files.register_directory(b"/locked", 0, false).unwrap();
+        for (path, errno) in [
+            (&b"/"[..], 21),
+            (b"///", 21),
+            (b"/save/.", 22),
+            (b"/save/..", 22),
+            (b"/save/../", 22),
+            (b"/save/file/", 20),
+            (b"/save/file/.", 20),
+            (b"/missing/../save", 2),
+            (b"/missing", 2),
+            (b"/save/no/", 2),
+            (b"/locked/.", 13),
+            (b"/locked/../save", 13),
+            (b"", 2),
+        ] {
+            let revision = files.revision;
+            assert_eq!(files.remove(path, None), Err(errno), "{:?}", path);
+            assert_eq!(files.revision, revision);
+            assert_eq!(files.content_bytes(), 1);
+        }
+        assert_eq!(files.remove(b".", Some(b"/save")), Err(22));
+        assert_eq!(files.remove(b"../", Some(b"/save")), Err(22));
+        assert!(files.register_directory(b"/sticky", 0o1777, false).is_err());
+    }
+    #[test]
+    fn remove_parent_policy_and_revision_checks_precede_mutation() {
+        let mut files = Files::default();
+        files.register(b"/rom/file", vec![1, 2]).unwrap();
+        assert_eq!(files.remove(b"/rom/file", None), Err(30));
+        assert_eq!(files.remove(b"/rom/missing", None), Err(2)); // lstat first
+        files.register_directory(b"/rom", 0o555, false).unwrap();
+        assert_eq!(files.remove(b"/rom/file", None), Err(13));
+        files.allow_create_directory(b"/rom").unwrap();
+        let stale = files.plan_mkdir(b"/rom/new", None, 0o777).unwrap();
+        files.remove(b"/rom/file", None).unwrap();
+        assert_eq!(files.commit_mkdir(stale), Err(22));
+        files.register(b"/rom/file", vec![3]).unwrap();
+        files.revision = u64::MAX;
+        assert_eq!(files.remove(b"/rom/file", None), Err(28));
+        assert_eq!(files.content_bytes(), 1);
+        assert_eq!(files.backing(b"/rom/file").unwrap().stat()[10..12], [1, 0]);
+    }
     #[test]
     fn directories_resolve_components_before_dotdot_and_preserve_type_rules() {
         let mut files = Files::default();

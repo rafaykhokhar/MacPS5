@@ -65,6 +65,22 @@ impl Kernel {
     pub fn commit_mkdir(&mut self, plan: MkdirPlan) -> std::result::Result<(), u32> {
         self.files.commit_mkdir(plan)
     }
+    /// Remove only from the owned guest namespace. Snapshot the pathname before
+    /// errno publication; open descriptors retain their shared backing.
+    pub fn remove_path(
+        &mut self,
+        memory: &Memory<'_>,
+        path_address: u64,
+    ) -> Result<std::result::Result<(), u32>> {
+        let path = match guest_files::read_path(memory, path_address) {
+            Ok(path) => path,
+            Err(errno) => return Ok(Err(errno)),
+        };
+        if !path.is_empty() && path[0] != b'/' && self.working_directory.is_none() {
+            return Err("Guest working directory is not configured for relative remove".into());
+        }
+        Ok(self.files.remove(&path, self.working_directory.as_deref()))
+    }
     pub fn errno_address(&self) -> u64 {
         self.errno_address
     }
@@ -1219,6 +1235,30 @@ mod tests {
 mod directory_bridge_tests {
     use super::*;
     use crate::descriptors::OpenOptions;
+    #[test]
+    fn remove_detaches_name_but_keeps_open_backing_and_recreate_identity() {
+        let mut kernel = Kernel::new(0, 0x1000).unwrap();
+        kernel.files.allow_create_directory(b"/save").unwrap();
+        kernel.files.register_writable(b"/save/data", b"old".to_vec()).unwrap();
+        kernel.register_working_directory(b"/save").unwrap();
+        let old = kernel.open_file_path(b"data", OpenOptions::read_only()).unwrap().unwrap();
+        let old_stat = kernel.descriptors.stat_file(&old).unwrap();
+        let mut path = *b"data\0";
+        let mut memory = Memory::default();
+        memory.add(0x2000, &mut path, false, false).unwrap();
+        assert_eq!(kernel.remove_path(&memory, 0x2000).unwrap(), Ok(()));
+        assert_eq!(kernel.files.content_bytes(), 3);
+        assert_eq!(kernel.descriptors.preview_read(&old, 8).unwrap().bytes(), b"old");
+        assert_eq!(&kernel.descriptors.stat_file(&old).unwrap()[10..12], &0u16.to_le_bytes());
+        assert_eq!(kernel.remove_path(&memory, 0x2000).unwrap(), Err(2));
+        kernel.files.register_writable(b"/save/data", b"new!".to_vec()).unwrap();
+        let new = kernel.open_file_path(b"data", OpenOptions::read_only()).unwrap().unwrap();
+        assert_ne!(&old_stat[4..8], &kernel.descriptors.stat_file(&new).unwrap()[4..8]);
+        assert_eq!(kernel.descriptors.preview_read(&new, 8).unwrap().bytes(), b"new!");
+        assert_eq!(kernel.files.content_bytes(), 7);
+        assert_eq!(kernel.descriptors.close_file(&old), 0);
+        assert_eq!(kernel.files.content_bytes(), 4);
+    }
     #[test]
     fn mkdir_open_stat_share_cwd_nodes_and_file_identity() {
         let mut kernel = Kernel::new(0, 0x1000).unwrap();
