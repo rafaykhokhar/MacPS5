@@ -147,6 +147,8 @@ pub fn verify(archive: &Path, directory: &Path) -> Result<(), String> {
     );
     assert_eq!(native.environment, DATA);
     assert_eq!(errno, 77u32.to_le_bytes());
+    // Failed allocation requires errno publication; success must not touch it.
+    native.environment_budget = 1;
     native.kernel = Some(Kernel::new(4096, 0x900000 + 4096 - 16)?);
     assert!(
         invoke(
@@ -160,6 +162,7 @@ pub fn verify(archive: &Path, directory: &Path) -> Result<(), String> {
         .is_err()
     );
     assert_eq!(native.environment, DATA);
+    native.environment_budget = 64;
     native.kernel = Some(Kernel::new(4096, ERRNO)?);
     assert_eq!(
         invoke(

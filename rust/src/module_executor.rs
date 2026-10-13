@@ -1049,6 +1049,7 @@ pub enum Service {
     Readdir,
     Closedir,
     Setenv,
+    Putenv,
     Wcslen,
     Wcstombs,
     Mbrtowc,
@@ -1260,6 +1261,7 @@ impl Service {
             | Self::Readdir
             | Self::Closedir
             | Self::Setenv
+            | Self::Putenv
             | Self::Wcslen
             | Self::Wcstombs
             | Self::Mbrtowc
@@ -1821,10 +1823,9 @@ enum Flow {
     EnvironmentSet {
         continuation: Box<Continuation>,
         imported: Option<crate::environment::Environment>,
-        name: Vec<u8>,
-        value: Vec<u8>,
-        overwrite: i32,
+        action: crate::environment::Action,
         errno: u64,
+        errno_fault: Option<String>,
         terminal: bool,
     },
     TranslationMiss {
@@ -3452,10 +3453,9 @@ impl NativeExecutor {
                 Flow::EnvironmentSet {
                     continuation: mut saved,
                     imported,
-                    name,
-                    value,
-                    overwrite,
+                    action,
                     errno,
+                    errno_fault,
                     terminal,
                 } => {
                     // All borrowed mappings are gone. Guest addresses stay fixed;
@@ -3466,7 +3466,7 @@ impl NativeExecutor {
                         saved.stack_lease.clone(),
                     );
                     let result = if let Some(mut environment) = imported {
-                        let result = environment.set(&name, &value, overwrite);
+                        let result = environment.commit(action);
                         if result.is_ok() {
                             self.environment = environment.table_address();
                             self.owned_environment = Some(environment);
@@ -3476,10 +3476,13 @@ impl NativeExecutor {
                         self.owned_environment
                             .as_mut()
                             .ok_or("Environment owner disappeared")?
-                            .set(&name, &value, overwrite)
+                            .commit(action)
                     };
                     if matches!(result, Err(crate::environment::EnvError::Corrupt)) {
                         return Err("Unsupported malformed direct environment mutation".into());
+                    }
+                    if result.is_err() {
+                        if let Some(fault) = errno_fault { return Err(fault); }
                     }
                     saved.cpu.registers[0] = if result.is_ok() { 0 } else { u32::MAX as u64 };
                     environment_completion =
@@ -3658,6 +3661,9 @@ impl NativeExecutor {
                 .validate_contents()
                 .map_err(|e| format!("Corrupt guest environment: {e:?}"))?;
         }
+        let environment_snapshot = self.owned_environment.as_ref()
+            .map(crate::environment::Environment::snapshot).transpose()
+            .map_err(|error| format!("Environment snapshot fault: {error:?}"))?;
         let (gdtoa_pool, gdtoa_state) = self.gdtoa.split_mut();
         let mut memory = Memory::default();
         for mapped in std::iter::once(&mut *image).chain(dependencies.iter_mut().map(|i| &mut **i))
@@ -5307,23 +5313,27 @@ impl NativeExecutor {
                                 u32::MAX.into()
                             }
                         }
-                    } else if matches!(service, Service::Setenv) {
+                    } else if matches!(service, Service::Setenv | Service::Putenv) {
                         'setenv: {
                             let errno = self
                                 .kernel
                                 .as_ref()
                                 .ok_or("Missing setenv errno context")?
                                 .errno_address();
-                            let inputs = crate::environment::setenv_inputs(
+                            let inputs = if matches!(service, Service::Putenv) {
+                                crate::environment::putenv_inputs(&memory, cpu.registers[7])
+                                    .map(|result| result.map(|name| (name, Vec::new())))
+                            } else { crate::environment::setenv_inputs(
                                 &memory,
                                 cpu.registers[7],
                                 cpu.registers[6],
-                            )
+                            ) }
                             .map_err(|e| format!("Guest setenv input fault {e:?}"))?;
-                            validate_net_output(&memory, errno, 4, sp, ret)?;
-                            memory.validate_write(errno, 4)?;
+                            let errno_fault = validate_net_output(&memory, errno, 4, sp, ret)
+                                .and_then(|()| memory.validate_write(errno, 4)).err();
                             match inputs {
                                 Err(error) => {
+                                    if let Some(fault) = errno_fault { return Err(fault); }
                                     memory.store(errno, error.errno() as u64, 4)?;
                                     u32::MAX as u64
                                 }
@@ -5339,6 +5349,7 @@ impl NativeExecutor {
                                         ) {
                                             Ok(environment) => Some(environment),
                                             Err(crate::strings::Fault::Allocation) => {
+                                                if let Some(fault) = errno_fault { return Err(fault); }
                                                 memory.store(errno, 12, 4)?;
                                                 break 'setenv u32::MAX as u64;
                                             }
@@ -5358,6 +5369,24 @@ impl NativeExecutor {
                                             }
                                         }
                                     }
+                                    let snapshot = if let Some(environment) = imported.as_ref() {
+                                        environment.snapshot().map_err(|error| format!("Imported environment snapshot fault: {error:?}"))?
+                                    } else {
+                                        environment_snapshot.clone().ok_or("Missing environment snapshot")?
+                                    };
+                                    let prepared = if matches!(service, Service::Putenv) {
+                                        snapshot.prepare_put(&memory, cpu.registers[7])
+                                    } else {
+                                        snapshot.prepare_set(&memory, &name, &value, cpu.registers[2] as u32 as i32)
+                                    }.map_err(|fault| format!("Environment mutation preparation fault: {fault:?}"))?;
+                                    let action = match prepared {
+                                        Ok(action) => action,
+                                        Err(error) => {
+                                            if let Some(fault) = errno_fault { return Err(fault); }
+                                            memory.store(errno, error.errno() as u64, 4)?;
+                                            break 'setenv u32::MAX as u64;
+                                        }
+                                    };
                                     // Complete the call exactly once before remapping: no repeat
                                     // stack push, service charge, or input pointer dereference.
                                     cpu.registers[4] =
@@ -5369,7 +5398,6 @@ impl NativeExecutor {
                                         cpu.stop = 3;
                                     }
                                     cpu.memory = 0;
-                                    let overwrite = cpu.registers[2] as u32 as i32;
                                     drop(memory);
                                     return Ok(Flow::EnvironmentSet {
                                         continuation: Box::new(Continuation {
@@ -5385,10 +5413,9 @@ impl NativeExecutor {
                                             caller_bias,
                                         }),
                                         imported,
-                                        name,
-                                        value,
-                                        overwrite,
+                                        action,
                                         errno,
+                                        errno_fault,
                                         terminal,
                                     });
                                 }

@@ -1,6 +1,7 @@
 //! Environment lookup over a guest-owned, NULL-terminated pointer table.
 //! Never reads the host process environment.
 use crate::strings::{Fault, LIMIT, Memory};
+use std::rc::Rc;
 const MAX_ENTRIES: u64 = 4096;
 const MAX_BYTES: usize = 1024 * 1024;
 fn read_string(memory: &impl Memory, address: u64, budget: &mut usize) -> Result<Vec<u8>, Fault> {
@@ -33,15 +34,36 @@ pub fn getenv(memory: &impl Memory, environment: u64, name: u64) -> Result<u64, 
         if pointer == 0 {
             return Ok(0);
         }
-        let entry = read_string(memory, pointer, &mut budget)?;
-        if entry.get(..name.len()) == Some(name.as_slice()) && entry.get(name.len()) == Some(&b'=')
-        {
+        if matches_name(memory, pointer, &name, &mut budget)? {
             return pointer
                 .checked_add(name.len() as u64 + 1)
                 .ok_or(Fault::Read);
         }
     }
     Err(Fault::Limit)
+}
+fn matches_name(
+    memory: &impl Memory,
+    pointer: u64,
+    name: &[u8],
+    budget: &mut usize,
+) -> Result<bool, Fault> {
+    for (offset, expected) in name
+        .iter()
+        .copied()
+        .chain(std::iter::once(b'='))
+        .enumerate()
+    {
+        if *budget == 0 {
+            return Err(Fault::Limit);
+        }
+        *budget -= 1;
+        let actual = memory.read(pointer.checked_add(offset as u64).ok_or(Fault::Read)?)?;
+        if actual != expected {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 #[cfg(test)]
 mod tests {
@@ -87,7 +109,11 @@ mod tests {
         m.0[40_000..40_004].copy_from_slice(b"B=1\0");
         assert_eq!(getenv(&m, 8, 110_000), Err(Fault::Limit));
         // Individually valid entries must still obey the aggregate scan budget.
-        m.0[40_000..40_000 + LIMIT - 1].fill(b'x');
+        m.0[110_000..110_512].fill(b'q');
+        m.0[40_000..40_512].fill(b'q');
+        m.0[40_512] = b'x';
+        // Prefix budget must stop before this otherwise-invalid later entry.
+        m.0[8 + 3000 * 8..16 + 3000 * 8].copy_from_slice(&u64::MAX.to_le_bytes());
         assert_eq!(getenv(&m, 8, 110_000), Err(Fault::Limit));
     }
     #[test]
@@ -101,14 +127,18 @@ mod tests {
         assert_eq!(getenv(&m, 8, 16), Err(Fault::Read));
         m.0[8..16].copy_from_slice(&64u64.to_le_bytes());
         m.0[64..64 + LIMIT].fill(b'x');
-        assert_eq!(getenv(&m, 8, 16), Err(Fault::Limit));
+        assert_eq!(getenv(&m, 8, 16), Ok(0));
     }
 }
 
 /// Owned process environment. Guest addresses remain stable when host vectors
 /// move. Displaced strings stay mapped until process teardown; shorter updates
 /// reuse the current value's capacity, matching FreeBSD11.4 getenv.c.
-/// putenv/unsetenv and direct replacement of environ are not supported here.
+/// putenv retains caller pointers. Direct table replacement and unsetenv remain
+/// unsupported. Owned storage uses the existing bounded arena rather than the
+/// source allocator/inactive-slot history; displaced owned bytes remain mapped.
+/// Policy: FreeBSD releng/11.4 lib/libc/stdlib/getenv.c (putenv/__findenv).
+/// https://raw.githubusercontent.com/freebsd/freebsd-src/releng/11.4/lib/libc/stdlib/getenv.c
 pub struct Environment {
     entries: Vec<Variable>,
     strings: Vec<u8>,
@@ -116,11 +146,14 @@ pub struct Environment {
     table: Vec<u8>,
     base: u64,
     budget: usize,
+    owner: Rc<()>,
+    revision: u64,
 }
 struct Variable {
     offset: usize,
     name_len: usize,
     capacity: usize,
+    borrowed: Option<u64>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnvError {
@@ -167,6 +200,8 @@ impl Environment {
             table,
             base,
             budget,
+            owner: Rc::new(()),
+            revision: 0,
         })
     }
     pub fn table_address(&self) -> u64 {
@@ -185,12 +220,18 @@ impl Environment {
         ]
     }
     fn index(&self, name: &[u8]) -> Option<usize> {
-        self.entries
-            .iter()
-            .position(|v| self.strings[v.offset..v.offset + v.name_len] == *name)
+        self.entries.iter().position(|v| {
+            v.borrowed.is_none() && self.strings[v.offset..v.offset + v.name_len] == *name
+        })
     }
     pub fn validate_contents(&self) -> Result<(), EnvError> {
         for (index, v) in self.entries.iter().enumerate() {
+            if let Some(pointer) = v.borrowed {
+                if pointer == 0 || self.table[index * 8..index * 8 + 8] != pointer.to_le_bytes() {
+                    return Err(EnvError::Corrupt);
+                }
+                continue;
+            }
             let name = &self.strings[v.offset..v.offset + v.name_len];
             let begin = v.offset + v.name_len + 1;
             let expected = self.strings_address() + v.offset as u64;
@@ -216,6 +257,20 @@ impl Environment {
     /// Input slices exclude their terminating NUL. Copying inputs before this
     /// call supports values which alias existing environment storage.
     pub fn set(&mut self, name: &[u8], value: &[u8], overwrite: i32) -> Result<(), EnvError> {
+        if self.entries.iter().any(|entry| entry.borrowed.is_some()) {
+            return Err(EnvError::Corrupt);
+        }
+        let index = self.index(name);
+        self.set_at(name, value, overwrite, index, false)
+    }
+    fn set_at(
+        &mut self,
+        name: &[u8],
+        value: &[u8],
+        overwrite: i32,
+        index: Option<usize>,
+        newest_first: bool,
+    ) -> Result<(), EnvError> {
         if name.is_empty() || name.contains(&b'=') || name.contains(&0) {
             return Err(EnvError::InvalidName);
         }
@@ -223,16 +278,17 @@ impl Environment {
             return Err(EnvError::Corrupt);
         }
         self.validate_contents()?;
-        let index = self.index(name);
         if index.is_some() && overwrite == 0 {
             return Ok(());
         }
+        let revision = self.revision.checked_add(1).ok_or(EnvError::NoMemory)?;
         if let Some(index) = index {
             let v = &self.entries[index];
-            if value.len() <= v.capacity {
+            if v.borrowed.is_none() && value.len() <= v.capacity {
                 let begin = v.offset + v.name_len + 1;
                 self.strings[begin..begin + value.len()].copy_from_slice(value);
                 self.strings[begin + value.len()] = 0;
+                self.revision = revision;
                 return Ok(());
             }
         } else if self.entries.len() == MAX_ENTRIES as usize {
@@ -263,8 +319,15 @@ impl Environment {
             offset,
             name_len: name.len(),
             capacity: value.len(),
+            borrowed: None,
         };
-        let slot = if let Some(i) = index {
+        let slot = if newest_first {
+            if let Some(i) = index {
+                self.entries.remove(i);
+            }
+            self.entries.insert(0, variable);
+            0
+        } else if let Some(i) = index {
             self.entries[i] = variable;
             i
         } else {
@@ -273,7 +336,98 @@ impl Environment {
         };
         let pointer = self.strings_address() + offset as u64;
         self.table[slot * 8..slot * 8 + 8].copy_from_slice(&pointer.to_le_bytes());
+        self.rebuild_table();
+        self.revision = revision;
         Ok(())
+    }
+    fn rebuild_table(&mut self) {
+        self.table.fill(0);
+        for (index, variable) in self.entries.iter().enumerate() {
+            let pointer = variable
+                .borrowed
+                .unwrap_or_else(|| self.strings_address() + variable.offset as u64);
+            self.table[index * 8..index * 8 + 8].copy_from_slice(&pointer.to_le_bytes());
+        }
+    }
+    /// Capture before mappings borrow this owner. Preparing an action reads
+    /// live caller-owned prefixes, never copied putenv values. No guest code
+    /// may run between preparing and committing the action.
+    pub fn snapshot(&self) -> Result<Snapshot, EnvError> {
+        self.validate_contents()?;
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(self.entries.len())
+            .map_err(|_| EnvError::NoMemory)?;
+        for variable in &self.entries {
+            entries.push(match variable.borrowed {
+                Some(pointer) => SnapshotEntry::Borrowed(pointer),
+                None => {
+                    let mut name = Vec::new();
+                    name.try_reserve_exact(variable.name_len)
+                        .map_err(|_| EnvError::NoMemory)?;
+                    name.extend_from_slice(
+                        &self.strings[variable.offset..variable.offset + variable.name_len],
+                    );
+                    SnapshotEntry::Owned(name)
+                }
+            });
+        }
+        Ok(Snapshot {
+            entries: Rc::new(entries),
+            owner: self.owner.clone(),
+            revision: self.revision,
+        })
+    }
+    pub fn commit(&mut self, action: Action) -> Result<(), EnvError> {
+        if !Rc::ptr_eq(&self.owner, &action.owner) || self.revision != action.revision {
+            return Err(EnvError::Corrupt);
+        }
+        self.validate_contents()?;
+        for (entry, expected) in self.entries.iter().zip(action.expected.iter()) {
+            if let SnapshotEntry::Owned(name) = expected {
+                if entry.borrowed.is_some()
+                    || self.strings[entry.offset..entry.offset + entry.name_len] != **name
+                {
+                    return Err(EnvError::Corrupt);
+                }
+            }
+        }
+        match action.operation {
+            Operation::Set {
+                name,
+                value,
+                overwrite,
+                index,
+            } => self.set_at(&name, &value, overwrite, index, true),
+            Operation::Put { pointer, index } => {
+                let revision = self.revision.checked_add(1).ok_or(EnvError::NoMemory)?;
+                if index.is_none() {
+                    if self.entries.len() == MAX_ENTRIES as usize {
+                        return Err(EnvError::NoMemory);
+                    }
+                    self.entries
+                        .try_reserve(1)
+                        .map_err(|_| EnvError::NoMemory)?;
+                }
+                let variable = Variable {
+                    offset: 0,
+                    name_len: 0,
+                    capacity: 0,
+                    borrowed: Some(pointer),
+                };
+                if let Some(index) = index.filter(|&index| self.entries[index].borrowed.is_some()) {
+                    self.entries[index] = variable;
+                } else {
+                    if let Some(index) = index {
+                        self.entries.remove(index);
+                    }
+                    self.entries.insert(0, variable);
+                }
+                self.rebuild_table();
+                self.revision = revision;
+                Ok(())
+            }
+        }
     }
     /// Copy the original guest table once, preserving its first duplicate.
     /// Caller publishes the new owner only after this constructor succeeds.
@@ -309,6 +463,130 @@ impl Environment {
         }
         Err(Fault::Limit)
     }
+}
+
+enum SnapshotEntry {
+    Owned(Vec<u8>),
+    Borrowed(u64),
+}
+#[derive(Clone)]
+pub struct Snapshot {
+    entries: Rc<Vec<SnapshotEntry>>,
+    owner: Rc<()>,
+    revision: u64,
+}
+pub struct Action {
+    expected: Rc<Vec<SnapshotEntry>>,
+    owner: Rc<()>,
+    revision: u64,
+    operation: Operation,
+}
+enum Operation {
+    Set {
+        name: Vec<u8>,
+        value: Vec<u8>,
+        overwrite: i32,
+        index: Option<usize>,
+    },
+    Put {
+        pointer: u64,
+        index: Option<usize>,
+    },
+}
+impl Snapshot {
+    fn index(&self, memory: &impl Memory, name: &[u8]) -> Result<Option<usize>, Fault> {
+        let mut budget = MAX_BYTES;
+        for (index, entry) in self.entries.iter().enumerate() {
+            let matched = match entry {
+                SnapshotEntry::Owned(owned) => owned == name,
+                SnapshotEntry::Borrowed(pointer) => {
+                    matches_name(memory, *pointer, name, &mut budget)?
+                }
+            };
+            if matched {
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
+    }
+    fn action(&self, operation: Operation) -> Action {
+        Action {
+            expected: self.entries.clone(),
+            owner: self.owner.clone(),
+            revision: self.revision,
+            operation,
+        }
+    }
+    pub fn prepare_put(
+        &self,
+        memory: &impl Memory,
+        pointer: u64,
+    ) -> Result<Result<Action, EnvError>, Fault> {
+        let name = match putenv_inputs(memory, pointer)? {
+            Ok(name) => name,
+            Err(error) => return Ok(Err(error)),
+        };
+        let index = self.index(memory, &name)?;
+        Ok(Ok(self.action(Operation::Put { pointer, index })))
+    }
+    pub fn prepare_set(
+        &self,
+        memory: &impl Memory,
+        name: &[u8],
+        value: &[u8],
+        overwrite: i32,
+    ) -> Result<Result<Action, EnvError>, Fault> {
+        if name.is_empty() || name.contains(&b'=') || name.contains(&0) {
+            return Ok(Err(EnvError::InvalidName));
+        }
+        if value.contains(&0) {
+            return Ok(Err(EnvError::Corrupt));
+        }
+        let index = self.index(memory, name)?;
+        let mut owned_name = Vec::new();
+        let mut owned_value = Vec::new();
+        owned_name
+            .try_reserve_exact(name.len())
+            .map_err(|_| Fault::Allocation)?;
+        owned_value
+            .try_reserve_exact(value.len())
+            .map_err(|_| Fault::Allocation)?;
+        owned_name.extend_from_slice(name);
+        owned_value.extend_from_slice(value);
+        Ok(Ok(self.action(Operation::Set {
+            name: owned_name,
+            value: owned_value,
+            overwrite,
+            index,
+        })))
+    }
+}
+/// FreeBSD putenv checks only through the first '='. The caller retains the
+/// string; neither installation nor name matching reads its value terminator.
+pub fn putenv_inputs(
+    memory: &impl Memory,
+    pointer: u64,
+) -> Result<Result<Vec<u8>, EnvError>, Fault> {
+    if pointer == 0 {
+        return Ok(Err(EnvError::InvalidName));
+    }
+    let mut name = Vec::new();
+    for offset in 0..LIMIT {
+        let byte = memory.read(pointer.checked_add(offset as u64).ok_or(Fault::Read)?)?;
+        if byte == b'=' {
+            return Ok(if name.is_empty() {
+                Err(EnvError::InvalidName)
+            } else {
+                Ok(name)
+            });
+        }
+        if byte == 0 {
+            return Ok(Err(EnvError::InvalidName));
+        }
+        name.try_reserve(1).map_err(|_| Fault::Allocation)?;
+        name.push(byte);
+    }
+    Err(Fault::Limit)
 }
 
 /// Read name first, then value even for overwrite=0. Malformed names produce
@@ -431,5 +709,162 @@ mod mutable_environment_tests {
         env.strings[1] = b'=';
         env.table[0] ^= 1;
         assert_eq!(env.validate_contents(), Err(EnvError::Corrupt));
+    }
+}
+
+#[cfg(test)]
+mod putenv_tests {
+    use super::*;
+    struct Mem(Vec<u8>);
+    impl Memory for Mem {
+        fn read(&self, address: u64) -> Result<u8, Fault> {
+            self.0.get(address as usize).copied().ok_or(Fault::Read)
+        }
+        fn write(&mut self, _: u64, _: &[u8]) -> Result<(), Fault> {
+            panic!("No caller writes")
+        }
+    }
+    fn put(env: &mut Environment, memory: &Mem, pointer: u64) {
+        let action = env
+            .snapshot()
+            .unwrap()
+            .prepare_put(memory, pointer)
+            .unwrap()
+            .unwrap();
+        env.commit(action).unwrap();
+    }
+    fn pointers(env: &Environment) -> Vec<u64> {
+        env.table[..env.entries.len() * 8]
+            .chunks_exact(8)
+            .map(|slot| u64::from_le_bytes(slot.try_into().unwrap()))
+            .collect()
+    }
+    #[test]
+    fn input_and_lookup_stop_before_unmapped_value() {
+        let m = Mem(vec![0, b'A', b'=']);
+        assert_eq!(putenv_inputs(&m, 1), Ok(Ok(b"A".to_vec())));
+        let mut env = Environment::new(0x10000, 0).unwrap();
+        put(&mut env, &m, 1);
+        assert_eq!(pointers(&env), [1]);
+        let action = env
+            .snapshot()
+            .unwrap()
+            .prepare_set(&m, b"A", b"ignored", 0)
+            .unwrap()
+            .unwrap();
+        env.commit(action).unwrap();
+        assert_eq!(pointers(&env), [1]);
+        let mut lookup = Mem(vec![0; 35]);
+        lookup.0[8..16].copy_from_slice(&33u64.to_le_bytes());
+        lookup.0[24..26].copy_from_slice(b"A\0");
+        lookup.0[33..35].copy_from_slice(b"A=");
+        assert_eq!(getenv(&lookup, 8, 24), Ok(35));
+        for bytes in [b"\0".as_slice(), b"=x\0", b"ABC\0"] {
+            let mut data = vec![0];
+            data.extend_from_slice(bytes);
+            assert_eq!(putenv_inputs(&Mem(data), 1), Ok(Err(EnvError::InvalidName)));
+        }
+        assert_eq!(putenv_inputs(&m, 0), Ok(Err(EnvError::InvalidName)));
+    }
+    #[test]
+    fn borrowed_renames_missing_equals_and_setenv_copy_are_live() {
+        let mut env = Environment::new(0x10000, 100).unwrap();
+        let mut m = Mem(vec![0; 64]);
+        m.0[8..14].copy_from_slice(b"A=one\0");
+        put(&mut env, &m, 8);
+        m.0[8..14].copy_from_slice(b"B=two\0");
+        env.validate_contents().unwrap();
+        let action = env
+            .snapshot()
+            .unwrap()
+            .prepare_set(&m, b"A", b"own", 1)
+            .unwrap()
+            .unwrap();
+        env.commit(action).unwrap();
+        assert_eq!(env.entries.len(), 2);
+        assert!(pointers(&env).contains(&8));
+        let saved_caller = m.0.clone();
+        let action = env
+            .snapshot()
+            .unwrap()
+            .prepare_set(&m, b"B", b"x", 1)
+            .unwrap()
+            .unwrap();
+        env.commit(action).unwrap();
+        assert!(!pointers(&env).contains(&8));
+        assert_eq!(m.0, saved_caller);
+        assert!(env.lookup(b"B").unwrap() >= env.strings_address());
+        m.0[24..30].copy_from_slice(b"C=raw\0");
+        put(&mut env, &m, 24);
+        m.0[25] = 0; // Current entry has no '='; it no longer matches C.
+        env.validate_contents().unwrap();
+        let action = env
+            .snapshot()
+            .unwrap()
+            .prepare_set(&m, b"C", b"new", 1)
+            .unwrap()
+            .unwrap();
+        env.commit(action).unwrap();
+        assert!(pointers(&env).contains(&24));
+        assert_eq!(env.entries.len(), 4);
+    }
+    #[test]
+    fn replacement_order_and_renamed_collisions_preserve_borrowed_slot() {
+        let mut env = Environment::new(0x10000, 100).unwrap();
+        env.set(b"X", b"owned", 1).unwrap();
+        let mut m = Mem(vec![0; 80]);
+        for (address, bytes) in [
+            (8, b"A=1\0"),
+            (24, b"B=2\0"),
+            (40, b"A=3\0"),
+            (56, b"X=4\0"),
+        ] {
+            m.0[address..address + 4].copy_from_slice(bytes);
+        }
+        put(&mut env, &m, 8);
+        put(&mut env, &m, 24);
+        put(&mut env, &m, 40);
+        assert_eq!(&pointers(&env)[..2], &[24, 40]); // Replacement retains A slot.
+        m.0[24] = b'A'; // Highest-priority live B entry now also names A.
+        put(&mut env, &m, 8);
+        assert_eq!(&pointers(&env)[..2], &[8, 40]);
+        put(&mut env, &m, 56); // Replacing owned X creates newest slot.
+        assert_eq!(pointers(&env), [56, 8, 40]);
+    }
+    #[test]
+    fn failures_and_stale_or_foreign_actions_preserve_environment() {
+        let mut env = Environment::new(0x10000, 0).unwrap();
+        let mut m = Mem(vec![0; 40]);
+        m.0[8..12].copy_from_slice(b"A=x\0");
+        put(&mut env, &m, 8);
+        let before = env.table.clone();
+        let action = env
+            .snapshot()
+            .unwrap()
+            .prepare_set(&m, b"A", b"x", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(env.commit(action), Err(EnvError::NoMemory));
+        assert_eq!(env.table, before);
+        let snapshot = env.snapshot().unwrap();
+        let stale = snapshot.prepare_put(&m, 8).unwrap().unwrap();
+        put(&mut env, &m, 8);
+        assert_eq!(env.commit(stale), Err(EnvError::Corrupt));
+        let foreign = env.snapshot().unwrap().prepare_put(&m, 8).unwrap().unwrap();
+        let mut other = Environment::new(0x10000, 0).unwrap();
+        assert_eq!(other.commit(foreign), Err(EnvError::Corrupt));
+        env.table[0] ^= 1;
+        assert!(matches!(env.snapshot(), Err(EnvError::Corrupt)));
+        let mut owned = Environment::new(0x20000, 20).unwrap();
+        owned.set(b"A", b"old", 1).unwrap();
+        let action = owned
+            .snapshot()
+            .unwrap()
+            .prepare_set(&m, b"A", b"new", 1)
+            .unwrap()
+            .unwrap();
+        owned.strings[0] = b'B';
+        assert_eq!(owned.commit(action), Err(EnvError::Corrupt));
+        assert_eq!(&owned.strings[..6], b"B=old\0");
     }
 }

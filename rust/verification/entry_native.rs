@@ -55,6 +55,7 @@ mod rename_native;
 mod strncpy_native;
 mod sscanf_native;
 mod directory_native;
+mod putenv_native;
 mod strcoll_native;
 mod strxfrm_native;
 mod wcscoll_native;
@@ -154,6 +155,7 @@ fn main() -> Result<(), String> {
         strncpy_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strncpy"))?;
         sscanf_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("sscanf"))?;
         directory_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("directory"))?;
+        putenv_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("putenv"))?;
         strcoll_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strcoll"))?;
         strxfrm_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strxfrm"))?;
         wcscoll_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("wcscoll"))?;
@@ -589,6 +591,7 @@ fn main() -> Result<(), String> {
         ("opendir", Service::Opendir),
         ("readdir", Service::Readdir),
         ("closedir", Service::Closedir),
+        ("putenv", Service::Putenv),
     ]
     .into_iter()
     .enumerate()
@@ -1567,6 +1570,7 @@ fn main() -> Result<(), String> {
                 (1272, "opendir"),
                 (1280, "closedir"),
                 (1288, "readdir"),
+                (1296, "putenv"),
             ] {
                 let expected = libc_exports.iter().find(|(symbol, _)| *symbol == name)
                     .ok_or("Missing registered libc service")?.1;
@@ -1595,12 +1599,12 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 162 libc exports: 163*24=3912 symbol bytes (rounded3920)
-                // and 1+162*12=1945 NID bytes (rounded1952).
-                || native.bytes_allocated() != 20208
+                // 163 libc exports: 164*24=3936 symbol bytes
+                // and 1+163*12=1957 NID bytes (rounded1968).
+                || native.bytes_allocated() != 20240
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'putenv'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'fgetc'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1610,7 +1614,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; directory imports bound; unresolved putenv causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; putenv import bound; unresolved fgetc causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1672,7 +1676,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved putenv triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved fgetc triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     if let Some(result) = presentation_result {

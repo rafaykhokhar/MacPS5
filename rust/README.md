@@ -1,12 +1,19 @@
 # Rust migration
 
+`Putenv` now retains live caller-backed strings and interoperates with owned
+`Setenv` replacements. Prefix-only lookups and guarded failure publication
+have native checks. The build passes 593 library tests, three integration tests
+and strict Clippy; both environment native verifiers pass. Startup binds putenv
+and now stops at `fgetc`, retaining 20,240 dependency bytes. Game main has not
+executed. See [environment evidence and limits](../docs/status/PUTENV.md).
+
 Owned `Opendir`, `Readdir` and `Closedir` services now use guest heap buffers
 and the shared descriptor table. Native checks pass 102 entries across batches,
 EOF/errno preservation, cleanup and descriptor-reuse protection. The integrated
 build passes 589 library tests, three integration tests, strict Clippy and
 release compilation. Raw directory syscalls, mutation-tolerant cursors and
 additional directory APIs remain incomplete. See [directory status](../docs/status/DIRECTORY_STREAMS.md).
-Startup-only import/ownership assertions pass with the three directory imports
+The preceding startup-only import/ownership assertions passed with the three directory imports
 bound and 20,208 retained dependency bytes. The next missing import is `putenv`;
 game main has not executed.
 
