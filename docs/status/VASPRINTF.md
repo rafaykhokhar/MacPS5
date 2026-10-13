@@ -2,6 +2,8 @@
 
 ## Protected hexadecimal executor integration
 
+Native verification now passes the pinned `asprintf_l` AL=1/AL=8 XMM-save paths, ten floating arguments including two stack spills, all four rounding directions, subnormal DE/PE effects, NaN output, cursor advancement and protected pool `%n`, result-slot and translated-store rejection (`work/vasprintf-native/hex-native.log`, 68948). This verifies the hexadecimal surface against the matching release; decimal and extended80 formatting remain outside this evidence.
+
 The executor now owns and remaps the gdtoa pool at `0x7fff00002000`, with heap-cache ownership retained through `OwnedMappings`. Ordinary guest writes, frees and reallocations reject runtime-owned storage, including allocator padding; narrowly scoped internal operations require the matching owner and still enforce callback barriers. Suspended contexts expose the pool read-only.
 
 `vasprintf` uses the protected hexadecimal renderer and publishes MXCSR effects in source order even if a later operation fails. Integer/text/wide formatting remains available; decimal floating formatting remains an explicit unsupported boundary pending its owned bigint allocation sequence. The combined tree passes 478 library tests, three integration tests and strict Clippy (`hex-executor-tests.log`, 36283). A service-level test verifies hexadecimal output, retained-buffer cleanup and rejection of final pointer publication into the private pool. Native AL/XMM wrapper verification against a matching release remains pending for this increment.

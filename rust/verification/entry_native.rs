@@ -47,7 +47,13 @@ mod multibyte_native;
 mod abort_native;
 mod movdqu_native;
 mod vasprintf_native;
+mod vasprintf_hex_native;
 mod strcoll_native;
+mod strftime_native;
+mod strtof_native;
+mod vmovd_native;
+mod cvtsi2sd_native;
+mod vpxor_native;
 mod system_service_native;
 mod threadattr_native;
 mod thread_services_native;
@@ -111,7 +117,13 @@ fn main() -> Result<(), String> {
     abort_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("abort"))?;
     movdqu_native::verify(Path::new(&archive), &Path::new(&directory).join("movdqu"))?;
     vasprintf_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("vasprintf"))?;
+    vasprintf_hex_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("vasprintf-hex"))?;
     strcoll_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strcoll"))?;
+    strftime_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strftime"))?;
+    strtof_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtof"))?;
+    vmovd_native::verify(Path::new(&archive), &Path::new(&directory).join("vmovd"))?;
+    cvtsi2sd_native::verify(Path::new(&archive), &Path::new(&directory).join("cvtsi2sd"))?;
+    vpxor_native::verify(Path::new(&archive), &Path::new(&directory).join("vpxor"))?;
     semaphore_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     stdio_file_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     system_service_native::verify(Path::new(&archive), Path::new(&directory))?;
@@ -501,6 +513,8 @@ fn main() -> Result<(), String> {
         ("abort", Service::Abort),
         ("vasprintf", Service::Vasprintf),
         ("strcoll", Service::Strcoll),
+        ("strftime", Service::Strftime),
+        ("strtof", Service::Strtof),
     ]
     .into_iter()
     .enumerate()
@@ -1465,13 +1479,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 137 libc exports: (137+1)*24=3312 symbol bytes (rounded3312)
-                // and 1+137*12=1645 NID bytes (rounded1648).
-                // Strcoll adds16bytes to19280.
-                || native.bytes_allocated() != 19296
+                // 139 libc exports: (139+1)*24=3360 symbol bytes (rounded3360)
+                // and 1+139*12=1669 NID bytes (rounded1680).
+                // Strtof adds32bytes to19344.
+                || native.bytes_allocated() != 19376
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'strftime'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'strtold'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1481,7 +1495,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; strcoll import bound; unresolved strftime causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; strtof import bound; unresolved strtold causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1543,7 +1557,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved strftime triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved strtold triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     presentation_result?;
