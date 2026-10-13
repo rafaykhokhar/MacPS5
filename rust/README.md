@@ -1,5 +1,13 @@
 # Rust migration
 
+VEX VMOVAPD/VMOVUPD now support eight XMM/YMM load/store forms with guarded
+copies and the required aligned/unaligned distinction. The matching build
+passes 673 library tests, three integration tests, strict Clippy, 38,016 native
+checks and the existing MOVDQU regression. Discovery reaches 57,827 instructions
+with 142 unsupported sites. Startup remains at missing `fscanf`, before game
+main. See [CPU evidence](../docs/status/CPU.md). Production readiness and
+retail gameplay remain unverified.
+
 VEX VBROADCASTSS/SD now support six scalar register/memory forms through the
 existing bit-copy broadcast path. The matching build passes 672 library tests,
 three integration tests, strict Clippy, 34,632 new native checks and 25,074

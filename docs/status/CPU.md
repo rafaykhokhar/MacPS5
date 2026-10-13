@@ -1,5 +1,41 @@
 # CPU completion criteria
 
+## Packed double moves
+
+VEX VMOVAPD and VMOVUPD now support their eight XMM/YMM load/store encodings,
+including register-to-register copies in either opcode direction. They use the
+existing guarded vector copy path. VMOVAPD enforces 16/32-byte alignment;
+VMOVUPD accepts unaligned operands. Loads guard the full source before writing
+the destination and clear the upper half for XMM. Stores guard the full output
+before writing and preserve source registers. All bits are copied without FP
+arithmetic. Only exact VEX forms are accepted; reserved vvvv, legacy/EVEX and
+unsupported FS/GS/address32 forms remain rejected.
+
+Reference: AMD APM Volume 4 rev.3.24 pp.182–183 and 232–233
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)).
+Alignment failures use runtime guard stops; architectural #GP classification,
+delivery and recovery remain unimplemented.
+
+The matching build passes 673 library tests, three integration tests, strict
+Clippy and release compilation (`work/packed-double-move-native/{tests,clippy,release}.log`,
+process 29681 exit 0). The [native verifier](../../rust/verification/packed_double_move_native.rs)
+passes 38,016 checks across 72 decoded fixtures: both register opcode
+directions, aliases/high registers/WIG, raw FP bits/random lanes, upper
+clearing, every aligned-move misalignment, unaligned copies, readonly loads,
+writable stores with sentinels, high/RIP operands, every short span, readonly
+store faults and flags/FP/fuel/prior faults. The existing MOVDQU regression
+also passes (`work/packed-double-move-native/{native,regression}.log`, process
+83578 exit 0).
+
+Discovery reaches 57,827 instructions and 13,097 blocks with 142 unsupported
+sites: four former stops removed and one later stop exposed. These counts do
+not establish CPU completion. The entry runner compiles with warnings denied;
+startup-only verification passes at the missing `fscanf` boundary, with ten
+accepted dependencies, 20,288 owned dependency bytes and pending cleanup.
+Game main has not executed (`work/packed-double-move-native/entry.log`, process
+24128 exit 0). No full GPU suite was run for this CPU change. Production
+readiness and retail gameplay remain unverified.
+
 ## Scalar floating-point broadcasts
 
 VEX VBROADCASTSS (XMM/YMM) and VBROADCASTSD (YMM) now support register and

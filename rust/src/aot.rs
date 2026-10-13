@@ -37,6 +37,27 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn packed_double_move_absolute_address_guard() {
+        for opcode in [0x10, 0x11, 0x28, 0x29] {
+            for length in [0, 4] {
+                let bytes = [
+                    0x67,
+                    0xc4,
+                    0xe1,
+                    0x79 | length,
+                    opcode,
+                    0x04,
+                    0x25,
+                    0,
+                    0,
+                    0,
+                    0,
+                ];
+                assert!(super::translate_rust_memory_region(&bytes, 0, "address").is_err());
+            }
+        }
+    }
+    #[test]
     fn scalar_broadcast_absolute_address_guard() {
         for (opcode, length) in [(0x18, 0), (0x18, 4), (0x19, 4)] {
             let bytes = [
@@ -2453,7 +2474,37 @@ impl Emitter {
                     self.fault();
                 }
             }
-            M::Vmovaps | M::Vmovups | M::Vmovdqa | M::Vmovdqu | M::Vxorps | M::Vxorpd => {
+            M::Vmovaps
+            | M::Vmovups
+            | M::Vmovapd
+            | M::Vmovupd
+            | M::Vmovdqa
+            | M::Vmovdqu
+            | M::Vxorps
+            | M::Vxorpd => {
+                if matches!(m, M::Vmovapd | M::Vmovupd) {
+                    use iced_x86::Code;
+                    if !matches!(
+                        i.code(),
+                        Code::VEX_Vmovapd_xmm_xmmm128
+                            | Code::VEX_Vmovapd_ymm_ymmm256
+                            | Code::VEX_Vmovapd_xmmm128_xmm
+                            | Code::VEX_Vmovapd_ymmm256_ymm
+                            | Code::VEX_Vmovupd_xmm_xmmm128
+                            | Code::VEX_Vmovupd_ymm_ymmm256
+                            | Code::VEX_Vmovupd_xmmm128_xmm
+                            | Code::VEX_Vmovupd_ymmm256_ymm
+                    ) {
+                        return Err("Only VEX128/256 packed double moves are implemented".into());
+                    }
+                    if (i.op0_kind() == OpKind::Memory || i.op1_kind() == OpKind::Memory)
+                        && i.memory_base() == R::None
+                        && i.memory_index() == R::None
+                        && i.memory_displ_size() != 8
+                    {
+                        return Err("32-bit absolute addressing is not implemented".into());
+                    }
+                }
                 if !matches!(i.encoding(), iced_x86::EncodingKind::VEX)
                     || ![128, 256].contains(&width)
                 {
@@ -2502,7 +2553,7 @@ impl Emitter {
                     let load = i.op_kind(1) == OpKind::Memory;
                     let reg = vector(i.op_register(if load { 0 } else { 1 }))?;
                     self.address(i)?;
-                    self.emit(format!("mov x0, x19\nmov x2, #{reg}\nmov x3, #{}\nmov x4, #{}\nbl _guest_vector_{}",width/8,u8::from(matches!(m, M::Vmovaps | M::Vmovdqa)),if load {"load"} else {"store"}));
+                    self.emit(format!("mov x0, x19\nmov x2, #{reg}\nmov x3, #{}\nmov x4, #{}\nbl _guest_vector_{}",width/8,u8::from(matches!(m, M::Vmovaps | M::Vmovapd | M::Vmovdqa)),if load {"load"} else {"store"}));
                     self.fault();
                 }
             }

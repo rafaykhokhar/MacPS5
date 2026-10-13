@@ -92,6 +92,7 @@ mod packed_multiply_native;
 mod packed_variable_shift_native;
 mod packed_pack_native;
 mod scalar_broadcast_native;
+mod packed_double_move_native;
 mod vector_extract128_native;
 mod strftime_native;
 mod strtof_native;
@@ -218,6 +219,7 @@ fn main() -> Result<(), String> {
         packed_variable_shift_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-variable-shift"))?;
         packed_pack_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-pack"))?;
         scalar_broadcast_native::verify(Path::new(&archive), &Path::new(&directory).join("scalar-broadcast"))?;
+        packed_double_move_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-double-move"))?;
         vector_extract128_native::verify(Path::new(&archive), &Path::new(&directory).join("vector-extract128"))?;
         strftime_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strftime"))?;
         strtof_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtof"))?;
