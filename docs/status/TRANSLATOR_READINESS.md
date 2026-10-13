@@ -498,3 +498,48 @@ the new strict-warning verifier pass (process 17829 exit 0). Register arithmetic
 `work/direct-immediate/`. Compile/run the standalone verifier with the preceding
 release rlib/dependency flags; no arguments required. Automatic translation,
 broader instruction coverage and retail compatibility remain unfinished.
+
+## Identical-workload backend comparison
+
+`backend_benchmark.rs` runs identical MOV/ADD/SUB-immediate/JNE/RET guest bytes
+through direct registration and dylib compilation. It uses fresh executors and
+images for five samples per backend, alternating backend order. Every first run
+and each of 100 warm runs verifies 50005000; each invocation executes 30003 guest
+instructions. Retirement checks follow every sample. It measures arena setup
+separately, then translation/publication, first execution and warm execution.
+
+On M5 Pro with the matching release runtime at `45322bd`, all 1010 result checks
+and retirement checks pass (process 30601 exit 0). `work/backend-benchmark/`
+contains the build log and raw `results.csv`:
+
+| Sample | Direct arena μs | Direct translation μs | Dylib translation ms | Direct warm μs/run | Dylib warm μs/run |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0 | 15.750 | 27.375 | 585.498 | 76.775 | 108.873 |
+| 1 | 1.667 | 7.125 | 581.584 | 73.368 | 119.453 |
+| 2 | 5.000 | 21.458 | 583.813 | 71.412 | 125.110 |
+| 3 | 1.333 | 5.792 | 591.660 | 78.723 | 110.429 |
+| 4 | 4.459 | 21.958 | 592.262 | 74.762 | 121.355 |
+
+Direct emission occupies 732 bytes in a 16384-byte arena; the dylib path charges
+425984 mapped bytes. Direct helper code resides in the host executable, outside
+this arena accounting, while dylib mappings include linked helper code. These
+figures are not total-RSS measurements or a whole-game memory comparison. CSV
+`direct_code_bytes=0` for dylibs means not measured, not zero executable code.
+The repeated in-process runs are not cold OS startup tests. Warm timings include
+host dispatch and result checks. This selected supported loop demonstrates the
+benefit of removing repeated library loads; it provides no compatibility,
+native-port performance or game FPS claim.
+
+Reproduce from the repository root after a release build:
+
+```sh
+rustc --edition=2024 -O -Dwarnings rust/verification/backend_benchmark.rs \
+  --extern native_ps5=rust/target/release/libnative_ps5.rlib \
+  -L dependency=rust/target/release/deps -o /tmp/macps5-backend-benchmark
+NATIVE_PS5_RUNTIME_ARCHIVE="$PWD/rust/target/release/libnative_ps5.a" \
+NATIVE_PS5_AOT_DIRECTORY="$PWD/backend-benchmark-new" \
+  /tmp/macps5-backend-benchmark
+```
+
+The artifact directory must not exist. Backend selection remains explicit; the
+benchmark does not enable incomplete direct translation for other workloads.

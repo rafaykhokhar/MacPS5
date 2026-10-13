@@ -1,5 +1,10 @@
 # Rust migration
 
+An identical-workload M5 Pro comparison verifies direct translation/publication
+at 5.8–27.4 μs (arena setup separately 1.3–15.8 μs), versus 582–592 ms through
+dylibs. Both paths execute the same checked integer loop. This is a synthetic
+supported-workload result; see [raw sample table, commands and limitations](../docs/status/TRANSLATOR_READINESS.md#identical-workload-backend-comparison).
+
 Direct arithmetic now supports immediate constants with decoded sign extension.
 20640 independent native cases and an executor loop using `SUB ECX,1` pass,
 alongside existing direct-backend regressions. See
