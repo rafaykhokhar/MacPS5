@@ -348,6 +348,7 @@ pub(crate) fn translate_span(
             Code::VEX_Bextr_r32_rm32_r32 | Code::VEX_Bextr_r64_rm64_r64 => {}
             _ if bmi_shift(&i).is_some() => {}
             _ if movbe(&i) => {}
+            Code::VEX_Andn_r32_r32_rm32 | Code::VEX_Andn_r64_r64_rm64 => {}
             _ => return Err(format!("Direct lowering unsupported: {:?}", i.code())),
         }
         offset += i.len();
@@ -633,12 +634,18 @@ pub(crate) fn translate_span(
         }
         if matches!(
             i.code(),
-            Code::VEX_Bextr_r32_rm32_r32 | Code::VEX_Bextr_r64_rm64_r64
+            Code::VEX_Bextr_r32_rm32_r32
+                | Code::VEX_Bextr_r64_rm64_r64
+                | Code::VEX_Andn_r32_r32_rm32
+                | Code::VEX_Andn_r64_r64_rm64
         ) || bmi_shift(i).is_some()
         {
             let wide = i.op0_register().size() == 8;
             let dst = register(i.op0_register(), wide)?;
-            if i.op1_kind() == OpKind::Memory {
+            let andn = i.mnemonic() == Mnemonic::Andn;
+            let data_operand = if andn { 2 } else { 1 };
+            let other_operand = if andn { 1 } else { 2 };
+            if i.op_kind(data_operand) == OpKind::Memory {
                 memory_address(&mut c, i)?;
                 c.emit(0xaa1303e0)?;
                 c.load_u64(2, if wide { 8 } else { 4 })?;
@@ -655,9 +662,35 @@ pub(crate) fn translate_span(
                     },
                 )?;
             } else {
-                c.context_access(0, 19, register(i.op1_register(), wide)? * 8, wide, false)?;
+                c.context_access(
+                    0,
+                    19,
+                    register(i.op_register(data_operand), wide)? * 8,
+                    wide,
+                    false,
+                )?;
             }
-            c.context_access(1, 19, register(i.op2_register(), wide)? * 8, wide, false)?;
+            c.context_access(
+                1,
+                19,
+                register(i.op_register(other_operand), wide)? * 8,
+                wide,
+                false,
+            )?;
+            if andn {
+                c.emit(if wide { 0x8a210000 } else { 0x0a210000 })?; // bic x0/w0,x0/w0,x1/w1
+                c.context_access(0, 19, dst * 8, true, true)?;
+                c.context_access(9, 19, 136, true, false)?;
+                c.load_u64(10, 0x8c1)?; // CF/OF clear, SF/ZF from result; retain undefined AF/PF
+                c.emit(0x8a2a0129)?;
+                c.emit(0xf100001f)?;
+                c.emit(0x9a9f17ea)?;
+                c.emit(0xaa0a1929)?; // ZF
+                c.emit(if wide { 0xd37ffc0a } else { 0xd35f7c0a })?; // source-width sign bit
+                c.emit(0xaa0a1d29)?; // orr x9,x9,x10,lsl #7
+                c.context_access(9, 19, 136, true, true)?;
+                continue;
+            }
             if let Some(opcode) = bmi_shift(i) {
                 // ARM W/X variable shifts mask counts to five/six bits, matching BMI.
                 c.emit(opcode | if wide { 0x80000000 } else { 0 })?;

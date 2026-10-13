@@ -1414,3 +1414,34 @@ and exits 1 at image-relative 0xcd2 with
 `/tmp/macps5-movbe-{tests,clippy,build,startup}.log` and record the first real dlsym
 lookup. The next gap is BMI AND-NOT. Bootstrap and PS5 gameplay remain incomplete;
 this startup-only run skips Metal presentation.
+
+## Direct BMI AND-NOT
+
+Direct lowering now accepts VEX ANDN32/64 with register or guarded memory second
+sources. The shared BMI source-loading path accounts for ANDN's operand order:
+ARM64 BIC receives the second x86 source as its data and the first as the bits
+to clear. Both inputs are captured before destination writes. Dword results
+zero-extend. CF/OF clear, SF/ZF derive from the result, and undefined AF/PF retain
+the runtime's prior values, matching the existing AOT policy. Memory operands
+are still validated when the first source guarantees a zero result; a failed
+read leaves the destination and flags unchanged.
+
+`rust/verification/direct_andn_native.rs` uses independent per-bit Boolean
+comparisons and expected sign/zero flags. It covers every GPR destination/first/
+second combination, aliases including address bases, both widths, varied and
+all-ones operands, unaligned/short/unmapped reads and address overflow. A second
+sweep covers all 65536 low-word first operands with six second-operand patterns.
+The BEXTR and BMI-shift native verifiers are rerun because operand resolution is
+shared. Reproduce with the standalone release rlib/dependency flags above using
+`direct_andn_native.rs`, `direct_bextr_native.rs`, and `direct_bmi_shift_native.rs`.
+
+Validation passes: 1359872 native ANDN cases (rerun with all arithmetic flags
+initially set), 1277952 BEXTR cases, 1975296 BMI-shift cases, 687 library tests,
+three integration tests, strict Clippy and release build. Standalone verifiers
+compile with warnings denied. Configured `--direct-startup` exits 1 in the same
+span at image-relative 0xcd2, now with
+`Direct lowering unsupported: VEX_Rorx_r32_rm32_imm8`. ANDN is accepted during
+translation, but this entire span has not executed. Logs are
+`/tmp/macps5-andn-{tests,clippy,build,startup}.log` and retain the first real dlsym
+lookup. RORX is the next CPU gap. Bootstrap and PS5 gameplay remain incomplete;
+this startup-only run skips Metal presentation.

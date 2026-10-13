@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct ANDN32/64 now uses ARM64 BIC with guarded memory sources and the required
+flag behavior. 1359872 native cases plus BEXTR/BMI-shift regressions pass.
+Startup translates past ANDN in the block at 0xcd2 but now rejects RORX32;
+that whole block has not executed. See
+[ANDN evidence](../docs/status/TRANSLATOR_READINESS.md#direct-bmi-and-not).
+
 Direct MOVBE now supports 16/32/64-bit guarded loads and stores with ARM64 byte
 reversal. 442368 native cases pass. Configured startup passes MOVBE and reaches
 ANDN32 at 0xcd2. See
