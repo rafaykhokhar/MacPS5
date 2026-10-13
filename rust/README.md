@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct indirect JMP64 now transfers through the executor without pushing a
+return address. Register and RIP-relative executor jumps preserve the stack,
+reject missing targets and stop a self-loop at the fuel limit. The shared native
+CALL/JMP state suite now covers 1920 cases. See
+[indirect-jump evidence](../docs/status/TRANSLATOR_READINESS.md#direct-indirect-jumps).
+
 Direct indirect CALL64 now accepts general registers and guarded memory
 pointers. 960 native state/fault/fuel checks and executor register, RIP-relative
 and pre-push `[RSP]` calls pass. See

@@ -11,77 +11,85 @@ fn main() {
     unsafe {
         let arena = JitArena::new(2 * 1024 * 1024).unwrap();
         let mut checks = 0;
-        for reg in 0..16u8 {
-            for indirect_memory in [false, true] {
-                let mut bytes = vec![0x40 | (reg >> 3), 0xff];
-                bytes.push(if indirect_memory {
-                    0x50 | (reg & 7)
-                } else {
-                    0xd0 | (reg & 7)
-                });
-                if indirect_memory {
-                    if reg & 7 == 4 {
-                        bytes.push(0x24);
+        for tail in [false, true] {
+            for reg in 0..16u8 {
+                for indirect_memory in [false, true] {
+                    let mut bytes = vec![0x40 | (reg >> 3), 0xff];
+                    bytes.push(if indirect_memory {
+                        (if tail { 0x60 } else { 0x50 }) | (reg & 7)
+                    } else {
+                        (if tail { 0xe0 } else { 0xd0 }) | (reg & 7)
+                    });
+                    if indirect_memory {
+                        if reg & 7 == 4 {
+                            bytes.push(0x24);
+                        }
+                        bytes.push(0xf8); // [register-8], including pre-push RSP
                     }
-                    bytes.push(0xf8); // [register-8], including pre-push RSP
-                }
-                let code = arena
-                    .publish(&direct_cpu::translate(&bytes, 0x100, 1).unwrap())
-                    .unwrap();
-                let run: unsafe extern "C" fn(*mut Cpu) =
-                    std::mem::transmute(code.entry(0).unwrap());
-                for address in [0x1000u64, 0x1001, 0x1008, 0x1009, u64::MAX] {
-                    for fuel in [0, 1, 10] {
-                        for prior_fault in [0, 9] {
-                            let mut data = [0xa5; 16];
-                            let mut memory = Memory::default();
-                            memory.add(0x1000, &mut data, false, false).unwrap();
-                            let mut cpu = Cpu {
-                                rip: 0x100,
-                                bias: 0x700000,
-                                fuel,
-                                fault: prior_fault,
-                                flags: 0xa55a,
-                                target: 77,
-                                next_rip: 88,
-                                memory: (&mut memory as *mut Memory<'_>) as u64,
-                                ..Cpu::default()
-                            };
-                            cpu.registers.fill(0x12345678);
-                            cpu.registers[reg as usize] = if indirect_memory {
-                                address.wrapping_add(8)
-                            } else {
-                                address
-                            };
-                            let old = cpu.clone();
-                            run(&mut cpu);
-                            assert_eq!(cpu.registers, old.registers);
-                            assert_eq!(cpu.flags, old.flags);
-                            assert_eq!(cpu.rip, 0x100);
-                            assert_eq!(memory.read(0x1000, 16).unwrap(), [0xa5; 16]);
-                            if prior_fault != 0 || fuel == 0 {
-                                assert_eq!(cpu.fault, prior_fault);
-                                assert_eq!(cpu.fuel, fuel);
-                                assert_eq!(cpu.stop, if prior_fault == 0 { 4 } else { 0 });
-                                assert_eq!((cpu.target, cpu.next_rip), (77, 88));
-                            } else if indirect_memory && !(0x1000..=0x1008).contains(&address) {
-                                assert_eq!(
-                                    (cpu.fault, cpu.fuel, cpu.stop, cpu.target, cpu.next_rip),
-                                    (1, fuel - 1, 0, 77, 88)
-                                );
-                            } else {
-                                assert_eq!((cpu.fault, cpu.fuel, cpu.stop), (0, fuel - 1, 1));
-                                assert_eq!(
-                                    cpu.target,
-                                    if indirect_memory {
-                                        0xa5a5a5a5a5a5a5a5
-                                    } else {
-                                        address
-                                    }
-                                );
-                                assert_eq!(cpu.next_rip, 0x100 + bytes.len() as u64);
+                    let code = arena
+                        .publish(&direct_cpu::translate(&bytes, 0x100, 1).unwrap())
+                        .unwrap();
+                    let run: unsafe extern "C" fn(*mut Cpu) =
+                        std::mem::transmute(code.entry(0).unwrap());
+                    for address in [0x1000u64, 0x1001, 0x1008, 0x1009, u64::MAX] {
+                        for fuel in [0, 1, 10] {
+                            for prior_fault in [0, 9] {
+                                let mut data = [0xa5; 16];
+                                let mut memory = Memory::default();
+                                memory.add(0x1000, &mut data, false, false).unwrap();
+                                let mut cpu = Cpu {
+                                    rip: 0x100,
+                                    bias: 0x700000,
+                                    fuel,
+                                    fault: prior_fault,
+                                    flags: 0xa55a,
+                                    target: 77,
+                                    next_rip: 88,
+                                    memory: (&mut memory as *mut Memory<'_>) as u64,
+                                    ..Cpu::default()
+                                };
+                                cpu.registers.fill(0x12345678);
+                                cpu.registers[reg as usize] = if indirect_memory {
+                                    address.wrapping_add(8)
+                                } else {
+                                    address
+                                };
+                                let old = cpu.clone();
+                                run(&mut cpu);
+                                assert_eq!(cpu.registers, old.registers);
+                                assert_eq!(cpu.flags, old.flags);
+                                assert_eq!(cpu.rip, 0x100);
+                                assert_eq!(memory.read(0x1000, 16).unwrap(), [0xa5; 16]);
+                                if prior_fault != 0 || fuel == 0 {
+                                    assert_eq!(cpu.fault, prior_fault);
+                                    assert_eq!(cpu.fuel, fuel);
+                                    assert_eq!(cpu.stop, if prior_fault == 0 { 4 } else { 0 });
+                                    assert_eq!((cpu.target, cpu.next_rip), (77, 88));
+                                } else if indirect_memory && !(0x1000..=0x1008).contains(&address) {
+                                    assert_eq!(
+                                        (cpu.fault, cpu.fuel, cpu.stop, cpu.target, cpu.next_rip),
+                                        (1, fuel - 1, 0, 77, 88)
+                                    );
+                                } else {
+                                    assert_eq!(
+                                        (cpu.fault, cpu.fuel, cpu.stop),
+                                        (0, fuel - 1, if tail { 5 } else { 1 })
+                                    );
+                                    assert_eq!(
+                                        cpu.target,
+                                        if indirect_memory {
+                                            0xa5a5a5a5a5a5a5a5
+                                        } else {
+                                            address
+                                        }
+                                    );
+                                    assert_eq!(
+                                        cpu.next_rip,
+                                        if tail { 88 } else { 0x100 + bytes.len() as u64 }
+                                    );
+                                }
+                                checks += 1;
                             }
-                            checks += 1;
                         }
                     }
                 }
@@ -133,7 +141,7 @@ fn main() {
         assert!(direct_cpu::translate(&[0xff, 0xd0, 0xc3], 0x100, 2).is_err());
         assert!(direct_cpu::translate(&[0x64, 0xff, 0x10], 0x100, 1).is_err());
         println!(
-            "PASS: {checks} indirect CALL register/memory state, fuel and fault checks; register, RIP-relative and pre-push RSP executor calls return 42"
+            "PASS: {checks} indirect CALL/JMP register/memory state, fuel and fault checks; register, RIP-relative and pre-push RSP executor calls return 42"
         );
     }
 }

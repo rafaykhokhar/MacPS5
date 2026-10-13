@@ -622,3 +622,25 @@ relative-call, cross-block branch, memory-MOV and register-MOV regressions pass
 the verifier takes no arguments. This expands explicit direct registration;
 automatic direct translation, indirect jumps and production readiness remain
 unfinished. No PS5 game execution is established by these checks.
+
+## Direct indirect jumps
+
+Direct `JMP r/m64` reuses guarded indirect operand resolution, then publishes
+the absolute target with dispatcher stop reason 5. It leaves the return-PC
+field and guest stack unchanged. The existing executor validates the target
+and performs a tail transfer. The indirect jump must end its registered span;
+far jumps and unsupported memory address forms remain explicit errors.
+
+The shared `direct_indirect_call_native.rs` now runs 1920 CALL/JMP state cases
+across all 16 register operands/memory bases, pointer boundary faults, fuel and
+prior faults. `direct_indirect_jump_native.rs` executes register and RIP-relative
+pointer-table jumps, checks unchanged stack depth at the destination, rejects
+missing registrations, and verifies that an indirect self-loop exhausts fuel.
+Relative-call and conditional-branch native regressions also pass.
+
+Validation: process 51652 exited 0 after 687 library tests, three integration
+tests, strict Clippy, release build, and all four strict-warning native verifier
+builds/runs. Compile the two standalone verifiers with the release rlib and
+dependency flags documented above; neither takes arguments. Automatic direct
+translation, broader instruction coverage and production readiness remain
+unfinished; this evidence does not establish PS5 game execution.

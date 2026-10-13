@@ -79,7 +79,7 @@ pub fn translate(bytes: &[u8], address: u64, instruction_limit: usize) -> Result
             Code::Mov_r32_imm32 | Code::Mov_r64_imm64 => {}
             Code::Mov_r32_rm32 | Code::Mov_rm32_r32 | Code::Mov_r64_rm64 | Code::Mov_rm64_r64 => {}
             _ if i.is_jcc_short_or_near() || i.is_jmp_short_or_near() => {}
-            Code::Call_rel32_64 | Code::Call_rm64 => {}
+            Code::Call_rel32_64 | Code::Call_rm64 | Code::Jmp_rm64 => {}
             _ if register_arithmetic(&i) => {}
             _ => return Err(format!("Direct lowering unsupported: {:?}", i.code())),
         }
@@ -93,11 +93,17 @@ pub fn translate(bytes: &[u8], address: u64, instruction_limit: usize) -> Result
                     .into(),
             );
         }
+        if i.code() == Code::Jmp_rm64 && offset != bytes.len() {
+            return Err("Direct indirect JMP must end its registered span".into());
+        }
         decoded.push(i);
     }
     if decoded.last().is_none_or(|i| {
         i.code() != Code::Retnq
-            && !matches!(i.code(), Code::Call_rel32_64 | Code::Call_rm64)
+            && !matches!(
+                i.code(),
+                Code::Call_rel32_64 | Code::Call_rm64 | Code::Jmp_rm64
+            )
             && !i.is_jmp_short_or_near()
             && !i.is_jcc_short_or_near()
     }) {
@@ -177,7 +183,10 @@ pub fn translate(bytes: &[u8], address: u64, instruction_limit: usize) -> Result
         )?;
         c.emit(0xd1000529)?; // sub x9,x9,#1
         c.context_access(9, 19, 160, true, true)?;
-        if matches!(i.code(), Code::Call_rel32_64 | Code::Call_rm64) {
+        if matches!(
+            i.code(),
+            Code::Call_rel32_64 | Code::Call_rm64 | Code::Jmp_rm64
+        ) {
             // The dispatcher owns guarded stack push/pop and target validation.
             // Resolve an indirect operand before publishing any call state.
             // Memory operands (including [RSP]) use the pre-push guest state.
@@ -206,9 +215,12 @@ pub fn translate(bytes: &[u8], address: u64, instruction_limit: usize) -> Result
                 c.emit(0xaa0003e9)?; // mov x9,x0
             }
             c.context_access(9, 19, 176, true, true)?;
-            c.load_u64(9, i.next_ip())?;
-            c.context_access(9, 19, 192, true, true)?;
-            c.load_u64(9, 1)?;
+            let tail = i.code() == Code::Jmp_rm64;
+            if !tail {
+                c.load_u64(9, i.next_ip())?;
+                c.context_access(9, 19, 192, true, true)?;
+            }
+            c.load_u64(9, if tail { 5 } else { 1 })?;
             c.context_access(9, 19, 168, true, true)?;
             c.branch(EXIT, Branch::Jump)?;
             continue;
