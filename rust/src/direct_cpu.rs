@@ -495,6 +495,8 @@ pub(crate) fn translate_span(
             Code::Bswap_r32 | Code::Bswap_r64 => {}
             _ if bit_scan(&i) => {}
             _ if bit_test(&i) => {}
+            Code::Clc | Code::Stc | Code::Cmc | Code::Cld | Code::Std | Code::Lahf | Code::Sahf => {
+            }
             Code::VEX_Andn_r32_r32_rm32 | Code::VEX_Andn_r64_r64_rm64 => {}
             Code::VEX_Rorx_r32_rm32_imm8 | Code::VEX_Rorx_r64_rm64_imm8 => {}
             Code::VEX_Mulx_r32_r32_rm32 | Code::VEX_Mulx_r64_r64_rm64 => {}
@@ -1057,6 +1059,42 @@ pub(crate) fn translate_span(
             c.context_access(9, 19, reg * 8, wide, false)?;
             c.emit(if wide { 0xdac00d29 } else { 0x5ac00929 })?; // REV x9/w9
             c.context_access(9, 19, reg * 8, true, true)?;
+            continue;
+        }
+        if matches!(
+            i.code(),
+            Code::Clc | Code::Stc | Code::Cmc | Code::Cld | Code::Std | Code::Lahf | Code::Sahf
+        ) {
+            c.context_access(9, 19, 136, true, false)?;
+            if matches!(i.code(), Code::Lahf | Code::Sahf) {
+                c.load_u64(10, 0xd5)?;
+                if i.code() == Code::Lahf {
+                    c.emit(0x8a0a0129)?; // and x9,x9,x10: five status bits
+                    c.load_u64(10, 2)?;
+                    c.emit(0xaa0a0129)?;
+                    c.emit(0x39000669)?; // strb w9,[x19,#1]: AH only
+                    continue;
+                }
+                c.emit(0x3940066b)?; // ldrb w11,[x19,#1]: AH
+                c.emit(0x8a0a016b)?; // and x11,x11,x10
+                c.emit(0x8a2a0129)?; // bic x9,x9,x10
+                c.emit(0xaa0b0129)?; // orr x9,x9,x11
+            } else {
+                c.load_u64(
+                    10,
+                    if matches!(i.code(), Code::Cld | Code::Std) {
+                        0x400
+                    } else {
+                        1
+                    },
+                )?;
+                c.emit(match i.code() {
+                    Code::Clc | Code::Cld => 0x8a2a0129, // bic
+                    Code::Cmc => 0xca0a0129,             // eor
+                    _ => 0xaa0a0129,                     // orr
+                })?;
+            }
+            c.context_access(9, 19, 136, true, true)?;
             continue;
         }
         if bit_test(i) {

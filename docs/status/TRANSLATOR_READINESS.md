@@ -2117,3 +2117,28 @@ The standalone verifier compiles with warnings denied; reproduce with the
 release rlib/dependency flags above using `direct_bit_test_native.rs`. Logs are
 `/tmp/macps5-bittest-{tests,clippy,build}.log`. Full translator readiness,
 atomic instruction support and PS5 gameplay remain incomplete.
+
+## Direct flag control
+
+Direct CLC/STC/CMC clears, sets or complements CF; CLD/STD clears or sets DF.
+LAHF writes the five arithmetic status flags to AH with the prescribed fixed
+bits, preserving AL, the rest of RAX and guest flags. SAHF copies AH's five
+status bits into guest flags, preserving OF, DF and all other bits. All seven
+instructions emit ARM64 code directly. They follow the normal prior-fault and
+instruction-budget guards. Invalid LOCK-prefixed forms are rejected. LAHF's
+fixed-bit behavior follows the
+[Intel instruction reference](https://cdrdv2-public.intel.com/671110/325383-sdm-vol-2abcd.pdf).
+
+`rust/verification/direct_flags_native.rs` independently updates flags bit by
+bit and AH as a byte. It sweeps the low twelve flag bits with architectural
+reserved-bit values, five AH patterns, zero/one/two instruction budgets and a
+pre-existing fault. An additional SAHF sweep tests every AH byte against every
+low flag byte. Full GPR, flags, RIP and fault/fuel/stop state are checked in the
+main sweep; all seven LOCK forms are rejected.
+
+Validation passes: 638976 native cases, 687 library tests, three integration
+tests, strict Clippy and release build. The standalone verifier compiles with
+warnings denied; reproduce with the release rlib/dependency flags above using
+`direct_flags_native.rs`. Logs are `/tmp/macps5-flags-{tests,clippy,build}.log`.
+This establishes these flag operations within the direct backend, not full
+CPU readiness, string-instruction support or PS5 gameplay.

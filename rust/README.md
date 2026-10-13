@@ -1,5 +1,9 @@
 # Rust migration
 
+Direct CLC/STC/CMC/CLD/STD/LAHF/SAHF now emits ARM64 flag and AH updates.
+All 638976 native state checks pass, alongside library/integration tests and
+strict Clippy. See [flag-control evidence](../docs/status/TRANSLATOR_READINESS.md#direct-flag-control).
+
 Direct BT/BTS/BTR/BTC now supports 16/32/64-bit registers and guarded memory,
 including signed register indices. All 823296 native state checks pass, along
 with library/integration tests and strict Clippy. LOCK forms remain rejected.
