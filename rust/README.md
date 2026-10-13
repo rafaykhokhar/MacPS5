@@ -1,5 +1,11 @@
 # Rust migration
 
+The direct ARM64 backend now has bounded executable storage with per-thread
+write protection, instruction-cache flushing and code-handle ownership. Native
+verification passes 4098 calls and lifetime/capacity checks on the M5 Pro.
+Guest translation still uses dylibs; direct emission and integration remain.
+See [executable-storage evidence](../docs/status/TRANSLATOR_READINESS.md#direct-backend-executable-storage).
+
 Optional `NATIVE_PS5_TRANSLATION_TIMINGS=1` diagnostics now separate discovery,
 filesystem setup, clang/linking, Mach-O validation, dylib loading and entry
 construction. On the synthetic M5 Pro benchmark, dylib loading dominates at

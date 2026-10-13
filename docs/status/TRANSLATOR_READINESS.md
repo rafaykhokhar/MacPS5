@@ -224,3 +224,45 @@ execution completed with process 46692 exit 0.
 benchmark run without the variable passes all result/retirement checks and
 produces zero stderr bytes (`default.csv`, `default.stderr`; process 34676
 exit 0). The diagnostics add no instruction support or gameplay compatibility.
+
+## Direct-backend executable storage
+
+`rust/src/jit_memory.rs` adds bounded append-only ARM64 storage using MAP_JIT,
+per-thread write protection and instruction-cache invalidation, following
+[Apple's JIT guidance](https://developer.apple.com/documentation/apple-silicon/porting-just-in-time-compilers-to-apple-silicon)
+and installed SDK declarations. Capacity is an exact whole number of host pages.
+Empty, overflowing and exhausted ranges are rejected before writes. Published
+code cannot be overwritten through the API; entry offsets must be aligned and
+inside the published allocation.
+
+Rc ownership pins the mapping after allocator destruction until the last code
+handle drops. Handles cannot cross host threads. Only one arena is permitted
+through this module at a time; a failed unmap retains the ownership lock.
+There is no individual allocation reuse, eviction or host parallelism. Arena
+accounting is not yet integrated with the executor's dylib budget.
+
+Construction/publication are unsafe: callers must supply trusted fully relocated
+ARM64 with a known ABI, retain external targets, coordinate JIT protection and
+prevent signal-handler reentry. The write window performs no allocation or user
+callbacks. A guard restores executable protection before cache invalidation and
+publication. Hardened-runtime hosts require compatible signing entitlements;
+callback-allowlist signing modes and other JIT engines are not integrated.
+
+Verification on M5 Pro: 683 library tests, three integration tests, strict Clippy,
+release build and strict-warning native verifier compilation pass (process
+95294 exit 0, `work/jit-memory/`). `jit_memory_native.rs` executes 4098 MOVZ/RET
+calls, fills 16 KiB exactly, checks rejected allocations and offsets, executes
+old code after new publication and allocator destruction, and remaps only after
+final handle release. It does not probe permission faults or hardened signing.
+
+From the repository root after building release:
+
+```sh
+rustc --edition=2024 -O -Dwarnings rust/verification/jit_memory_native.rs \
+  --extern native_ps5=rust/target/release/libnative_ps5.rlib \
+  -L dependency=rust/target/release/deps -o /tmp/macps5-jit-memory-check
+/tmp/macps5-jit-memory-check
+```
+
+Guest translation still uses dylibs. Direct instruction encoding, relocations,
+helper calls, executor publication integration and correctness gates remain.
