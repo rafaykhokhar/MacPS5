@@ -39,6 +39,7 @@ struct Block {
     address: u64,
     class: u32,
     length: usize,
+    owned_length: usize,
     backing: usize,
     heap: bool,
     active: bool,
@@ -103,7 +104,7 @@ impl State {
             self.blocks
                 .iter()
                 .filter(|b| b.heap && b.backing != 0)
-                .map(|b| (b.address, b.length)),
+                .map(|b| (b.address, b.owned_length)),
         )
     }
     fn pool_valid(&self, memory: &Memory<'_>) -> Result<(), Error> {
@@ -184,12 +185,17 @@ impl State {
             let initialize = (|| {
                 mem(memory.validate_write(address, 24))?;
                 let backing = mem(memory.read(address, length))?.as_ptr() as usize;
+                let owned_length = if pool {
+                    length
+                } else {
+                    mem(memory.heap_allocation_size(address))?
+                };
                 mem(memory.store(address + 8, u64::from(class), 4))?;
                 mem(memory.store(address + 12, 1u64 << class, 4))?;
                 mem(memory.store(address + 16, 0, 8))?;
-                Ok(backing)
+                Ok((backing, owned_length))
             })();
-            let backing = match initialize {
+            let (backing, owned_length) = match initialize {
                 Ok(v) => v,
                 Err(error) => {
                     if !pool {
@@ -203,6 +209,7 @@ impl State {
                 address,
                 class,
                 length,
+                owned_length,
                 backing,
                 heap: !pool,
                 active: false,
@@ -400,6 +407,12 @@ mod tests {
         let b = state.balloc(&mut memory, 9).unwrap();
         let heap = state.address(&b).unwrap();
         assert!(memory.heap_allocation_size(heap).is_ok());
+        assert!(
+            state
+                .owned_ranges()
+                .any(|(base, size)| base == heap
+                    && size == memory.heap_allocation_size(heap).unwrap())
+        );
         state.bfree(&mut memory, &b).unwrap();
         assert!(memory.heap_allocation_size(heap).is_ok());
         let reused = state.balloc(&mut memory, 9).unwrap();
@@ -409,6 +422,14 @@ mod tests {
         state.bfree(&mut memory, &big).unwrap();
         assert!(memory.heap_allocation_size(address).is_err());
         assert_eq!(state.owned_ranges().count(), 2);
+        for _ in 0..5 {
+            state.balloc(&mut memory, 1).unwrap();
+        }
+        let padded = state.balloc(&mut memory, 1).unwrap();
+        let address = state.address(&padded).unwrap();
+        assert_eq!(State::allocation_size(1).unwrap(), 40);
+        assert_eq!(memory.heap_allocation_size(address).unwrap(), 48);
+        assert!(state.owned_ranges().any(|range| range == (address, 48)));
     }
     #[test]
     fn string_overlays_header_retains_until_release_and_restores_class() {
