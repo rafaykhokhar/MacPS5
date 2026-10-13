@@ -1392,6 +1392,7 @@ pub mod ffi {
     use super::*;
     use crate::legacy_cpu::Cpu;
     /// Unlocked integer memory arithmetic: 0=ADD, 1=SUB, 2=AND, 3=OR, 4=XOR, 5=NOT, 6=NEG, 7=ADC, 8=SBB.
+    /// Shift operations: 9=SHL, 10=SHR, 11=SAR; rhs is the unmasked count.
     /// Flags commit only after the guarded store succeeds. This is not a host atomic operation.
     /// # Safety
     /// Same exclusive, disjoint CPU/Memory ownership contract as native_ps5_module_load_v1.
@@ -1409,7 +1410,7 @@ pub mod ffi {
         if cpu.fault != 0 {
             return;
         }
-        if ![1, 2, 4, 8].contains(&size) || operation > 8 {
+        if ![1, 2, 4, 8].contains(&size) || operation > 11 {
             cpu.fault = 3;
             return;
         }
@@ -1422,6 +1423,7 @@ pub mod ffi {
             cpu.fault = 1;
             return;
         };
+        let count = (rhs & if size == 8 { 63 } else { 31 }) as u32;
         let result = match operation {
             0 => lhs.wrapping_add(rhs),
             1 => lhs.wrapping_sub(rhs),
@@ -1431,9 +1433,18 @@ pub mod ffi {
             5 => !lhs,
             6 => lhs.wrapping_neg(),
             7 => lhs.wrapping_add(rhs).wrapping_add(cpu.flags & 1),
-            _ => lhs.wrapping_sub(rhs).wrapping_sub(cpu.flags & 1),
+            8 => lhs.wrapping_sub(rhs).wrapping_sub(cpu.flags & 1),
+            9 => lhs << count,
+            10 => lhs >> count,
+            _ => {
+                let extension = (64 - size * 8) as u32;
+                let signed = ((lhs << extension) as i64) >> extension;
+                (signed >> count) as u64
+            }
         };
-        let flags = if operation == 5 {
+        let flags = if operation >= 9 {
+            crate::shift_flags::flags(cpu.flags, lhs, rhs, result, size * 8, operation - 9).flags
+        } else if operation == 5 {
             cpu.flags
         } else if operation == 6 {
             crate::arithmetic::flags(cpu.flags, 0, lhs, result, size * 8, 0).flags

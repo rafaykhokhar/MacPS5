@@ -221,6 +221,15 @@ fn register_shift(i: &Instruction) -> bool {
         && (i.op1_kind() == OpKind::Immediate8
             || (i.op1_kind() == OpKind::Register && i.op1_register() == Register::CL))
 }
+fn memory_shift(i: &Instruction) -> bool {
+    matches!(i.mnemonic(), Mnemonic::Shl | Mnemonic::Shr | Mnemonic::Sar)
+        && i.encoding() == iced_x86::EncodingKind::Legacy
+        && !i.has_lock_prefix()
+        && i.op0_kind() == OpKind::Memory
+        && matches!(i.memory_size().size(), 1 | 2 | 4 | 8)
+        && (i.op1_kind() == OpKind::Immediate8
+            || (i.op1_kind() == OpKind::Register && i.op1_register() == Register::CL))
+}
 fn arithmetic_supported(i: &Instruction) -> bool {
     if i.op0_kind() == OpKind::Memory
         && matches!(
@@ -372,6 +381,7 @@ pub(crate) fn translate_span(
             Code::VEX_Vzeroupper | Code::VEX_Vzeroall => {}
             _ if conditional_move(&i) => {}
             _ if memory_arithmetic(&i) => {}
+            _ if memory_shift(&i) => {}
             Code::Not_rm8 | Code::Not_rm16 | Code::Not_rm32 | Code::Not_rm64
                 if !i.has_lock_prefix() => {}
             Code::Neg_rm8 | Code::Neg_rm16 | Code::Neg_rm32 | Code::Neg_rm64
@@ -924,7 +934,7 @@ pub(crate) fn translate_span(
             c.context_access(1, 19, 152, true, true)?;
             continue;
         }
-        if memory_arithmetic(i) {
+        if memory_arithmetic(i) || memory_shift(i) {
             let size = i.memory_size().size();
             memory_address(&mut c, i)?;
             if i.op1_kind() == OpKind::Register {
@@ -953,6 +963,9 @@ pub(crate) fn translate_span(
                     Mnemonic::And => 2,
                     Mnemonic::Or => 3,
                     Mnemonic::Xor => 4,
+                    Mnemonic::Shl => 9,
+                    Mnemonic::Shr => 10,
+                    Mnemonic::Sar => 11,
                     _ => unreachable!(),
                 },
             )?;

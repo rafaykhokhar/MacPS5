@@ -1684,3 +1684,30 @@ build. Both standalone verifiers compile with warnings denied. Logs are
 `/tmp/macps5-narrowshift-{tests,clippy,build}.log`. Memory shifts remain an
 explicit direct-backend gap. This adds CPU instruction coverage without changing
 the previously observed homebrew library boundary or establishing gameplay.
+
+## Direct guarded memory shifts
+
+Direct SHL/SHR/SAR accepts 8/16/32/64-bit memory operands with immediate,
+implicit-one and CL counts. Effective address and count are captured before
+calling the shared guarded RMW helper. Helper operations 9/10/11 mask the count
+to five/six bits and compute the shifted value and flags using the operand
+width. SAR sign-extends the original value before the host shift. A successful
+full-width store precedes the flag commit; read or write faults preserve flags
+and bytes. Even zero-count operands follow the guarded RMW access path, matching
+the existing AOT implementation. LOCK forms remain unsupported.
+
+`rust/verification/direct_memory_shift_native.rs` uses an iterative one-bit
+result/flag oracle for all widths, all 256 counts, the three count encodings,
+all sixteen base registers, sign boundaries and zero/full-width values.
+It includes RCX address/count overlap, unaligned/final-byte/short/unmapped reads,
+overflowing addresses, read-only writes, zero counts, and full GPR/flags/memory/
+fault/fuel/stop/RIP comparisons. The shared memory arithmetic verifier updates
+its invalid-operation case to 12 and protects the existing RMW operations.
+Reproduce with the release rlib/dependency flags above using
+`direct_memory_shift_native.rs` and `direct_memory_arithmetic_native.rs`.
+
+Validation passes: 4924800 native memory-shift checks, 407205 shared RMW
+regression checks, 687 library tests, three integration tests, strict Clippy
+and release build. Standalone verifiers compile with warnings denied. Logs are
+`/tmp/macps5-memshift-{tests,clippy,build}.log`. These checks establish scoped
+memory-shift behavior, not completed CPU translation, fault delivery or gameplay.

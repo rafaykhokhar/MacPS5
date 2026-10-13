@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct SHL/SHR/SAR now also handles guarded memory operands at all four widths
+with immediate, implicit-one and CL counts. 4924800 native memory-shift checks
+and 407205 shared RMW regression checks pass. This closes the memory-shift gap,
+not the remaining CPU or gameplay requirements. See
+[memory shift evidence](../docs/status/TRANSLATOR_READINESS.md#direct-guarded-memory-shifts).
+
 Direct SHL/SHR/SAR now also supports 8/16-bit registers with immediate,
 implicit-one and CL counts, preserving partial-register state. 9714168 narrow
 native checks and 589830 wider regression checks pass. Memory shifts remain
