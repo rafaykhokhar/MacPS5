@@ -25,6 +25,7 @@ pub enum Error {
     PrecisionLimit,
     Allocation,
     InternalBound,
+    Control,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub struct Formatted {
@@ -350,6 +351,172 @@ pub fn format(
     })
 }
 
+/// Source hdtoa effects under masked, gradual-underflow SSE binary64 controls.
+/// The upstream integer-bit fpclassifyd leaves signaling NaNs untouched:
+/// https://raw.githubusercontent.com/freebsd/freebsd-src/releng/11.4/lib/libc/gen/fpclassify.c
+/// Subnormal normalization multiplies by 2^514 exactly (denormal-operand flag).
+/// Explicit short precision uses a scaled add/subtract of signed one: all
+/// operands/results are normal, and only discarded significand bits produce
+/// precision loss. The subtraction is exact by Sterbenz's lemma. Default or
+/// Thirteen or more fractional hexadecimal digits perform no rounding arithmetic.
+/// Returns complete MXCSR preserving incoming sticky flags. This is the source
+/// operation model; native console compiler/code-generation parity is separate.
+pub fn hex_effects(bits: u64, precision: Option<usize>, mxcsr: u32) -> Result<u32, Error> {
+    if precision.is_some_and(|p| p > MAX_PRECISION) {
+        return Err(Error::PrecisionLimit);
+    }
+    if mxcsr & !0xffff != 0 || mxcsr & 0x1f80 != 0x1f80 || mxcsr & 0x8040 != 0 {
+        return Err(Error::Control);
+    }
+    let exponent = (bits >> 52) & 0x7ff;
+    let fraction = bits & ((1u64 << 52) - 1);
+    if exponent == 0x7ff || (exponent == 0 && fraction == 0) {
+        return Ok(mxcsr);
+    }
+    let (significand, flags) = if exponent == 0 {
+        let top = 63 - fraction.leading_zeros();
+        (fraction << (52 - top), 2)
+    } else {
+        (fraction | (1u64 << 52), 0)
+    };
+    let inexact =
+        precision.is_some_and(|p| p < 13 && significand & ((1u64 << (52 - p * 4)) - 1) != 0);
+    Ok(mxcsr | flags | if inexact { 32 } else { 0 })
+}
+
+/// A source PRINT vector or PAD request. Empty PRINTs still count toward NIOV.
+/// Ranges refer to `SourceFormatted.value.body`; the outer formatter emits the
+/// prefix separately before these pieces and splits ZeroPad into 16-byte chunks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Piece {
+    Print(std::ops::Range<usize>),
+    ZeroPad(usize),
+}
+#[derive(Debug)]
+pub struct SourceFormatted {
+    pub value: Formatted,
+    pub pieces: Vec<Piece>,
+}
+
+/// FreeBSD 11.4 output-vector policy, separate from mathematical rounding.
+/// This does not establish source FP-status effects; callers must resolve that
+/// boundary before registering a runtime service. In dtoa mode3, ilim<=0 uses
+/// the half comparison even for directed rounding (dtoa.c:594-605).
+pub fn source_format(
+    bits: u64,
+    conversion: u8,
+    precision: Option<usize>,
+    alternate: bool,
+    rounding: Rounding,
+) -> Result<SourceFormatted, Error> {
+    let kind = conversion.to_ascii_lowercase();
+    let mut value = format(bits, conversion, precision, alternate, rounding)?;
+    let mut pieces = Vec::new();
+    pieces.try_reserve_exact(8).map_err(|_| Error::Allocation)?;
+    if value.special {
+        pieces.push(Piece::Print(0..value.body.len()));
+        return Ok(SourceFormatted { value, pieces });
+    }
+    let mut p = precision.unwrap_or(6);
+    let mut at = value.prefix_len;
+    fn print(pieces: &mut Vec<Piece>, at: &mut usize, count: usize) {
+        pieces.push(Piece::Print(*at..*at + count));
+        *at += count;
+    }
+    fn pad(pieces: &mut Vec<Piece>, at: &mut usize, count: usize) {
+        if count != 0 {
+            pieces.push(Piece::ZeroPad(count));
+            *at += count;
+        }
+    }
+    fn print_and_pad(pieces: &mut Vec<Piece>, at: &mut usize, available: usize, total: usize) {
+        let count = available.min(total);
+        if count != 0 {
+            print(pieces, at, count);
+        }
+        pad(pieces, at, total - count);
+    }
+    let (expt, ndig, scientific) = if kind == b'a' {
+        let exponent_at = value
+            .body
+            .iter()
+            .position(|&b| b == b'p' || b == b'P')
+            .ok_or(Error::InternalBound)?;
+        p = exponent_at - value.prefix_len - 1 - usize::from(value.body.contains(&b'.'));
+        let zero = bits & !(1u64 << 63) == 0;
+        (0, if zero { 1 } else { p + 1 }, true)
+    } else {
+        if kind == b'g' {
+            p = p.max(1);
+        }
+        let mut decimal = Decimal::exact(bits)?;
+        let keep = match kind {
+            b'f' => decimal.exponent + 1 + p as i32,
+            b'e' => p as i32 + 1,
+            _ => p as i32,
+        };
+        let source_rounding = if kind == b'f' && keep <= 0 {
+            Rounding::NearestEven
+        } else {
+            rounding
+        };
+        if source_rounding != rounding {
+            value = format(bits, conversion, precision, alternate, source_rounding)?;
+        }
+        decimal.round(keep, bits >> 63 != 0, source_rounding);
+        let nonzero_input = bits & !(1u64 << 63) != 0;
+        let no_digits = kind == b'f' && nonzero_input && decimal.digits[0] == 0;
+        let expt = if no_digits {
+            -(p as i32)
+        } else {
+            decimal.exponent + 1
+        };
+        let ndig = if no_digits { 0 } else { decimal.len };
+        let scientific = kind == b'e' || (kind == b'g' && (expt <= -4 || expt > p as i32));
+        if kind == b'g' {
+            let significant = if alternate { p } else { ndig };
+            p = if scientific {
+                significant - 1
+            } else {
+                (significant as i32 - expt).max(0) as usize
+            };
+        }
+        (expt, ndig, scientific)
+    };
+    if scientific {
+        print(&mut pieces, &mut at, 1);
+        if p != 0 || alternate {
+            print(&mut pieces, &mut at, 1);
+            print(&mut pieces, &mut at, ndig - 1);
+            pad(&mut pieces, &mut at, p + 1 - ndig);
+        }
+        let remaining = value
+            .body
+            .len()
+            .checked_sub(at)
+            .ok_or(Error::InternalBound)?;
+        print(&mut pieces, &mut at, remaining);
+    } else if expt <= 0 {
+        print(&mut pieces, &mut at, 1);
+        if p != 0 || alternate {
+            print(&mut pieces, &mut at, 1);
+        }
+        pad(&mut pieces, &mut at, (-expt) as usize);
+        let remaining = (p as i32 + expt).max(0) as usize;
+        print_and_pad(&mut pieces, &mut at, ndig, remaining);
+    } else {
+        print_and_pad(&mut pieces, &mut at, ndig, expt as usize);
+        if p != 0 || alternate {
+            print(&mut pieces, &mut at, 1);
+        }
+        print_and_pad(&mut pieces, &mut at, ndig.saturating_sub(expt as usize), p);
+    }
+    if at != value.body.len() || pieces.len() > 8 {
+        return Err(Error::InternalBound);
+    }
+    Ok(SourceFormatted { value, pieces })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,6 +753,140 @@ mod tests {
                 assert_eq!(general.body, if up { b"1e+01".as_slice() } else { b"9" });
                 assert_eq!(general.negative, negative);
             }
+        }
+    }
+
+    #[test]
+    fn source_vectors_keep_prints_distinct_from_padding() {
+        let v = source_format(
+            1.0f64.to_bits(),
+            b'e',
+            Some(3),
+            false,
+            Rounding::NearestEven,
+        )
+        .unwrap();
+        assert_eq!(v.value.body, b"1.000e+00");
+        assert_eq!(
+            v.pieces,
+            [
+                Piece::Print(0..1),
+                Piece::Print(1..2),
+                Piece::Print(2..2),
+                Piece::ZeroPad(3),
+                Piece::Print(5..9)
+            ]
+        );
+        let h = source_format(
+            1.0f64.to_bits(),
+            b'a',
+            Some(3),
+            false,
+            Rounding::NearestEven,
+        )
+        .unwrap();
+        assert_eq!(
+            h.pieces,
+            [
+                Piece::Print(2..3),
+                Piece::Print(3..4),
+                Piece::Print(4..7),
+                Piece::Print(7..10)
+            ]
+        );
+        let f = source_format(
+            100.0f64.to_bits(),
+            b'f',
+            Some(2),
+            false,
+            Rounding::NearestEven,
+        )
+        .unwrap();
+        assert_eq!(
+            f.pieces,
+            [
+                Piece::Print(0..1),
+                Piece::ZeroPad(2),
+                Piece::Print(3..4),
+                Piece::ZeroPad(2)
+            ]
+        );
+        let tiny = source_format(1, b'f', Some(2), false, Rounding::Upward).unwrap();
+        assert_eq!(tiny.value.body, b"0.00");
+        assert_eq!(
+            tiny.pieces,
+            [Piece::Print(0..1), Piece::Print(1..2), Piece::ZeroPad(2)]
+        );
+        assert_eq!(
+            format(1, b'f', Some(2), false, Rounding::Upward)
+                .unwrap()
+                .body,
+            b"0.01"
+        );
+    }
+
+    #[test]
+    fn source_piece_ranges_cover_output() {
+        for bits in [
+            0,
+            1,
+            3,
+            0x3fd0000000000000,
+            0x3ff0000000000000,
+            0x4023000000000000,
+            0x7fefffffffffffff,
+        ] {
+            for conversion in *b"fega" {
+                for p in [None, Some(0), Some(1), Some(3), Some(20), Some(4096)] {
+                    for alternate in [false, true] {
+                        for rounding in [
+                            Rounding::NearestEven,
+                            Rounding::Upward,
+                            Rounding::Downward,
+                            Rounding::TowardZero,
+                        ] {
+                            let output =
+                                source_format(bits, conversion, p, alternate, rounding).unwrap();
+                            let mut rebuilt = output.value.body[..output.value.prefix_len].to_vec();
+                            for piece in output.pieces {
+                                match piece {
+                                    Piece::Print(range) => {
+                                        rebuilt.extend_from_slice(&output.value.body[range])
+                                    }
+                                    Piece::ZeroPad(count) => {
+                                        rebuilt.extend(std::iter::repeat_n(b'0', count))
+                                    }
+                                }
+                            }
+                            assert_eq!(rebuilt, output.value.body);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn source_hex_effects_preserve_flags_and_reject_unmodeled_controls() {
+        for mode in 0..4 {
+            let control = 0x1f80 | (mode << 13) | 1;
+            assert_eq!(
+                hex_effects(1.5f64.to_bits(), Some(0), control),
+                Ok(control | 32)
+            );
+            assert_eq!(hex_effects(1.5f64.to_bits(), Some(1), control), Ok(control));
+            assert_eq!(hex_effects(1, None, control), Ok(control | 2));
+            assert_eq!(hex_effects(3, Some(0), control), Ok(control | 34));
+            assert_eq!(
+                hex_effects(0x7ff0000000000001, Some(0), control),
+                Ok(control)
+            );
+        }
+        for control in [0x9f80, 0x1fc0, 0, 0x11f80] {
+            assert_eq!(
+                hex_effects(1.0f64.to_bits(), None, control),
+                Err(Error::Control)
+            );
         }
     }
 

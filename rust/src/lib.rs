@@ -14,6 +14,7 @@ pub mod printf_output;
 pub mod printf_float;
 pub mod printf_buffer;
 pub mod printf_spec;
+pub mod printf_render;
 pub mod legacy_cpu;
 pub mod payload;
 pub mod shift_flags;

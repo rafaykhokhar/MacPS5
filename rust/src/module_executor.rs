@@ -125,6 +125,132 @@ fn force_abort_default(
         _ => unreachable!("Second raise uses default disposition"),
     }
 }
+#[cfg(test)]
+mod vasprintf_dispatch_tests {
+    use super::*;
+    const SP: u64 = 0x1010;
+    const RET: u64 = 0x4455;
+    const OUT: u64 = 0x1020;
+    fn bytes(format: &[u8]) -> Vec<u8> {
+        let mut data = vec![0; 4096];
+        data[16..24].copy_from_slice(&RET.to_le_bytes());
+        data[32..40].copy_from_slice(&0xaabbccu64.to_le_bytes());
+        data[0x100..0x100 + format.len()].copy_from_slice(format);
+        data[0x204..0x208].copy_from_slice(&48u32.to_le_bytes());
+        data[0x210..0x218].copy_from_slice(&0x1300u64.to_le_bytes());
+        data[0x300..0x308].copy_from_slice(&13u64.to_le_bytes());
+        data[0x308..0x310].copy_from_slice(&0x1400u64.to_le_bytes());
+        data[0x400..0x403].copy_from_slice(b"ok\0");
+        data
+    }
+    #[test]
+    fn success_does_not_require_errno_and_publishes_owned_output() {
+        let mut data = bytes(b"%d/%s\0");
+        let mut owner = crate::guest_memory::OwnedMappings::default();
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut data, true, false).unwrap();
+        memory.attach_owned(&mut owner).unwrap();
+        assert_eq!(
+            vasprintf_service(&mut memory, [OUT, 0x1100, 0x1200], None, SP, RET).unwrap(),
+            5
+        );
+        let allocation = memory.load(OUT, 8).unwrap();
+        assert_eq!(memory.read(allocation, 6).unwrap(), b"13/ok\0");
+        assert_eq!(memory.load(0x1200, 4).unwrap(), 16);
+        assert_eq!(memory.load(SP, 8).unwrap(), RET);
+        memory.free(allocation).unwrap();
+        drop(memory);
+        assert_eq!(owner.bytes_allocated(), 0);
+    }
+    #[test]
+    fn initial_allocation_failure_precedes_format_read_and_orders_outputs() {
+        let mut data = bytes(b"\0");
+        let mut memory = Memory::default(); // No attached allocator: real ENOMEM.
+        memory.add(0x1000, &mut data, true, false).unwrap();
+        assert_eq!(
+            vasprintf_service(
+                &mut memory,
+                [OUT, u64::MAX, u64::MAX],
+                Some(OUT + 4),
+                SP,
+                RET
+            )
+            .unwrap(),
+            u32::MAX as u64
+        );
+        assert_eq!(memory.load(OUT, 8).unwrap(), 12u64 << 32);
+        assert_eq!(memory.load(SP, 8).unwrap(), RET);
+    }
+    #[test]
+    fn unsupported_format_frees_private_buffer_without_fabricating_errno() {
+        let mut data = bytes(b"%f\0");
+        let mut owner = crate::guest_memory::OwnedMappings::default();
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut data, true, false).unwrap();
+        memory.attach_owned(&mut owner).unwrap();
+        assert!(
+            vasprintf_service(&mut memory, [OUT, 0x1100, 0x1200], None, SP, RET)
+                .unwrap_err()
+                .contains("floating")
+        );
+        assert_eq!(memory.load(OUT, 8).unwrap(), 0xaabbcc);
+        assert_eq!(memory.load(0x1204, 4).unwrap(), 48);
+        drop(memory);
+        assert_eq!(owner.bytes_allocated(), 0);
+    }
+    #[test]
+    fn output_or_count_write_cannot_replace_live_return_address() {
+        let mut data = bytes(b"%n\0");
+        data[0x300..0x308].copy_from_slice(&SP.to_le_bytes());
+        let mut owner = crate::guest_memory::OwnedMappings::default();
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut data, true, false).unwrap();
+        memory.attach_owned(&mut owner).unwrap();
+        assert!(vasprintf_service(&mut memory, [SP, 0x1100, 0x1200], None, SP, RET).is_err());
+        assert_eq!(memory.load(0x1200, 4).unwrap(), 0);
+        assert!(vasprintf_service(&mut memory, [OUT, 0x1100, 0x1200], None, SP, RET).is_err());
+        assert_eq!(memory.load(0x1200, 4).unwrap(), 8); // Successful argument read is not rolled back.
+        assert_eq!(memory.load(SP, 8).unwrap(), RET);
+        drop(memory);
+        assert_eq!(owner.bytes_allocated(), 0);
+    }
+}
+fn vasprintf_service(
+    memory: &mut Memory<'_>,
+    arguments: [u64; 3],
+    errno: Option<u64>,
+    sp: u64,
+    ret: u64,
+) -> Result<u64> {
+    let [strp, format, va] = arguments;
+    let guard = |memory: &Memory<'_>, address, length| {
+        validate_net_output(memory, address, length, sp, ret)
+    };
+    let result = crate::printf_buffer::run(memory, strp, 65536, guard, |buffer| {
+        crate::printf_render::render(
+            buffer,
+            format,
+            va,
+            crate::printf_render::Options::default(),
+            guard,
+        )
+    });
+    match result {
+        Ok(length) => Ok(length as u32 as u64),
+        Err(error) => {
+            if error.cleanup.is_none() {
+                if let crate::printf_buffer::Kind::Allocation(code) = error.kind {
+                    let errno =
+                        errno.ok_or("Missing vasprintf allocation-failure errno context")?;
+                    let value =
+                        crate::printf_buffer::publish_failure(memory, strp, errno, code, guard)?;
+                    return Ok(value as u32 as u64);
+                }
+            }
+            Err(format!("Guest vasprintf fault: {error:?}"))
+        }
+    }
+}
 fn strdup_service(
     memory: &mut Memory<'_>,
     source: u64,
@@ -862,6 +988,7 @@ pub enum Service {
     Sprintf,
     Snprintf,
     Vsnprintf,
+    Vasprintf,
     Errno,
     Getpid,
     Syscall,
@@ -1078,6 +1205,7 @@ impl Service {
             | Self::Sprintf
             | Self::Snprintf
             | Self::Vsnprintf
+            | Self::Vasprintf
             | Self::Errno
             | Self::Getpid
             | Self::Syscall
@@ -4860,6 +4988,14 @@ impl NativeExecutor {
                         strdup_service(
                             &mut memory,
                             cpu.registers[7],
+                            self.kernel.as_ref().map(|kernel| kernel.errno_address()),
+                            sp,
+                            ret,
+                        )?
+                    } else if matches!(service, Service::Vasprintf) {
+                        vasprintf_service(
+                            &mut memory,
+                            [cpu.registers[7], cpu.registers[6], cpu.registers[2]],
                             self.kernel.as_ref().map(|kernel| kernel.errno_address()),
                             sp,
                             ret,

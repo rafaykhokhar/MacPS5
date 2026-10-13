@@ -102,11 +102,14 @@ impl Output {
             let vector = self.vectors[index].as_ref().expect("queued output vector");
             // __sprint clears vectors without calling __sfvwrite if residual
             // bytes are zero. Zero-length vectors never require guest access.
-            if !vector.is_empty() {
-                if let Err(error) = sink(vector) {
-                    self.poisoned = true;
-                    return Err(Error::Sink(error));
-                }
+            let result = if vector.is_empty() {
+                Ok(())
+            } else {
+                sink(vector)
+            };
+            if let Err(error) = result {
+                self.poisoned = true;
+                return Err(Error::Sink(error));
             }
             self.vectors[index] = None;
         }
