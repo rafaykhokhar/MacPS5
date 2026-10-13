@@ -5,6 +5,12 @@ use crate::{
     decode,
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
+fn immediate_shift(i: &Instruction) -> bool {
+    matches!(i.mnemonic(), Mnemonic::Shl | Mnemonic::Shr | Mnemonic::Sar)
+        && i.op0_kind() == OpKind::Register
+        && matches!(i.op0_register().size(), 4 | 8)
+        && i.op1_kind() == OpKind::Immediate8
+}
 fn arithmetic_supported(i: &Instruction) -> bool {
     if i.op0_kind() == OpKind::Memory
         && matches!(
@@ -131,6 +137,7 @@ pub(crate) fn translate_span(
             _ if i.is_jcc_short_or_near() || i.is_jmp_short_or_near() => {}
             Code::Call_rel32_64 | Code::Call_rm64 | Code::Jmp_rm64 => {}
             _ if arithmetic_supported(&i) => {}
+            _ if immediate_shift(&i) => {}
             _ => return Err(format!("Direct lowering unsupported: {:?}", i.code())),
         }
         offset += i.len();
@@ -234,6 +241,28 @@ pub(crate) fn translate_span(
         )?;
         c.emit(0xd1000529)?; // sub x9,x9,#1
         c.context_access(9, 19, 160, true, true)?;
+        if immediate_shift(i) {
+            let wide = i.op0_register().size() == 8;
+            let destination = register(i.op0_register(), wide)?;
+            let count = u64::from(i.immediate8()) & if wide { 63 } else { 31 };
+            c.context_access(1, 19, destination * 8, wide, false)?;
+            c.load_u64(2, count)?;
+            let (opcode, operation) = match i.mnemonic() {
+                Mnemonic::Shl => (0x1ac22023, 0),
+                Mnemonic::Shr => (0x1ac22423, 1),
+                Mnemonic::Sar => (0x1ac22823, 2),
+                _ => unreachable!(),
+            };
+            c.emit(opcode | if wide { 0x80000000 } else { 0 })?;
+            c.context_access(3, 19, destination * 8, true, true)?;
+            c.context_access(0, 19, 136, true, false)?;
+            c.load_u64(4, if wide { 64 } else { 32 })?;
+            c.load_u64(5, operation)?;
+            c.call_absolute(crate::shift_flags::native_ps5_shift_flags_v1 as *const () as u64)?;
+            c.context_access(0, 19, 136, true, true)?;
+            c.context_access(1, 19, 152, true, true)?;
+            continue;
+        }
         if matches!(
             i.code(),
             Code::Movzx_r32_rm8 | Code::Movzx_r64_rm8 | Code::Movzx_r32_rm16 | Code::Movzx_r64_rm16

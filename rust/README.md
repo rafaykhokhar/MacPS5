@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct immediate SHL/SHR/SAR now handles 32/64-bit registers with x86 count
+masking and flag semantics. 294918 native cases pass; configured startup advances
+to a SETNE gap in the block at 0x2ca0. See
+[shift evidence](../docs/status/TRANSLATOR_READINESS.md#direct-immediate-register-shifts).
+
 Direct MOVZX now zero-extends byte/word register or guarded memory sources into
 32/64-bit destinations. 24608 native cases pass; configured startup's next
 unsupported form is an immediate left shift in the block at 0x215e. See

@@ -983,3 +983,25 @@ The span has moved past MOVZX during translation but has not executed as a whole
 The startup process exits 1; `/tmp/macps5-movzx-startup.log` records the result.
 Use the preceding standalone build flags for this verifier and the configured
 startup command to reproduce. Bootstrap and gameplay remain incomplete.
+
+## Direct immediate register shifts
+
+Direct immediate/implicit-one SHL, SHR and SAR now support 32/64-bit register
+operands. Counts are masked to five or six bits before ARM64 variable-shift
+execution; the existing shift flag helper preserves zero-count flags and the
+runtime's undefined-AF/multi-bit-OF policy. Results at 32 bits zero-extend their
+containing register. CL-count, memory and byte/word shift forms remain unsupported
+in this direct path.
+
+`direct_shift_native.rs` passes 294918 native checks with a single-bit iterative
+result/flag oracle: all 256 immediate counts, three operations, both widths,
+all registers, selected signed/unsigned edge values, incoming flag patterns,
+implicit-one encoding and fuel/prior faults. 687 library tests, three integration
+tests, strict Clippy, release build and the strict-warning native verifier pass.
+
+The configured startup probe then exits 1 at its next explicit unsupported form:
+`Translation miss at 0x10002ca0 (bias 0x10000000): Direct lowering unsupported: Setne_rm8`.
+This is process 67206; `/tmp/macps5-shift-startup.log` records the result. The
+first real dlsym boundary is still reached, but complete bootstrap/gameplay is
+not established. Reproduce the standalone verifier using the release rlib flags
+above and no arguments; rerun `--direct-startup` for the real-file boundary.
