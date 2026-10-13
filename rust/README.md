@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct C7 immediate MOV32/64 now handles register and guarded memory destinations.
+23042 native cases pass. The raw homebrew probe advances to a guarded indirect
+call read fault at 0x3c1, with 3212 JIT bytes; it lacks startup arguments and a
+callback table. See [constant MOV evidence](../docs/status/TRANSLATOR_READINESS.md#direct-immediate-mov-stores).
+
 Direct ADD/SUB/CMP/AND/OR/XOR32/64 now accept guarded memory source operands.
 196608 native cases pass. The raw homebrew probe executes its initial entry
 block and reaches an immediate-to-memory MOV translation blocker at 0x3a0,

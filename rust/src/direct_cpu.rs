@@ -90,6 +90,7 @@ pub(crate) fn translate_span(
             Code::Push_r64 | Code::Pop_r64 => {}
             Code::Lea_r32_m | Code::Lea_r64_m => {}
             Code::Mov_r32_imm32 | Code::Mov_r64_imm64 => {}
+            Code::Mov_rm32_imm32 | Code::Mov_rm64_imm32 => {}
             Code::Mov_r32_rm32 | Code::Mov_rm32_r32 | Code::Mov_r64_rm64 | Code::Mov_rm64_r64 => {}
             _ if i.is_jcc_short_or_near() || i.is_jmp_short_or_near() => {}
             Code::Call_rel32_64 | Code::Call_rm64 | Code::Jmp_rm64 => {}
@@ -197,6 +198,36 @@ pub(crate) fn translate_span(
         )?;
         c.emit(0xd1000529)?; // sub x9,x9,#1
         c.context_access(9, 19, 160, true, true)?;
+        if matches!(i.code(), Code::Mov_rm32_imm32 | Code::Mov_rm64_imm32) {
+            let wide = i.code() == Code::Mov_rm64_imm32;
+            let value = if wide {
+                i.immediate32to64() as u64
+            } else {
+                u64::from(i.immediate32())
+            };
+            if i.op0_kind() == OpKind::Register {
+                c.load_u64(9, value)?;
+                c.context_access(9, 19, register(i.op0_register(), wide)? * 8, true, true)?;
+            } else {
+                memory_address(&mut c, i)?;
+                c.emit(0xaa1303e0)?; // mov x0,x19
+                c.load_u64(2, value)?;
+                c.load_u64(3, if wide { 8 } else { 4 })?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_store_v1 as *const () as u64,
+                )?;
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+            }
+            continue;
+        }
         if matches!(i.code(), Code::Lea_r32_m | Code::Lea_r64_m) {
             let wide = i.code() == Code::Lea_r64_m;
             memory_address(&mut c, i)?;

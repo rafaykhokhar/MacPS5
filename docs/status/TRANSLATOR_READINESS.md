@@ -791,3 +791,27 @@ imports, dependencies or process setup; the result proves bounded direct entry
 progress only, not initialized homebrew or gameplay. Reproduce the new verifier
 with the release rlib/dependency flags above and no arguments; the existing
 ELF probe reproduces the real-file boundary.
+
+## Direct immediate MOV stores
+
+Direct C7 `MOV r/m32,imm32` and `MOV r/m64,imm32` now support register and memory
+destinations. The 64-bit form sign-extends the immediate; the 32-bit register
+form zero-extends its result. Memory destinations use guarded stores, stop on
+faults and preserve registers/flags. Byte/word stores remain unsupported here.
+
+`direct_mov_constant_native.rs` passes 23042 native cases: all register/base
+operands, signed boundary constants, alignment and mapping boundaries, read-only
+destinations, fuel and prior faults. RIP-relative stores explicitly check that
+the effective address uses the end of the whole instruction, including its
+immediate. 687 library tests, three integration tests, strict Clippy, release
+build and the initial 23040-case verifier pass (40506, exit 0). The final verifier
+with RIP cases, memory-MOV and automatic translation regressions pass (99078,
+exit 0). Use the release rlib/dependency flags above to reproduce; no arguments.
+
+The same raw homebrew probe now publishes 3212 JIT bytes, loads zero dylibs and
+stops with guest read fault 1 at 0x3c1. Decoding 0x3a0 onward shows `CALL [RBX]`
+there; the function assigned RBX from incoming RDI at 0x3a6. The raw probe passes
+default arguments and supplies no startup callback table, imports or process
+setup. This fault is therefore a runtime-setup boundary to investigate with the
+configured startup path, not evidence that another instruction must be stubbed.
+Homebrew initialization and PS5 gameplay remain unverified on this backend.
