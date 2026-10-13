@@ -12,6 +12,7 @@ mod direct_memory_native;
 mod equeue_native;
 mod exit_native;
 mod fma213_native;
+mod fma231_native;
 mod ime_native;
 mod keyboard_native;
 mod libc_memory_native;
@@ -224,6 +225,7 @@ fn main() -> Result<(), String> {
         scheduler_native::verify(Path::new(&archive), Path::new(&directory))?;
         vmulsd_native::verify(Path::new(&archive), Path::new(&directory))?;
         fma213_native::verify(Path::new(&archive), Path::new(&directory))?;
+        fma231_native::verify(Path::new(&archive), &Path::new(&directory).join("fma231"))?;
         thread_services_native::verify(Path::new(&archive), Path::new(&directory))?;
         thread_module_native::verify(Path::new(&archive), Path::new(&directory))?;
         thread_name_native::verify(Path::new(&archive), Path::new(&directory))?;

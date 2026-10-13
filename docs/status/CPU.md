@@ -1,5 +1,44 @@
 # CPU completion criteria
 
+## Scalar fused multiply-add 231 ordering
+
+VEX VFMADD231SD now lowers through the existing exact fused binary64 helper,
+with its inputs reordered to compute explicit-register source times final source
+plus old destination. NaN payload priority follows that same arithmetic order;
+any signaling NaN still raises invalid. The destination's old bits127:64 are
+preserved and bits255:128 cleared. Aliased inputs are captured before commit.
+Memory forms guard exactly eight bytes before arithmetic. The existing 213
+form remains supported; 132 and other unimplemented forms remain rejected.
+
+Reference: [Intel SDM Volume 1](https://cdrdv2-public.intel.com/843827/253665-sdm-vol-1-dec-24.pdf)
+§14.5.1–2, Table14-17, printed14-22–24, and TableD-18, printedD-15.
+The latter gates new precision status when overflow/underflow is unmasked;
+preexisting sticky flags remain set. Intel's explicit upper-lane preservation
+rule is used rather than the conflicting AMD rev.3.24 p.620 text.
+
+The matching build passes 647 library tests, three integration tests, strict
+Clippy and release compilation (`work/fma231-native/{tests,clippy,release}.log`,
+process 62384 exit 0). The [native verifier](../../rust/verification/fma231_native.rs)
+passes 14,202 checks across 24 decoded fixtures using exact small-integer
+arithmetic and independently specified fused cancellation, rounding, NaN payload,
+DAZ/FTZ and exception vectors. It covers aliases/high registers/LIG, preserved
+high64/cleared upper128, readonly high/unaligned/RIP inputs, every short span,
+reserved controls, memory-fault precedence and preserved flags/GPR/x87/fuel.
+The existing 213 native regression also passes (`work/fma231-native/native.log`,
+process 30507 exit 0). An initial verifier expectation incorrectly included new
+precision status on unmasked overflow; it was corrected against TableD-18,
+without changing the arithmetic helper. These are selected floating-point
+checks, not exhaustive arithmetic or architectural exception-delivery proof.
+
+Discovery reaches 56,950 instructions and 12,954 blocks with 163 unsupported
+sites: the former 231 stop is removed and a later stop exposed (process 8533
+exit 0). These counts do not establish CPU coverage. The entry runner compiles
+with warnings denied; its startup-only run still stops at missing `fscanf`,
+with ten accepted dependencies, 20,288 owned dependency bytes and pending cleanup.
+Game main has not executed (`work/fma231-native/entry.log`, process 89926 exit 0).
+No full GPU suite was run for this CPU change. Production readiness and retail
+gameplay remain unverified.
+
 ## Packed low/high interleaving
 
 VEX VPUNPCKL/H BW, WD, DQ and QDQ now support XMM/YMM register and memory

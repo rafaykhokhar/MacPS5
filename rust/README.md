@@ -1,5 +1,11 @@
 # Rust migration
 
+VEX VFMADD231SD now uses the existing exact fused arithmetic helper with audited
+operand/NaN ordering. The matching build passes 647 library tests, three
+integration tests, strict Clippy, 14,202 native checks and the existing FMA213
+regression. Discovery reaches 56,950 instructions. See [CPU evidence](../docs/status/CPU.md).
+Production readiness and retail gameplay remain unverified.
+
 VEX packed low/high interleaving now covers byte/word/dword/qword elements in
 XMM/YMM operands. The matching build passes 646 library tests, three integration
 tests, strict Clippy and 23,232 native checks. Discovery reaches 56,949 instructions;

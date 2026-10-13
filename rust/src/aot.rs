@@ -975,25 +975,42 @@ impl Emitter {
                 self.emit("ldr w20, [x19, #200]");
                 self.write(i, 0, 32, 20)?;
             }
-            M::Vfmadd213sd => {
-                if i.code() != iced_x86::Code::VEX_Vfmadd213sd_xmm_xmm_xmmm64 {
-                    return Err("Only VEX VFMADD213SD is implemented".into());
-                }
+            M::Vfmadd213sd | M::Vfmadd231sd => {
+                let add_old = match i.code() {
+                    iced_x86::Code::VEX_Vfmadd213sd_xmm_xmm_xmmm64 => false,
+                    iced_x86::Code::VEX_Vfmadd231sd_xmm_xmm_xmmm64 => true,
+                    _ => return Err("Only VEX VFMADD213SD/231SD is implemented".into()),
+                };
                 let dst = vector(i.op_register(0))?;
                 let first = vector(i.op_register(1))?;
                 if i.op_kind(2) == OpKind::Register {
                     let second = vector(i.op_register(2))?;
                     self.emit(format!("ldr x20, [x19, #{}]", 208 + second * 32));
                 } else {
+                    if i.memory_base() == R::None
+                        && i.memory_index() == R::None
+                        && i.memory_displ_size() != 8
+                    {
+                        return Err("32-bit absolute addressing is not implemented".into());
+                    }
                     self.read(i, 2, 64, 20)?;
                 }
-                // Intel VFMADD213SD: (old destination * source1) + source2,
-                // with one rounding. Bits127:64 preserve the OLD destination.
-                // Snapshot every aliased source before any destination commit.
+                // The shared helper gives NaN priority x2, x1, x3. Match the
+                // encoded arithmetic order, including noncommutative NaNs:
+                // 213: explicit register * old destination + final operand;
+                // 231: explicit register * final operand + old destination.
+                // Bits127:64 preserve OLD destination, including aliases.
                 self.emit(format!(
-                    "ldr x21, [x19, #{}]\nldr x1, [x19, #{}]\nldr x2, [x19, #{}]\nmov x3, x20\nmov x0, x19\nbl _native_ps5_fma213_binary64_v1",
-                    216 + dst * 32, 208 + dst * 32, 208 + first * 32
+                    "ldr x21, [x19, #{}]\nldr x2, [x19, #{}]",
+                    216 + dst * 32,
+                    208 + first * 32
                 ));
+                if add_old {
+                    self.emit(format!("mov x1, x20\nldr x3, [x19, #{}]", 208 + dst * 32));
+                } else {
+                    self.emit(format!("ldr x1, [x19, #{}]\nmov x3, x20", 208 + dst * 32));
+                }
+                self.emit("mov x0, x19\nbl _native_ps5_fma213_binary64_v1");
                 self.fault();
                 self.emit(format!(
                     "str x0, [x19, #{}]\nstr x21, [x19, #{}]\nstr xzr, [x19, #{}]\nstr xzr, [x19, #{}]",
@@ -2572,6 +2589,21 @@ mod vmulsd_tests {
 mod fma213_tests {
     use super::*;
     #[test]
+    fn fma231_exact_form_and_absolute_address_guard() {
+        for bytes in [
+            &[0xc4, 0xe2, 0xe1, 0xb9, 0xe2][..],
+            &[0xc4, 0xe2, 0xe1, 0xb9, 0x27][..],
+        ] {
+            let i = decode::instruction(bytes, 0).unwrap();
+            assert_eq!(i.code(), iced_x86::Code::VEX_Vfmadd231sd_xmm_xmm_xmmm64);
+            assert!(supported(&i).is_ok());
+        }
+        for opcode in [0xa9, 0xb9] {
+            let bytes = [0x67, 0xc4, 0xe2, 0xe1, opcode, 0x24, 0x25, 0, 0, 0, 0];
+            assert!(translate_rust_memory_region(&bytes, 0, "address").is_err());
+        }
+    }
+    #[test]
     fn exact_fma213_scalar_vex_forms() {
         for bytes in [
             &[0xc4, 0xe2, 0xe1, 0xa9, 0xe2][..],
@@ -2584,7 +2616,6 @@ mod fma213_tests {
         }
         for bytes in [
             &[0xc4, 0xe2, 0xe1, 0x99, 0xe2][..],
-            &[0xc4, 0xe2, 0xe1, 0xb9, 0xe2][..],
             &[0xc4, 0xe2, 0x61, 0xa9, 0xe2][..],
         ] {
             assert!(translate_rust_memory_region(bytes, 0, "unsupported_fma").is_err());
