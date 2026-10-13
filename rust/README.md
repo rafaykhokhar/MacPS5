@@ -1,5 +1,14 @@
 # Rust migration
 
+The C/POSIX `mbrlen` service passes 4,238 native direct and actual guest-wrapper
+checks (`work/mbrlen-native/native.log`). The matching build passes 507 library
+tests, three integration tests and strict Clippy. Startup discovery resolves
+`mbrlen` and reaches missing `mbtowc` with 19,568 owned dependency bytes
+(`work/arm64-prototype/mbrlen-entry.log`). Updated startup-only import-slot and
+ownership assertions pass (`work/arm64-prototype/mbrlen-verified.log`, 60640
+exit0). That run skips component and Metal checks; game main has not executed.
+See [conversion status](../docs/status/MULTIBYTE.md).
+
 The current release passes 65,579 native ARM64 `VPBROADCASTD` checks and 140
 direct/actual-wrapper C/POSIX `wcsxfrm` checks. Both verifiers are registered in
 the full entry runner. See [CPU evidence](../docs/status/CPU.md) and
