@@ -135,6 +135,28 @@ pub struct MkdirPlan {
     revision: u64,
     owner: Rc<()>,
 }
+/// Prepared namespace replacement. Rc file contents remain shared, but no
+/// destination link count changes until an owner/revision-checked commit.
+pub struct RenamePlan {
+    files: BTreeMap<Vec<u8>, Rc<FileBacking>>,
+    directories: BTreeMap<Vec<u8>, Directory>,
+    victim: Option<Rc<FileBacking>>,
+    moved: Option<(Vec<u8>, Vec<u8>)>,
+    replaced_directory: Option<Vec<u8>>,
+    changed: bool,
+    revision: u64,
+    owner: Rc<()>,
+}
+impl RenamePlan {
+    pub fn moved_directory(&self) -> Option<(&[u8], &[u8])> {
+        self.moved
+            .as_ref()
+            .map(|(old, new)| (old.as_slice(), new.as_slice()))
+    }
+    pub fn replaced_directory(&self) -> Option<&[u8]> {
+        self.replaced_directory.as_deref()
+    }
+}
 pub struct Files {
     files: BTreeMap<Vec<u8>, Rc<FileBacking>>,
     quota: Rc<Quota>,
@@ -479,6 +501,227 @@ impl Files {
         self.revision = revision;
         Ok(())
     }
+    // DELETE/RENAME lookup differs from ordinary lookup: terminal dot/dotdot
+    // fail before looking up that final component, while trailing slash type
+    // checks follow parent mutation permissions. Do not lose either spelling.
+    fn rename_lookup(
+        &self,
+        path: &[u8],
+        cwd: Option<&[u8]>,
+    ) -> std::result::Result<(Vec<u8>, bool), u32> {
+        if path.is_empty() {
+            return Err(2);
+        }
+        if path.len() >= PATH_MAX || path.contains(&0) {
+            return Err(63);
+        }
+        let end = path
+            .iter()
+            .rposition(|&b| b != b'/')
+            .map(|i| i + 1)
+            .ok_or(21u32)?;
+        let plain = &path[..end];
+        let start = plain
+            .iter()
+            .rposition(|&b| b == b'/')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        if matches!(&plain[start..], b"." | b"..") {
+            let prefix = if start == 0 {
+                let cwd = cwd.ok_or(2u32)?;
+                self.resolve(cwd.strip_suffix(&[0]).unwrap_or(cwd), None)?
+            } else {
+                self.resolve(&plain[..start], cwd)?
+            };
+            let prefix = trimmed(&prefix);
+            if !self.directories.contains_key(prefix) {
+                return Err(if self.files.contains_key(prefix) {
+                    20
+                } else {
+                    2
+                });
+            }
+            return Err(22);
+        }
+        Ok((self.resolve(plain, cwd)?, end != path.len()))
+    }
+    fn rename_parent_access(&self, path: &[u8]) -> std::result::Result<(), u32> {
+        let directory = self.directories.get(parent(path)).ok_or(2u32)?;
+        if directory.read_only {
+            return Err(30);
+        }
+        if !self.access(directory, 3) {
+            return Err(13);
+        }
+        Ok(())
+    }
+    fn rename_source(
+        &self,
+        old: &[u8],
+        cwd: Option<&[u8]>,
+    ) -> std::result::Result<(Vec<u8>, bool), u32> {
+        let (resolved, trailing) = self.rename_lookup(old, cwd)?;
+        let directory = self.directories.contains_key(&resolved);
+        if !directory && !self.files.contains_key(&resolved) {
+            return Err(2);
+        }
+        self.rename_parent_access(&resolved)?;
+        if trailing && !directory {
+            return Err(20);
+        }
+        Ok((resolved, directory))
+    }
+    /// Kernel reads the source guest path and performs this preflight before
+    /// reading the destination guest path, matching rename's ordered namei calls.
+    pub(crate) fn check_rename_source(
+        &self,
+        old: &[u8],
+        cwd: Option<&[u8]>,
+    ) -> std::result::Result<(), u32> {
+        self.rename_source(old, cwd).map(|_| ())
+    }
+    /// Source-audited FreeBSD11.4 rename within the existing virtual profile.
+    /// No hardlinks, symlinks, mount boundaries, sticky modes, inode flags, ACLs
+    /// or privilege bypass are added. Readonly-directory policy is per-node.
+    /// A cross-parent directory move needs write access to that directory to
+    /// change its logical '..'. Input paths retain PATH_MAX checks, but moving
+    /// an ancestor may produce longer stored descendant names, as on a real FS.
+    /// The kernel must prepare any pathname-based cwd update before committing.
+    /// https://raw.githubusercontent.com/freebsd/freebsd-src/releng/11.4/sys/kern/vfs_syscalls.c
+    /// https://raw.githubusercontent.com/freebsd/freebsd-src/releng/11.4/sys/ufs/ufs/ufs_vnops.c
+    /// https://raw.githubusercontent.com/freebsd/freebsd-src/releng/11.4/sys/kern/vfs_lookup.c
+    pub fn plan_rename(
+        &self,
+        old: &[u8],
+        new: &[u8],
+        cwd: Option<&[u8]>,
+    ) -> std::result::Result<RenamePlan, u32> {
+        let (old, source_directory) = self.rename_source(old, cwd)?;
+        let (new, trailing) = self
+            .rename_lookup(new, cwd)
+            .map_err(|e| if e == 21 && source_directory { 22 } else { e })?;
+        let target_directory = self.directories.contains_key(&new);
+        let target_file = self.files.contains_key(&new);
+        self.rename_parent_access(&new)?;
+        if trailing && !target_directory {
+            if target_file {
+                return Err(20);
+            }
+            if !source_directory {
+                return Err(2);
+            }
+        }
+        if source_directory && target_file {
+            return Err(20);
+        }
+        if !source_directory && target_directory {
+            return Err(21);
+        }
+        let changed = old != new;
+        // Both lookups and their delete/create permission checks precede the
+        // same-inode success. No source name is fabricated for a missing path.
+        if changed && source_directory {
+            if old == parent(&new) {
+                return Err(22);
+            }
+            if parent(&old) != parent(&new) {
+                let source = self
+                    .directories
+                    .get(&old)
+                    .expect("Checked source directory");
+                if source.read_only {
+                    return Err(30);
+                }
+                if !self.access(source, 2) {
+                    return Err(13);
+                }
+                if descendant(&new, &old) {
+                    return Err(22);
+                }
+            }
+            if target_directory
+                && self
+                    .files
+                    .keys()
+                    .chain(self.directories.keys())
+                    .any(|child| child.as_slice() != new && parent(child) == new.as_slice())
+            {
+                return Err(66);
+            }
+        }
+        if changed {
+            self.revision.checked_add(1).ok_or(28u32)?;
+        }
+        let mut plan = RenamePlan {
+            files: self.files.clone(),
+            directories: self.directories.clone(),
+            victim: None,
+            moved: None,
+            replaced_directory: None,
+            changed,
+            revision: self.revision,
+            owner: self.owner.clone(),
+        };
+        if !changed {
+            return Ok(plan);
+        }
+        if source_directory {
+            if target_directory {
+                plan.directories
+                    .remove(&new)
+                    .expect("Checked target directory");
+                plan.replaced_directory = Some(new.clone());
+            }
+            // Construct all remapped names before touching the live namespace.
+            // Rc clones preserve descriptor identity and concurrent content edits.
+            for path in self
+                .directories
+                .keys()
+                .filter(|path| path.as_slice() == old || descendant(path, &old))
+            {
+                let renamed = renamed_path(path, &old, &new);
+                let directory = plan
+                    .directories
+                    .remove(path)
+                    .expect("Owned moved directory");
+                plan.directories.insert(renamed, directory);
+            }
+            for path in self.files.keys().filter(|path| descendant(path, &old)) {
+                let renamed = renamed_path(path, &old, &new);
+                let file = plan.files.remove(path).expect("Owned moved file");
+                plan.files.insert(renamed, file);
+            }
+            let from = plan.directories.get_mut(parent(&old)).ok_or(22u32)?;
+            from.links = from.links.checked_sub(1).filter(|&n| n >= 2).ok_or(22u32)?;
+            if !target_directory {
+                let to = plan.directories.get_mut(parent(&new)).ok_or(22u32)?;
+                to.links = to.links.checked_add(1).ok_or(31u32)?;
+            }
+            plan.moved = Some((old, new));
+        } else {
+            let file = plan.files.remove(&old).expect("Checked source file");
+            plan.victim = plan.files.insert(new, file);
+        }
+        Ok(plan)
+    }
+    pub fn commit_rename(&mut self, plan: RenamePlan) -> std::result::Result<(), u32> {
+        if !Rc::ptr_eq(&self.owner, &plan.owner) || self.revision != plan.revision {
+            return Err(22);
+        }
+        if !plan.changed {
+            return Ok(());
+        }
+        let revision = self.revision.checked_add(1).ok_or(28u32)?;
+        // Only the destination loses its namespace link. The source backing is
+        // shared between maps, so open descriptor identity/content is preserved.
+        if let Some(victim) = plan.victim {
+            victim.links.set(0);
+        }
+        self.files = plan.files;
+        self.directories = plan.directories;
+        self.revision = revision;
+        Ok(())
+    }
     /// Register owned contents at a canonical absolute guest path. Missing
     /// ancestors become real searchable readonly virtual directory nodes.
     pub fn register(&mut self, path: &[u8], bytes: Vec<u8>) -> Result<()> {
@@ -684,6 +927,14 @@ impl Files {
         Ok(0)
     }
 }
+fn descendant(path: &[u8], directory: &[u8]) -> bool {
+    path.starts_with(directory) && path.get(directory.len()) == Some(&b'/')
+}
+fn renamed_path(path: &[u8], old: &[u8], new: &[u8]) -> Vec<u8> {
+    let mut renamed = new.to_vec();
+    renamed.extend_from_slice(&path[old.len()..]);
+    renamed
+}
 fn trimmed(path: &[u8]) -> &[u8] {
     if path.len() > 1 {
         path.strip_suffix(b"/").unwrap_or(path)
@@ -729,6 +980,194 @@ pub(crate) fn read_path(user: &Memory<'_>, address: u64) -> std::result::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rename_replacement_preserves_source_and_retains_unlinked_destination_until_close() {
+        let mut files = Files::default();
+        files.allow_create_directory(b"/save").unwrap();
+        files
+            .register_writable(b"/save/a", b"abc".to_vec())
+            .unwrap();
+        files
+            .register_writable(b"/save/b", b"defg".to_vec())
+            .unwrap();
+        let source = files.backing(b"/save/a").unwrap();
+        let victim = files.backing(b"/save/b").unwrap();
+        let plan = files.plan_rename(b"a", b"b", Some(b"/save\0")).unwrap();
+        assert!(plan.moved_directory().is_none());
+        assert!(plan.replaced_directory().is_none());
+        assert_eq!(victim.stat()[10..12], [1, 0]);
+        assert!(Rc::ptr_eq(&files.backing(b"/save/a").unwrap(), &source));
+        assert!(Rc::ptr_eq(&files.backing(b"/save/b").unwrap(), &victim));
+        source.state.borrow_mut().bytes[0] = b'A'; // contents remain shared after planning
+        files.commit_rename(plan).unwrap();
+        assert!(matches!(files.backing(b"/save/a"), Err(2)));
+        let renamed = files.backing(b"/save/b").unwrap();
+        assert!(Rc::ptr_eq(&renamed, &source));
+        assert_eq!(&*renamed.state.borrow().bytes, b"Abc");
+        assert_eq!(renamed.stat()[10..12], [1, 0]);
+        assert_eq!(victim.stat()[10..12], [0, 0]);
+        assert_eq!(&*victim.state.borrow().bytes, b"defg");
+        assert_eq!(files.content_bytes(), 7);
+        drop(victim);
+        assert_eq!(files.content_bytes(), 3);
+    }
+    #[test]
+    fn rename_plans_are_discardable_and_reject_stale_or_foreign_publication() {
+        let mut files = Files::default();
+        files.allow_create_directory(b"/save").unwrap();
+        files.register(b"/save/a", vec![1]).unwrap();
+        files.register(b"/save/b", vec![2, 3]).unwrap();
+        let victim = files.backing(b"/save/b").unwrap();
+        drop(files.plan_rename(b"/save/a", b"/save/b", None).unwrap());
+        assert_eq!(victim.stat()[10..12], [1, 0]);
+        let foreign = files.plan_rename(b"/save/a", b"/save/b", None).unwrap();
+        assert_eq!(Files::default().commit_rename(foreign), Err(22));
+        let stale = files.plan_rename(b"/save/a", b"/save/b", None).unwrap();
+        files.register(b"/save/c", vec![4]).unwrap();
+        assert_eq!(files.commit_rename(stale), Err(22));
+        assert_eq!(victim.stat()[10..12], [1, 0]);
+        assert_eq!(files.content_bytes(), 4);
+        assert_eq!(
+            &*files.backing(b"/save/a").unwrap().state.borrow().bytes,
+            &[1]
+        );
+        assert!(Rc::ptr_eq(&files.backing(b"/save/b").unwrap(), &victim));
+    }
+    #[test]
+    fn rename_directory_subtree_preserves_identities_metadata_and_parent_links() {
+        let mut files = Files::default();
+        for path in [
+            &b"/save"[..],
+            b"/save/from",
+            b"/save/to",
+            b"/save/from/tree",
+            b"/save/from/tree/sub",
+            b"/save/to/empty",
+        ] {
+            files.allow_create_directory(path).unwrap();
+        }
+        files
+            .register(b"/save/from/tree/sub/data", vec![9])
+            .unwrap();
+        let file = files.backing(b"/save/from/tree/sub/data").unwrap();
+        let tree = files.stat_record(b"/save/from/tree").unwrap();
+        let sub = files.stat_record(b"/save/from/tree/sub").unwrap();
+        let plan = files
+            .plan_rename(b"/save/from/tree", b"/save/to/empty/", None)
+            .unwrap();
+        assert_eq!(
+            plan.moved_directory(),
+            Some((b"/save/from/tree".as_slice(), b"/save/to/empty".as_slice()))
+        );
+        assert_eq!(
+            plan.replaced_directory(),
+            Some(b"/save/to/empty".as_slice())
+        );
+        files.commit_rename(plan).unwrap();
+        assert_eq!(files.stat_record(b"/save/to/empty").unwrap(), tree);
+        assert_eq!(files.stat_record(b"/save/to/empty/sub").unwrap(), sub);
+        assert!(Rc::ptr_eq(
+            &files.backing(b"/save/to/empty/sub/data").unwrap(),
+            &file
+        ));
+        assert_eq!(files.stat_record(b"/save/from").unwrap()[10..12], [2, 0]);
+        assert_eq!(files.stat_record(b"/save/to").unwrap()[10..12], [3, 0]);
+        assert!(matches!(files.stat_record(b"/save/from/tree"), Err(2)));
+        let plan = files
+            .plan_rename(b"/save/to/empty", b"/save/to/new///", None)
+            .unwrap();
+        assert!(plan.replaced_directory().is_none());
+        files.commit_rename(plan).unwrap();
+        assert_eq!(files.stat_record(b"/save/to").unwrap()[10..12], [3, 0]);
+        files.allow_create_directory(b"/save/to/other").unwrap();
+        let plan = files
+            .plan_rename(b"/save/to/new", b"/save/to/other", None)
+            .unwrap();
+        files.commit_rename(plan).unwrap();
+        assert_eq!(files.stat_record(b"/save/to").unwrap()[10..12], [3, 0]);
+    }
+    #[test]
+    fn rename_errors_and_noop_require_ordered_lookup_permissions_and_type_checks() {
+        let mut files = Files::default();
+        for path in [&b"/save"[..], b"/save/dir", b"/save/full", b"/save/dir/sub"] {
+            files.allow_create_directory(path).unwrap();
+        }
+        files.register(b"/save/file", vec![1]).unwrap();
+        files.register(b"/save/full/data", vec![2]).unwrap();
+        files.register(b"/rom/file", vec![3]).unwrap();
+        for (old, new, error) in [
+            (&b"/absent"[..], &b"/also_absent"[..], 2),
+            (b"/rom/file", b"/rom/file", 30),
+            (b"/save/file", b"/save/dir", 21),
+            (b"/save/dir", b"/save/file", 20),
+            (b"/save/dir", b"/save/full", 66),
+            (b"/save/dir", b"/save/dir/sub/new", 22),
+            (b"/save/dir", b"/save/dir/new", 22),
+            (b"/save/file", b"/save/absent/", 2),
+            (b"/save/file", b"/save/file/", 20),
+            (b"/save/file/", b"/save/new", 20),
+            (b"/save/.", b"/save/new", 22),
+            (b"/save/..", b"/save/new", 22),
+            (b"/save/file", b"/save/.", 22),
+            (b"/save/file", b"/save/..", 22),
+            (b"/", b"/save/new", 21),
+            (b"/save/file", b"/", 21),
+            (b"/save/dir", b"/", 22),
+        ] {
+            let before = files.revision;
+            assert!(
+                matches!(files.plan_rename(old,new,None),Err(e) if e == error),
+                "{old:?} -> {new:?}: expected {error}"
+            );
+            assert_eq!(files.revision, before);
+            assert_eq!(files.content_bytes(), 3);
+        }
+        let before = files.revision;
+        let plan = files
+            .plan_rename(b"/save/dir/../file", b"/save/file", None)
+            .unwrap();
+        assert!(plan.moved_directory().is_none());
+        assert!(plan.replaced_directory().is_none());
+        files.commit_rename(plan).unwrap();
+        assert_eq!(files.revision, before);
+        files
+            .register_directory(b"/save/dir", 0o555, false)
+            .unwrap();
+        assert!(matches!(
+            files.plan_rename(b"/save/dir", b"/save/full/new", None),
+            Err(13)
+        ));
+        files.register_directory(b"/save", 0o555, false).unwrap();
+        assert_eq!(files.check_rename_source(b"/save/file/", None), Err(13)); // access precedes trailing type
+        files.register_directory(b"/save/dir", 0, false).unwrap();
+        assert_eq!(files.check_rename_source(b"/save/dir/.", None), Err(22)); // namei rejects before final search
+    }
+    #[test]
+    fn renamed_descendant_keys_can_exceed_pathmax_without_rejecting_valid_inputs() {
+        let mut files = Files::default();
+        files.allow_create_directory(b"/save").unwrap();
+        files.allow_create_directory(b"/save/a").unwrap();
+        let mut leaf = b"/save/a".to_vec();
+        for _ in 0..3 {
+            leaf.push(b'/');
+            leaf.extend_from_slice(&[b'x'; 250]);
+            files.allow_create_directory(&leaf).unwrap();
+        }
+        leaf.extend_from_slice(b"/data");
+        files.register(&leaf, vec![4]).unwrap();
+        let backing = files.backing(&leaf).unwrap();
+        let mut destination = b"/save/".to_vec();
+        destination.extend_from_slice(&[b'y'; 250]);
+        files.allow_create_directory(&destination).unwrap();
+        destination.push(b'/');
+        destination.extend_from_slice(&[b'z'; 250]);
+        let plan = files.plan_rename(b"/save/a", &destination, None).unwrap();
+        files.commit_rename(plan).unwrap();
+        let new_leaf = renamed_path(&leaf, b"/save/a", &destination);
+        assert!(new_leaf.len() >= PATH_MAX);
+        assert!(Rc::ptr_eq(files.files.get(&new_leaf).unwrap(), &backing));
+        assert_eq!(files.content_bytes(), 1);
+    }
     #[test]
     fn unlink_retains_open_backing_inode_zero_links_and_quota_until_last_close() {
         let mut files = Files::default();

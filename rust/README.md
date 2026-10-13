@@ -1,5 +1,14 @@
 # Rust migration
 
+Guest `Rename` now prepares atomic namespace replacements, preserving source
+inodes and open destination descriptors. Directory moves preserve subtrees and
+update the pathname-based cwd together with namespace publication. The matching
+build passes 565 library tests, three integration tests and strict Clippy; native
+M_rename and remove regressions pass. Retained cwd-directory handles and broader
+filesystem features remain incomplete. See [rename status](../docs/status/RENAME.md).
+Startup-only import/ownership assertions pass at missing `strncpy`, with rename
+bound and 20,016 retained dependency bytes (`rename-entry-verified.log`).
+
 Guest `Remove` now deletes file names and empty directories from the owned
 namespace. Open descriptors retain old data/inodes after unlink; recreated
 paths obtain distinct identities. The matching build passes 558 library tests,
@@ -7,7 +16,7 @@ three integration tests and strict Clippy. Native checks pass the actual
 M_remove wrapper and existing mkdir/stat/file regressions. This is a bounded
 virtual filesystem, with no host-path deletion or persistent save storage.
 See [remove evidence and limitations](../docs/status/REMOVE.md).
-Startup-only import/ownership assertions pass at missing `rename`, with remove
+The preceding startup-only import/ownership assertions passed at missing `rename`, with remove
 bound and 20,000 retained dependency bytes (`remove-entry-verified.log`).
 
 Owned stdout/stderr `Fprintf` and `Vfprintf` now share the typed formatter.

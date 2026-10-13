@@ -4,7 +4,7 @@ use crate::{Result, descriptors::Descriptors, guest_memory::Memory};
 #[path = "guest_files.rs"]
 mod guest_files;
 pub(crate) use guest_files::{FileBacking, Quota};
-pub use guest_files::{Files, MkdirPlan, NamespaceProfile, STAT_SIZE, StatRequest, StatTrace};
+pub use guest_files::{Files, MkdirPlan, RenamePlan, NamespaceProfile, STAT_SIZE, StatRequest, StatTrace};
 
 struct Region {
     address: u64,
@@ -80,6 +80,67 @@ impl Kernel {
             return Err("Guest working directory is not configured for relative remove".into());
         }
         Ok(self.files.remove(&path, self.working_directory.as_deref()))
+    }
+    /// Prepare both namespace and pathname-based cwd state before publishing
+    /// either. Source lookup precedes access to the destination pathname.
+    pub fn rename_paths(
+        &mut self,
+        memory: &Memory<'_>,
+        old_address: u64,
+        new_address: u64,
+    ) -> Result<std::result::Result<(), u32>> {
+        let old = match guest_files::read_path(memory, old_address) {
+            Ok(path) => path,
+            Err(errno) => return Ok(Err(errno)),
+        };
+        if !old.is_empty() && old[0] != b'/' && self.working_directory.is_none() {
+            return Err("Guest working directory is not configured for relative rename".into());
+        }
+        if let Err(errno) = self.files.check_rename_source(&old, self.working_directory.as_deref()) {
+            return Ok(Err(errno));
+        }
+        let new = match guest_files::read_path(memory, new_address) {
+            Ok(path) => path,
+            Err(errno) => return Ok(Err(errno)),
+        };
+        if !new.is_empty() && new[0] != b'/' && self.working_directory.is_none() {
+            return Err("Guest working directory is not configured for relative rename".into());
+        }
+        let plan = match self.files.plan_rename(&old, &new, self.working_directory.as_deref()) {
+            Ok(plan) => plan,
+            Err(errno) => return Ok(Err(errno)),
+        };
+        let mut next_cwd = None;
+        if let Some(cwd) = self.working_directory.as_deref() {
+            let cwd = cwd.strip_suffix(&[0]).unwrap_or(cwd);
+            let within = |path: &[u8], base: &[u8]| path == base
+                || path.strip_prefix(base).is_some_and(|tail| tail.first() == Some(&b'/'));
+            if plan.replaced_directory().is_some_and(|target| within(cwd, target)) {
+                return Err("Rename would unlink the current directory identity; retained directory handles are not implemented".into());
+            }
+            if let Some((old, new)) = plan.moved_directory() {
+                if within(cwd, old) {
+                    let tail = &cwd[old.len()..];
+                    let length = new.len().checked_add(tail.len()).filter(|&n| n < 1024);
+                    let Some(length) = length else {
+                        return Err("Renamed working directory exceeds the supported pathname profile".into());
+                    };
+                    let mut bytes = Vec::new();
+                    bytes.try_reserve_exact(length + 1).map_err(|_| "Cannot prepare renamed working directory")?;
+                    bytes.extend_from_slice(new);
+                    bytes.extend_from_slice(tail);
+                    bytes.push(0);
+                    next_cwd = Some(bytes);
+                }
+            }
+        }
+        match self.files.commit_rename(plan) {
+            Ok(()) => {
+                if let Some(cwd) = next_cwd { self.working_directory = Some(cwd); }
+                Ok(Ok(()))
+            }
+            Err(errno) => Ok(Err(errno)),
+        }
     }
     pub fn errno_address(&self) -> u64 {
         self.errno_address
@@ -1235,6 +1296,44 @@ mod tests {
 mod directory_bridge_tests {
     use super::*;
     use crate::descriptors::OpenOptions;
+    #[test]
+    fn rename_moves_cwd_atomically_and_keeps_relative_file_access() {
+        let mut kernel = Kernel::new(0, 0x1000).unwrap();
+        kernel.files.allow_create_directory(b"/save").unwrap();
+        kernel.files.register_directory(b"/save/old", 0o777, false).unwrap();
+        kernel.files.register_directory(b"/save/old/sub", 0o777, false).unwrap();
+        kernel.files.register_writable(b"/save/old/sub/file", b"payload".to_vec()).unwrap();
+        kernel.register_working_directory(b"/save/old/sub").unwrap();
+        let mut old = *b"/save/old\0";
+        let mut new = *b"/save/new\0";
+        let mut memory = Memory::default();
+        memory.add(0x2000, &mut old, false, false).unwrap();
+        memory.add(0x3000, &mut new, false, false).unwrap();
+        assert_eq!(kernel.rename_paths(&memory, 0x2000, 0x3000).unwrap(), Ok(()));
+        assert_eq!(kernel.working_directory_bytes(), Some(b"/save/new/sub\0".as_slice()));
+        let file = kernel.open_file_path(b"file", OpenOptions::read_only()).unwrap().unwrap();
+        assert_eq!(kernel.descriptors.preview_read(&file, 100).unwrap().bytes(), b"payload");
+        // Source failure wins over an inaccessible destination pointer.
+        assert_eq!(kernel.rename_paths(&memory, 0x2000, 1).unwrap(), Err(2));
+        assert_eq!(kernel.working_directory_bytes(), Some(b"/save/new/sub\0".as_slice()));
+    }
+    #[test]
+    fn rename_replacing_cwd_is_rejected_before_namespace_publication() {
+        let mut kernel = Kernel::new(0, 0x1000).unwrap();
+        kernel.files.allow_create_directory(b"/save").unwrap();
+        kernel.files.register_directory(b"/save/a", 0o777, false).unwrap();
+        kernel.files.register_directory(b"/save/b", 0o777, false).unwrap();
+        kernel.register_working_directory(b"/save/b").unwrap();
+        let mut old = *b"/save/a\0";
+        let mut new = *b"/save/b\0";
+        let mut memory = Memory::default();
+        memory.add(0x2000, &mut old, false, false).unwrap();
+        memory.add(0x3000, &mut new, false, false).unwrap();
+        assert!(kernel.rename_paths(&memory, 0x2000, 0x3000).unwrap_err().contains("current directory identity"));
+        assert!(kernel.files.is_directory(b"/save/a").unwrap());
+        assert!(kernel.files.is_directory(b"/save/b").unwrap());
+        assert_eq!(kernel.working_directory_bytes(), Some(b"/save/b\0".as_slice()));
+    }
     #[test]
     fn remove_detaches_name_but_keeps_open_backing_and_recreate_identity() {
         let mut kernel = Kernel::new(0, 0x1000).unwrap();

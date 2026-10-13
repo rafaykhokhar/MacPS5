@@ -1044,6 +1044,7 @@ pub enum Service {
     Getcwd,
     Mkdir,
     Remove,
+    Rename,
     Setenv,
     Wcslen,
     Wcstombs,
@@ -1249,6 +1250,7 @@ impl Service {
             | Self::Getcwd
             | Self::Mkdir
             | Self::Remove
+            | Self::Rename
             | Self::Setenv
             | Self::Wcslen
             | Self::Wcstombs
@@ -5971,12 +5973,17 @@ impl NativeExecutor {
                             cpu.registers[6],
                             cpu.registers[2],
                         )? as u32 as u64
-                    } else if matches!(service, Service::Remove) {
+                    } else if matches!(service, Service::Remove | Service::Rename) {
                         if memory.load(sp, 8)? != ret {
-                            return Err("Remove return frame changed before namespace mutation".into());
+                            return Err("Namespace service return frame changed before mutation".into());
                         }
-                        let kernel = self.kernel.as_mut().ok_or("Missing remove kernel context")?;
-                        match kernel.remove_path(&memory, cpu.registers[7])? {
+                        let kernel = self.kernel.as_mut().ok_or("Missing namespace service kernel context")?;
+                        let outcome = if matches!(service, Service::Rename) {
+                            kernel.rename_paths(&memory, cpu.registers[7], cpu.registers[6])?
+                        } else {
+                            kernel.remove_path(&memory, cpu.registers[7])?
+                        };
+                        match outcome {
                             Ok(()) => 0,
                             Err(errno) => {
                                 let address = kernel.errno_address();
