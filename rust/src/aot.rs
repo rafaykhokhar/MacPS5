@@ -37,6 +37,13 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn vector_extract128_absolute_address_guard() {
+        for opcode in [0x19, 0x39] {
+            let bytes = [0x67, 0xc4, 0xe3, 0x7d, opcode, 0x04, 0x25, 0, 0, 0, 0, 1];
+            assert!(super::translate_rust_memory_region(&bytes, 0, "address").is_err());
+        }
+    }
+    #[test]
     fn packed_shuffle_absolute_address_guard() {
         for length in [0, 4] {
             for (map, opcode) in [(1, 0x70), (2, 0)] {
@@ -1039,6 +1046,38 @@ impl Emitter {
                     216 + merge * 32, 208 + dst * 32, 216 + dst * 32,
                     224 + dst * 32, 232 + dst * 32
                 ));
+            }
+            M::Vextracti128 | M::Vextractf128 => {
+                if !matches!(
+                    i.code(),
+                    iced_x86::Code::VEX_Vextracti128_xmmm128_ymm_imm8
+                        | iced_x86::Code::VEX_Vextractf128_xmmm128_ymm_imm8
+                ) {
+                    return Err("Only VEX 128-bit lane extraction is implemented".into());
+                }
+                let source = vector(i.op1_register())?;
+                let lane = i.immediate8() & 1;
+                if i.op0_kind() == OpKind::Memory {
+                    if i.memory_base() == R::None
+                        && i.memory_index() == R::None
+                        && i.memory_displ_size() != 8
+                    {
+                        return Err("32-bit absolute addressing is not implemented".into());
+                    }
+                    self.address(i)?;
+                    self.emit(format!(
+                        "mov x0, x19\nmov x2, #{source}\nmov x3, #{lane}\nbl _native_ps5_module_vector_extract128_v1"
+                    ));
+                    self.fault();
+                } else {
+                    let destination = vector(i.op0_register())?;
+                    // Capture the selected half before clearing an aliased YMM.
+                    self.emit(format!(
+                        "ldr q0, [x19, #{}]\nmovi v1.16b, #0\nstr q0, [x19, #{}]\nstr q1, [x19, #{}]",
+                        208 + source * 32 + usize::from(lane) * 16,
+                        208 + destination * 32, 224 + destination * 32
+                    ));
+                }
             }
             M::Vpshufd | M::Vpshufb => {
                 use iced_x86::Code;

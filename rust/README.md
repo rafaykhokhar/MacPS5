@@ -1,5 +1,12 @@
 # Rust migration
 
+VEXTRACTI128/F128 now support register destinations and guarded 16-byte stores.
+The matching build passes 638 library tests, three integration tests, strict
+Clippy and 78,336 native checks. Discovery reaches 56,566 instructions and removes
+four extraction stops. Startup remains at missing `fscanf`, before game main.
+See [CPU evidence](../docs/status/CPU.md); production readiness and retail
+gameplay remain unverified.
+
 VEX byte/doubleword shuffles now support XMM/YMM and guarded memory operands.
 The matching build passes 634 library tests, three integration tests, strict
 Clippy and 95,616 native checks across 2,136 encoding fixtures. Discovery reaches

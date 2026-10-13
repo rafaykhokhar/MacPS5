@@ -1,5 +1,38 @@
 # CPU completion criteria
 
+## 128-bit vector extraction
+
+VEXTRACTI128 and VEXTRACTF128 now extract either half of a YMM register into
+an XMM register or exactly 16 bytes of guest memory. Only immediate bit 0
+selects the half. Register writes snapshot the source before writing and clear
+the destination's upper YMM half, including self-aliases. Stores preserve all
+vectors and validate the complete writable span before copying. Flags/FP state
+are unchanged. W1, L0, reserved vvvv, legacy/EVEX and unsupported FS/GS/address32
+forms remain rejected.
+
+Reference: AMD APM Volume 4 rev.3.24 pp.610–613
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)).
+The current guard fault model does not establish architectural exception delivery
+or alignment-control emulation.
+
+The matching build passes 638 library tests, three integration tests, strict
+Clippy and release compilation (`work/vector-extract128-native/{tests,clippy,release}.log`,
+process 97151 exit 0). The [native verifier](../../rust/verification/vector_extract128_native.rs)
+passes 78,336 byte-copy reference checks over 4,096 decoded fixtures: all 256
+immediates, high registers, high-half self-aliasing, upper clearing, exact-end and
+sentinel-protected high/unaligned/RIP stores, every short span, readonly failures,
+flags/FP/fuel/prior faults (`work/vector-extract128-native/native.log`, process
+11501 exit 0). Helper tests additionally check invalid parameters and write barriers.
+
+Discovery reaches 56,566 instructions and 12,859 blocks with 175 unsupported
+sites; all four previous extraction stops are removed, with no new stops exposed.
+These counts do not establish CPU coverage. The entry runner compiles with
+warnings denied and its startup-only run still stops at missing `fscanf`, after
+accepting ten dependencies. The 20,288 dependency bytes remain owned, cleanup
+is pending and game main has not executed (`work/vector-extract128-native/entry.log`,
+process 26066 exit 0). No full GPU run was performed for this CPU change.
+Production readiness and retail gameplay remain unverified.
+
 ## Packed byte and doubleword shuffles
 
 VEX VPSHUFB and VPSHUFD now cover XMM and YMM register/memory forms.

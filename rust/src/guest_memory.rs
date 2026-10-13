@@ -716,6 +716,21 @@ pub fn vector_store(
     vector_operand(address, reg, size, aligned)?;
     memory.write(address, &vectors[reg as usize][..size as usize])
 }
+/// Store one selected 128-bit half without modifying its source vector.
+pub fn vector_extract128(
+    memory: &mut Memory<'_>,
+    vectors: &[[u8; 32]; 16],
+    address: u64,
+    source: u64,
+    lane: u64,
+) -> Result<()> {
+    vector_operand(address, source, 16, 0)?;
+    if lane > 1 {
+        return Err("Invalid 128-bit extraction lane".into());
+    }
+    let start = lane as usize * 16;
+    memory.write(address, &vectors[source as usize][start..start + 16])
+}
 /// Guard the entire unaligned 256-bit source before changing any destination lane.
 pub fn vector_cmpgtd256(
     memory: &Memory<'_>,
@@ -1039,6 +1054,35 @@ pub mod ffi {
                 reg,
                 size,
                 aligned,
+            )
+            .is_ok()
+        {
+            return;
+        }
+        cpu.fault = 2;
+    }
+    /// # Safety
+    /// Same context contract as native_ps5_module_vector_load_v1.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn native_ps5_module_vector_extract128_v1(
+        cpu: *mut Cpu,
+        address: u64,
+        source: u64,
+        lane: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if cpu.memory != 0
+            && vector_extract128(
+                unsafe { &mut *(cpu.memory as *mut Memory<'_>) },
+                &cpu.vectors,
+                address,
+                source,
+                lane,
             )
             .is_ok()
         {
@@ -1806,6 +1850,93 @@ mod tests {
         unsafe { ffi::native_ps5_module_vector_addsub_v1(&mut cpu, 0x1000, 0, 0, 16, 1, 2) };
         assert_eq!(cpu.fault, 1);
         assert_eq!(cpu.vectors, before);
+    }
+    #[test]
+    fn vector_extract128_selects_half_and_preserves_adjacent_bytes() {
+        let mut vectors = [[0xa5; 32]; 16];
+        vectors[15] = std::array::from_fn(|i| (i + 1) as u8);
+        for lane in 0..2 {
+            let mut data = [0xcc; 18];
+            let mut memory = Memory::default();
+            memory.add(0x1_0000_0000, &mut data, true, false).unwrap();
+            vector_extract128(&mut memory, &vectors, 0x1_0000_0001, 15, lane).unwrap();
+            let output = memory.read(0x1_0000_0000, 18).unwrap();
+            assert_eq!(output[0], 0xcc);
+            assert_eq!(output[17], 0xcc);
+            let start = lane as usize * 16;
+            assert_eq!(&output[1..17], &vectors[15][start..start + 16]);
+        }
+    }
+    #[test]
+    fn vector_extract128_bad_parameters_and_store_guards_are_atomic() {
+        let vectors = [[0xa5; 32]; 16];
+        for lane in 0..2 {
+            for length in 0..16 {
+                let mut data = vec![0xcc; length];
+                let mut memory = Memory::default();
+                if length != 0 {
+                    memory.add(0x1001, &mut data, true, false).unwrap();
+                }
+                assert!(vector_extract128(&mut memory, &vectors, 0x1001, 0, lane).is_err());
+                if length != 0 {
+                    assert_eq!(memory.read(0x1001, length).unwrap(), vec![0xcc; length]);
+                }
+            }
+            let mut data = [0xcc; 16];
+            let mut memory = Memory::default();
+            memory.add(0x1001, &mut data, false, false).unwrap();
+            assert!(vector_extract128(&mut memory, &vectors, 0x1001, 0, lane).is_err());
+            assert_eq!(memory.read(0x1001, 16).unwrap(), &[0xcc; 16]);
+        }
+        let mut data = [0xcc; 16];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, true, false).unwrap();
+        for (source, lane) in [(16, 0), (u64::MAX, 0), (0, 2), (0, u64::MAX)] {
+            assert!(vector_extract128(&mut memory, &vectors, 0x1001, source, lane).is_err());
+            assert_eq!(memory.read(0x1001, 16).unwrap(), &[0xcc; 16]);
+        }
+        memory.set_write_barriers(vec![(0x100f, 1)]);
+        assert!(vector_extract128(&mut memory, &vectors, 0x1001, 0, 0).is_err());
+        assert_eq!(memory.read(0x1001, 16).unwrap(), &[0xcc; 16]);
+    }
+    #[test]
+    #[allow(unsafe_code)]
+    fn vector_extract128_ffi_preserves_cpu_state_and_prior_faults() {
+        use crate::legacy_cpu::Cpu;
+        unsafe { ffi::native_ps5_module_vector_extract128_v1(std::ptr::null_mut(), 0, 0, 0) };
+        let mut cpu = Cpu {
+            vectors: [[0x55; 32]; 16],
+            flags: u64::MAX,
+            ..Cpu::default()
+        };
+        cpu.vectors[15] = std::array::from_fn(|i| (i + 1) as u8);
+        let original = cpu.vectors;
+        for fault in [0, 1, 13] {
+            cpu.fault = fault;
+            unsafe { ffi::native_ps5_module_vector_extract128_v1(&mut cpu, 0x1001, 15, 1) };
+            assert_eq!(cpu.fault, if fault == 0 { 2 } else { fault });
+            assert_eq!(cpu.vectors, original);
+            assert_eq!(cpu.flags, u64::MAX);
+        }
+        let mut data = [0xcc; 16];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, true, false).unwrap();
+        cpu.memory = (&mut memory as *mut Memory<'_>) as u64;
+        cpu.fault = 13;
+        unsafe { ffi::native_ps5_module_vector_extract128_v1(&mut cpu, 0x1001, 15, 1) };
+        assert_eq!(cpu.fault, 13);
+        assert_eq!(memory.read(0x1001, 16).unwrap(), &[0xcc; 16]);
+        cpu.fault = 0;
+        unsafe { ffi::native_ps5_module_vector_extract128_v1(&mut cpu, 0x1001, 15, 1) };
+        assert_eq!(cpu.fault, 0);
+        assert_eq!(memory.read(0x1001, 16).unwrap(), &original[15][16..]);
+        assert_eq!(cpu.vectors, original);
+        assert_eq!(cpu.flags, u64::MAX);
+        unsafe { ffi::native_ps5_module_vector_extract128_v1(&mut cpu, 0x1001, 15, 2) };
+        assert_eq!(cpu.fault, 2);
+        assert_eq!(memory.read(0x1001, 16).unwrap(), &original[15][16..]);
+        assert_eq!(cpu.vectors, original);
+        assert_eq!(cpu.flags, u64::MAX);
     }
     #[test]
     fn packed_shuffles_all_controls_keep_128bit_lanes_separate() {
