@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct ROL/ROR now supports registers and guarded memory at all four widths,
+including immediate and CL counts. Expanded shift/rotate checks pass: 983046
+wider-register, 16190280 narrow-register, 8208000 memory and 407205 shared RMW
+regression cases. RCL/RCR remains unsupported. See
+[rotation evidence](../docs/status/TRANSLATOR_READINESS.md#direct-rol-and-ror).
+
 Direct SHL/SHR/SAR now also handles guarded memory operands at all four widths
 with immediate, implicit-one and CL counts. 4924800 native memory-shift checks
 and 407205 shared RMW regression checks pass. This closes the memory-shift gap,

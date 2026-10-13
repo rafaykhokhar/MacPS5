@@ -1711,3 +1711,34 @@ regression checks, 687 library tests, three integration tests, strict Clippy
 and release build. Standalone verifiers compile with warnings denied. Logs are
 `/tmp/macps5-memshift-{tests,clippy,build}.log`. These checks establish scoped
 memory-shift behavior, not completed CPU translation, fault delivery or gameplay.
+
+## Direct ROL and ROR
+
+Direct ROL/ROR supports 8/16/32/64-bit registers and guarded memory with
+immediate, implicit-one and CL counts. Register lowering uses ARM64 RORV;
+ROL negates the count in a temporary without changing the count passed to flag
+calculation. Narrow values are repeated across 32 bits before rotation, with
+byte/word stores preserving the rest of the guest register. Memory operations
+12/13 use width-reduced rotation while retaining the masked count for flags.
+Memory flags commit only after the guarded store succeeds. Zero masked counts
+preserve flags; nonzero full-width narrow rotations still update CF. Rotates
+preserve SF/ZF/AF/PF, set OF for count one and preserve undefined multi-bit OF.
+Rotate-through-carry RCL/RCR remains unsupported by this path.
+
+The wider-register, narrow-register and memory shift verifiers now include
+ROL/ROR with iterative one-bit result and flag oracles. They cover every raw
+count, all registers and base aliases, partial-register state, byte inputs,
+word/dword/qword sign boundaries, zero counts and full-width rotations. Memory
+checks retain short/unaligned/read-only/overflowing accesses and preservation
+on failure. The RMW helper invalid-operation regression now uses 14. Reproduce
+with the existing release rlib/dependency flags using `direct_shift_native.rs`,
+`direct_narrow_shift_native.rs`, `direct_memory_shift_native.rs` and
+`direct_memory_arithmetic_native.rs`.
+
+The expanded shift/rotate suites pass 983046 wider-register cases, 16190280
+narrow-register cases, 8208000 memory cases and 407205 shared RMW regression
+cases. The 687 library tests, three integration tests, strict Clippy and release
+build pass; all four standalone verifiers compile with warnings denied. Logs
+are `/tmp/macps5-rotate-{tests,clippy,build}.log`. These combined counts include
+existing shifts, not just newly added rotations. Gameplay and full CPU
+translation remain incomplete.

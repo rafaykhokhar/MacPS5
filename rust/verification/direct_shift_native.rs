@@ -1,13 +1,13 @@
 use native_ps5::{direct_cpu, jit_memory::JitArena, legacy_cpu::Cpu};
 fn main() {
     unsafe {
-        let arena = JitArena::new(32 * 1024 * 1024).unwrap();
+        let arena = JitArena::new(64 * 1024 * 1024).unwrap();
         let mut checks = 0;
         for wide in [false, true] {
             let bits = if wide { 64 } else { 32 };
             let mask = u64::MAX >> (64 - bits);
             let sign = 1u64 << (bits - 1);
-            for (operation, extension) in [4u8, 5, 7].into_iter().enumerate() {
+            for (operation, extension) in [4u8, 5, 7, 0, 1].into_iter().enumerate() {
                 for variable in [false, true] {
                     for reg in 0..16u8 {
                         for raw in 0..=255u8 {
@@ -49,25 +49,41 @@ fn main() {
                                                 carry = result & 1;
                                                 result = (result >> 1) | (result & sign);
                                             }
+                                            3 => {
+                                                carry = (result & sign != 0) as u64;
+                                                result = ((result << 1) & mask) | carry;
+                                            }
+                                            4 => {
+                                                carry = result & 1;
+                                                result = (result >> 1) | (carry << (bits - 1));
+                                            }
                                             _ => unreachable!(),
                                         }
                                     }
                                     let mut flags = oldflags;
                                     if count != 0 {
-                                        flags = (flags & !0xc5) | carry;
-                                        if result == 0 {
-                                            flags |= 64;
-                                        }
-                                        if result & sign != 0 {
-                                            flags |= 128;
-                                        }
-                                        if (result as u8).count_ones() % 2 == 0 {
-                                            flags |= 4;
+                                        flags = (flags & !if operation >= 3 { 1 } else { 0xc5 })
+                                            | carry;
+                                        if operation < 3 {
+                                            if result == 0 {
+                                                flags |= 64;
+                                            }
+                                            if result & sign != 0 {
+                                                flags |= 128;
+                                            }
+                                            if (result as u8).count_ones() % 2 == 0 {
+                                                flags |= 4;
+                                            }
                                         }
                                         if count == 1 {
                                             let overflow = match operation {
-                                                0 => (result >> (bits - 1)) ^ carry,
+                                                0 | 3 => (result >> (bits - 1)) ^ carry,
                                                 1 => (value & mask) >> (bits - 1),
+                                                4 => {
+                                                    ((result >> (bits - 1))
+                                                        ^ (result >> (bits - 2)))
+                                                        & 1
+                                                }
                                                 _ => 0,
                                             };
                                             flags = (flags & !0x800) | (overflow << 11);
@@ -121,7 +137,7 @@ fn main() {
             }
         }
         println!(
-            "PASS: {checks} immediate/CL SHL/SHR/SAR register cases with all 256 counts, iterative result/flag oracle, both widths, all registers including count aliases, and implicit-one/fuel/fault checks"
+            "PASS: {checks} immediate/CL shift/rotate register cases with all 256 counts, iterative result/flag oracle, both widths, all registers including count aliases, and implicit-one/fuel/fault checks"
         );
     }
 }

@@ -215,15 +215,19 @@ fn setcc(i: &Instruction) -> bool {
     )
 }
 fn register_shift(i: &Instruction) -> bool {
-    matches!(i.mnemonic(), Mnemonic::Shl | Mnemonic::Shr | Mnemonic::Sar)
-        && i.op0_kind() == OpKind::Register
+    matches!(
+        i.mnemonic(),
+        Mnemonic::Shl | Mnemonic::Shr | Mnemonic::Sar | Mnemonic::Rol | Mnemonic::Ror
+    ) && i.op0_kind() == OpKind::Register
         && matches!(i.op0_register().size(), 1 | 2 | 4 | 8)
         && (i.op1_kind() == OpKind::Immediate8
             || (i.op1_kind() == OpKind::Register && i.op1_register() == Register::CL))
 }
 fn memory_shift(i: &Instruction) -> bool {
-    matches!(i.mnemonic(), Mnemonic::Shl | Mnemonic::Shr | Mnemonic::Sar)
-        && i.encoding() == iced_x86::EncodingKind::Legacy
+    matches!(
+        i.mnemonic(),
+        Mnemonic::Shl | Mnemonic::Shr | Mnemonic::Sar | Mnemonic::Rol | Mnemonic::Ror
+    ) && i.encoding() == iced_x86::EncodingKind::Legacy
         && !i.has_lock_prefix()
         && i.op0_kind() == OpKind::Memory
         && matches!(i.memory_size().size(), 1 | 2 | 4 | 8)
@@ -966,6 +970,8 @@ pub(crate) fn translate_span(
                     Mnemonic::Shl => 9,
                     Mnemonic::Shr => 10,
                     Mnemonic::Sar => 11,
+                    Mnemonic::Rol => 12,
+                    Mnemonic::Ror => 13,
                     _ => unreachable!(),
                 },
             )?;
@@ -1144,9 +1150,33 @@ pub(crate) fn translate_span(
                 Mnemonic::Shl => (0x1ac22023, 0),
                 Mnemonic::Shr => (0x1ac22423, 1),
                 Mnemonic::Sar => (0x1ac22823, 2),
+                Mnemonic::Rol => (0, 3),
+                Mnemonic::Ror => (0, 4),
                 _ => unreachable!(),
             };
-            c.emit(opcode | if wide { 0x80000000 } else { 0 })?;
+            if operation >= 3 {
+                let src = if size < 4 {
+                    c.emit(0x2a0103e9)?; // mov w9,w1
+                    if size == 1 {
+                        c.emit(0x2a092129)?;
+                    } // repeat byte into word
+                    c.emit(0x2a094129)?; // repeat word across 32 bits
+                    9
+                } else {
+                    1
+                };
+                let count = if operation == 3 {
+                    c.emit(0x4b0203ea | if wide { 0x80000000 } else { 0 })?; // neg w10/x10,w2/x2
+                    10
+                } else {
+                    2
+                };
+                c.emit(
+                    0x1ac02c03 | (src << 5) | (count << 16) | if wide { 0x80000000 } else { 0 },
+                )?;
+            } else {
+                c.emit(opcode | if wide { 0x80000000 } else { 0 })?;
+            }
             if size == 1 {
                 c.emit(0x39000263 | (byte_offset(i.op0_register())? << 10))?;
             } else if size == 2 {

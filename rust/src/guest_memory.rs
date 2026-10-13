@@ -1392,7 +1392,7 @@ pub mod ffi {
     use super::*;
     use crate::legacy_cpu::Cpu;
     /// Unlocked integer memory arithmetic: 0=ADD, 1=SUB, 2=AND, 3=OR, 4=XOR, 5=NOT, 6=NEG, 7=ADC, 8=SBB.
-    /// Shift operations: 9=SHL, 10=SHR, 11=SAR; rhs is the unmasked count.
+    /// Shift/rotate operations: 9=SHL, 10=SHR, 11=SAR, 12=ROL, 13=ROR; rhs is the unmasked count.
     /// Flags commit only after the guarded store succeeds. This is not a host atomic operation.
     /// # Safety
     /// Same exclusive, disjoint CPU/Memory ownership contract as native_ps5_module_load_v1.
@@ -1410,7 +1410,7 @@ pub mod ffi {
         if cpu.fault != 0 {
             return;
         }
-        if ![1, 2, 4, 8].contains(&size) || operation > 11 {
+        if ![1, 2, 4, 8].contains(&size) || operation > 13 {
             cpu.fault = 3;
             return;
         }
@@ -1436,10 +1436,21 @@ pub mod ffi {
             8 => lhs.wrapping_sub(rhs).wrapping_sub(cpu.flags & 1),
             9 => lhs << count,
             10 => lhs >> count,
-            _ => {
+            11 => {
                 let extension = (64 - size * 8) as u32;
                 let signed = ((lhs << extension) as i64) >> extension;
                 (signed >> count) as u64
+            }
+            _ => {
+                let bits = (size * 8) as u32;
+                let rotation = count % bits;
+                if rotation == 0 {
+                    lhs
+                } else if operation == 12 {
+                    (lhs << rotation) | (lhs >> (bits - rotation))
+                } else {
+                    (lhs >> rotation) | (lhs << (bits - rotation))
+                }
             }
         };
         let flags = if operation >= 9 {

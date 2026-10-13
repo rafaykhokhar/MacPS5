@@ -8,7 +8,13 @@ fn reference(mut value: u64, bits: u32, count: u8, op: u8, old: u64) -> (u64, u6
     let mut carry = old & 1;
     let count = count & 31;
     for _ in 0..count {
-        if op == 4 {
+        if op == 0 {
+            carry = u64::from(value & sign != 0);
+            value = ((value * 2) & mask) | carry;
+        } else if op == 1 {
+            carry = value & 1;
+            value = value / 2 | (carry << (bits - 1));
+        } else if op == 4 {
             carry = u64::from(value & sign != 0);
             value = (value * 2) & mask;
         } else {
@@ -18,19 +24,23 @@ fn reference(mut value: u64, bits: u32, count: u8, op: u8, old: u64) -> (u64, u6
     }
     let mut flags = old;
     if count > 0 {
-        flags = (flags & !0xc5) | carry;
-        if value == 0 {
-            flags |= 64;
-        }
-        if value & sign != 0 {
-            flags |= 128;
-        }
-        if (value as u8).count_ones() % 2 == 0 {
-            flags |= 4;
+        flags = (flags & !if op < 2 { 1 } else { 0xc5 }) | carry;
+        if op >= 2 {
+            if value == 0 {
+                flags |= 64;
+            }
+            if value & sign != 0 {
+                flags |= 128;
+            }
+            if (value as u8).count_ones() % 2 == 0 {
+                flags |= 4;
+            }
         }
         if count == 1 {
-            let overflow = if op == 4 {
+            let overflow = if op == 0 || op == 4 {
                 u64::from(value & sign != 0) ^ carry
+            } else if op == 1 {
+                ((value >> (bits - 1)) ^ (value >> (bits - 2))) & 1
             } else if op == 5 {
                 u64::from(original & sign != 0)
             } else {
@@ -55,7 +65,7 @@ fn main() {
                     } else {
                         (reg as usize, 0)
                     };
-                    for op in [4u8, 5, 7] {
+                    for op in [4u8, 5, 7, 0, 1] {
                         for mode in 0..3 {
                             for raw in 0..=255u8 {
                                 if mode == 2 && raw != 1 {
@@ -131,6 +141,6 @@ fn main() {
                 }
             }
         }
-        println!("direct narrow SHL/SHR/SAR: {checks} native state checks passed");
+        println!("direct narrow shifts/rotates: {checks} native state checks passed");
     }
 }
