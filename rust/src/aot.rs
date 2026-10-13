@@ -1135,8 +1135,15 @@ impl Emitter {
                 self.fault();
             }
             M::Div | M::Idiv => {
-                if ![16, 32, 64].contains(&width) {
-                    return Err("Only DIV/IDIV16/32/64 is implemented".into());
+                if ![8, 16, 32, 64].contains(&width) {
+                    return Err("Only DIV/IDIV8/16/32/64 is implemented".into());
+                }
+                if i.op0_kind() == OpKind::Memory
+                    && i.memory_base() == R::None
+                    && i.memory_index() == R::None
+                    && i.memory_displ_size() != 8
+                {
+                    return Err("32-bit absolute addressing is not implemented".into());
                 }
                 self.read(i, 0, width, 20)?;
                 self.emit(format!("mov x0, x19\nmov x1, x20\nmov x2, #{width}\nmov x3, #{}\nbl _native_ps5_divide_v1", u8::from(m == M::Idiv)));
@@ -1445,7 +1452,7 @@ mod tests {
     fn reject_unsupported_instead_of_silently_skipping() {
         for bytes in [
             &[0xd2, 0xd0, 0xc3][..], // RCL AL,CL still needs carry-input support.
-            &[0xf6, 0xf0, 0xc3],
+            &[0xd2, 0xd8, 0xc3],     // RCR AL,CL is not ordinary rotation.
             &[0xf0, 0x01, 0x00, 0xc3],
             &[0x64, 0x48, 0x8b, 0x00, 0xc3],
             &[0x67, 0x8b, 0x00, 0xc3],

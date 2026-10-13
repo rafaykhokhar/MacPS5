@@ -7,109 +7,110 @@ use native_ps5::{
     stdio_file::Operation as FileOperation,
 };
 use std::{collections::BTreeSet, path::Path};
+mod abort_native;
+mod adc_native;
+mod atomic_xadd_native;
 mod audio_native;
+mod bit_test_native;
+mod byte_divide_native;
+mod c_locale_native;
+mod cancel_type_native;
+mod cond_native;
+mod cvtsi2sd_native;
 mod direct_memory_native;
+mod directory_native;
+mod environment_native;
 mod equeue_native;
 mod exit_native;
+mod fgetc_native;
+mod fgets_native;
+mod file_syscalls_native;
+mod float_parse_native;
 mod fma213_native;
+mod fprintf_native;
+mod fstat_native;
+mod getcwd_native;
+mod guest_time_native;
 mod ime_native;
+mod imul_implicit_native;
+mod integer_parse_native;
 mod keyboard_native;
 mod libc_memory_native;
 mod locale_native;
+mod lzcnt_native;
+mod mb_cur_max_native;
+mod mbrlen_native;
+mod mbtowc_native;
+mod memory_compare_native;
+mod mkdir_native;
+mod movdqu_native;
+mod mul_native;
+mod multibyte_native;
 mod mutex_native;
+mod narrow_shift_native;
+mod narrow_strings_native;
 mod net_native;
+mod packed_compare_shift_native;
 mod pad_native;
+mod printf_stdout_native;
+mod putenv_native;
 mod puts_native;
 mod quantum_native;
 mod realloc_native;
-mod scheduler_native;
-mod sprx_symbol_native;
-mod stat_native;
-mod stdio_native;
-mod stdio_file_native;
-mod file_syscalls_native;
-mod fstat_native;
-mod stat_service_native;
-mod semaphore_native;
-mod atomic_xadd_native;
-mod adc_native;
-mod sysconf_native;
-mod sysctl_native;
-mod sigaction_native;
-mod wcstombs_native;
-mod sort_search_native;
-mod fgets_native;
-mod getcwd_native;
-mod strdup_native;
-mod mkdir_native;
-mod cond_native;
-mod multibyte_native;
-mod abort_native;
-mod movdqu_native;
-mod vasprintf_native;
-mod vasprintf_hex_native;
-mod printf_stdout_native;
-mod fprintf_native;
 mod remove_native;
 mod rename_native;
-mod strncpy_native;
+mod scan_native;
+mod scheduler_native;
+mod scheduling_native;
+mod sdl_scheduling_native;
+mod semaphore_native;
+mod sigaction_native;
+mod signal_mask_native;
+mod signal_set_native;
+mod sleep_native;
+mod sort_search_native;
+mod sprx_symbol_native;
 mod sscanf_native;
-mod directory_native;
-mod putenv_native;
-mod fgetc_native;
-mod strcoll_native;
-mod strxfrm_native;
-mod wcscoll_native;
-mod lzcnt_native;
-mod bit_test_native;
-mod narrow_shift_native;
-mod mul_native;
-mod wcsxfrm_native;
-mod mbrlen_native;
-mod mbtowc_native;
-mod mb_cur_max_native;
-mod strtok_r_native;
+mod stat_native;
+mod stat_service_native;
+mod stdio_file_native;
+mod stdio_native;
 mod stdout_byte_native;
-mod packed_compare_shift_native;
-mod vpbroadcastd_native;
+mod strcoll_native;
+mod strdup_native;
 mod strftime_native;
+mod strncpy_native;
 mod strtof_native;
+mod strtok_r_native;
 mod strtold_native;
-mod vmovd_native;
-mod cvtsi2sd_native;
-mod vpxor_native;
+mod strxfrm_native;
+mod sysconf_native;
+mod sysctl_native;
 mod system_service_native;
-mod threadattr_native;
-mod thread_services_native;
 mod thread_module_native;
 mod thread_name_native;
 mod thread_pins_native;
-mod signal_set_native;
-mod signal_mask_native;
-mod cancel_type_native;
-mod scheduling_native;
-mod sdl_scheduling_native;
-mod environment_native;
-mod memory_compare_native;
-mod wide_strings_native;
-mod narrow_strings_native;
-mod integer_parse_native;
-mod x87_control_native;
-mod x87_store_native;
-mod c_locale_native;
-mod float_parse_native;
-mod scan_native;
-mod guest_time_native;
-mod imul_implicit_native;
-mod sleep_native;
-mod tiler_native;
+mod thread_services_native;
+mod threadattr_native;
 mod tiler_gpu_native;
+mod tiler_native;
 mod tls_native;
 mod truncate_native;
 mod user_service_native;
+mod vasprintf_hex_native;
+mod vasprintf_native;
+mod vmovd_native;
 mod vmovsd_native;
 mod vmulsd_native;
+mod vpbroadcastd_native;
+mod vpxor_native;
+mod wcscoll_native;
+mod wcstombs_native;
+mod wcsxfrm_native;
+mod wide_strings_native;
 mod worker_native;
+mod x87_control_native;
+mod x87_store_native;
 fn main() -> Result<(), String> {
     let startup_only = match std::env::args_os().nth(2).as_deref() {
         None => false,
@@ -127,7 +128,9 @@ fn main() -> Result<(), String> {
     let directory =
         std::env::var_os("NATIVE_PS5_AOT_DIRECTORY").ok_or("Missing compiler output directory")?;
     let presentation_result = if startup_only {
-        println!("STARTUP-ONLY: component regressions and Metal presentation are SKIPPED; this run cannot establish their success");
+        println!(
+            "STARTUP-ONLY: component regressions and Metal presentation are SKIPPED; this run cannot establish their success"
+        );
         None
     } else {
         stat_native::verify(Path::new(&archive), Path::new(&directory))?;
@@ -141,44 +144,176 @@ fn main() -> Result<(), String> {
         sysctl_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
         sigaction_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
         wcstombs_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
-        sort_search_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("sort-search"))?;
-        fgets_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("fgets"))?;
-        getcwd_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("getcwd"))?;
-        strdup_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strdup"))?;
-        mkdir_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("mkdir"))?;
-        cond_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("condition"))?;
-        multibyte_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("multibyte"))?;
-        abort_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("abort"))?;
+        sort_search_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("sort-search"),
+        )?;
+        fgets_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("fgets"),
+        )?;
+        getcwd_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("getcwd"),
+        )?;
+        strdup_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("strdup"),
+        )?;
+        mkdir_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("mkdir"),
+        )?;
+        cond_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("condition"),
+        )?;
+        multibyte_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("multibyte"),
+        )?;
+        abort_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("abort"),
+        )?;
         movdqu_native::verify(Path::new(&archive), &Path::new(&directory).join("movdqu"))?;
-        vasprintf_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("vasprintf"))?;
-        vasprintf_hex_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("vasprintf-hex"))?;
-        printf_stdout_native::verify(Path::new(&archive), &Path::new(&directory).join("printf-stdout"))?;
+        vasprintf_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("vasprintf"),
+        )?;
+        vasprintf_hex_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("vasprintf-hex"),
+        )?;
+        printf_stdout_native::verify(
+            Path::new(&archive),
+            &Path::new(&directory).join("printf-stdout"),
+        )?;
         fprintf_native::verify(Path::new(&archive), &Path::new(&directory).join("fprintf"))?;
-        remove_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("remove"))?;
-        rename_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("rename"))?;
-        strncpy_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strncpy"))?;
-        sscanf_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("sscanf"))?;
-        directory_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("directory"))?;
-        putenv_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("putenv"))?;
-        fgetc_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("fgetc"))?;
-        strcoll_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strcoll"))?;
-        strxfrm_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strxfrm"))?;
-        wcscoll_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("wcscoll"))?;
+        remove_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("remove"),
+        )?;
+        rename_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("rename"),
+        )?;
+        strncpy_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("strncpy"),
+        )?;
+        sscanf_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("sscanf"),
+        )?;
+        directory_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("directory"),
+        )?;
+        putenv_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("putenv"),
+        )?;
+        fgetc_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("fgetc"),
+        )?;
+        strcoll_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("strcoll"),
+        )?;
+        strxfrm_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("strxfrm"),
+        )?;
+        wcscoll_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("wcscoll"),
+        )?;
         lzcnt_native::verify(Path::new(&archive), &Path::new(&directory).join("lzcnt"))?;
         bit_test_native::verify(Path::new(&archive), &Path::new(&directory).join("bit-test"))?;
-        narrow_shift_native::verify(Path::new(&archive), &Path::new(&directory).join("narrow-shift"))?;
+        narrow_shift_native::verify(
+            Path::new(&archive),
+            &Path::new(&directory).join("narrow-shift"),
+        )?;
         mul_native::verify(Path::new(&archive), &Path::new(&directory).join("mul"))?;
-        wcsxfrm_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("wcsxfrm"))?;
-        mbrlen_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("mbrlen"))?;
-        mbtowc_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("mbtowc"))?;
-        mb_cur_max_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("mb-cur-max"))?;
-        strtok_r_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtok-r"))?;
-        stdout_byte_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("stdout-byte"))?;
-        packed_compare_shift_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-compare-shift"))?;
-        vpbroadcastd_native::verify(Path::new(&archive), &Path::new(&directory).join("vpbroadcastd"))?;
-        strftime_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strftime"))?;
-        strtof_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtof"))?;
-        strtold_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtold"))?;
+        byte_divide_native::verify(
+            Path::new(&archive),
+            &Path::new(&directory).join("byte-divide"),
+        )?;
+        wcsxfrm_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("wcsxfrm"),
+        )?;
+        mbrlen_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("mbrlen"),
+        )?;
+        mbtowc_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("mbtowc"),
+        )?;
+        mb_cur_max_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("mb-cur-max"),
+        )?;
+        strtok_r_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("strtok-r"),
+        )?;
+        stdout_byte_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("stdout-byte"),
+        )?;
+        packed_compare_shift_native::verify(
+            Path::new(&archive),
+            &Path::new(&directory).join("packed-compare-shift"),
+        )?;
+        vpbroadcastd_native::verify(
+            Path::new(&archive),
+            &Path::new(&directory).join("vpbroadcastd"),
+        )?;
+        strftime_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("strftime"),
+        )?;
+        strtof_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("strtof"),
+        )?;
+        strtold_native::verify(
+            &file,
+            Path::new(&archive),
+            &Path::new(&directory).join("strtold"),
+        )?;
         vmovd_native::verify(Path::new(&archive), &Path::new(&directory).join("vmovd"))?;
         cvtsi2sd_native::verify(Path::new(&archive), &Path::new(&directory).join("cvtsi2sd"))?;
         vpxor_native::verify(Path::new(&archive), &Path::new(&directory).join("vpxor"))?;
@@ -600,7 +735,10 @@ fn main() -> Result<(), String> {
         ("readdir", Service::Readdir),
         ("closedir", Service::Closedir),
         ("putenv", Service::Putenv),
-        ("fgetc", Service::File(native_ps5::stdio_file::Operation::ReadByte)),
+        (
+            "fgetc",
+            Service::File(native_ps5::stdio_file::Operation::ReadByte),
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -726,30 +864,51 @@ fn main() -> Result<(), String> {
         use native_ps5::kernel_module::{Export, Kind};
         let mut user = native_ps5::guest_memory::Memory::default();
         user.add(0x30003000, &mut isthreaded, true, false)?;
-        user.add(native_ps5::guest_locale::MB_CUR_MAX_ADDR, &mut mb_cur_max, true, false)?;
-        user.add(native_ps5::stdout_file::STDOUT_PTR_ADDR, &mut stdout_pointer, true, false)?;
+        user.add(
+            native_ps5::guest_locale::MB_CUR_MAX_ADDR,
+            &mut mb_cur_max,
+            true,
+            false,
+        )?;
+        user.add(
+            native_ps5::stdout_file::STDOUT_PTR_ADDR,
+            &mut stdout_pointer,
+            true,
+            false,
+        )?;
         user.add(
             native_ps5::guest_stdio::STDERR_PTR_ADDR,
             &mut stderr_pointer,
             false,
             false,
         )?;
-        user.add(native_ps5::stdio_file::STDIN_PTR_ADDR, &mut stdin_pointer, false, false)?;
+        user.add(
+            native_ps5::stdio_file::STDIN_PTR_ADDR,
+            &mut stdin_pointer,
+            false,
+            false,
+        )?;
         let nids = encode_exports(&libc_exports)?;
         let exports = nids
             .iter()
             .map(|(nid, address)| Export {
                 nid,
                 address: *address,
-                kind: if *address == 0x30003000 || *address == native_ps5::guest_locale::MB_CUR_MAX_ADDR {
+                kind: if *address == 0x30003000
+                    || *address == native_ps5::guest_locale::MB_CUR_MAX_ADDR
+                {
                     Kind::Object {
                         size: 4,
                         writable: true,
                     }
                 } else if *address == native_ps5::stdout_file::STDOUT_PTR_ADDR {
-                    Kind::Object { size: 8, writable: true }
+                    Kind::Object {
+                        size: 8,
+                        writable: true,
+                    }
                 } else if *address == native_ps5::guest_stdio::STDERR_PTR_ADDR
-                    || *address == native_ps5::stdio_file::STDIN_PTR_ADDR {
+                    || *address == native_ps5::stdio_file::STDIN_PTR_ADDR
+                {
                     Kind::Object {
                         size: 8,
                         writable: false,
@@ -1582,8 +1741,11 @@ fn main() -> Result<(), String> {
                 (1296, "putenv"),
                 (1328, "fgetc"),
             ] {
-                let expected = libc_exports.iter().find(|(symbol, _)| *symbol == name)
-                    .ok_or("Missing registered libc service")?.1;
+                let expected = libc_exports
+                    .iter()
+                    .find(|(symbol, _)| *symbol == name)
+                    .ok_or("Missing registered libc service")?
+                    .1;
                 if locale_segment.bytes[locale_offset + delta..locale_offset + delta + 8]
                     != expected.to_le_bytes()
                 {

@@ -228,13 +228,43 @@ mod tests {
         }
     }
     #[test]
+    fn byte_division_commits_ax_only_and_faults_atomically() {
+        for (ax, divisor, signed, result) in [
+            (0x1234, 0x80, 0, Some(0x3424)),
+            (0xff80, 1, 1, Some(0x0080)),
+            (0x0080, 0xff, 1, Some(0x0080)),
+            (0xff7f, 2, 1, Some(0xffc0)),
+            (0x8000, 0xff, 1, None),
+            (0xff80, 0xff, 1, None),
+            (0x0100, 1, 0, None),
+            (1, 0x100, 0, None),
+            (0xff80, 0x180, 1, Some(1)),
+        ] {
+            let mut cpu = crate::legacy_cpu::Cpu {
+                registers: [0x123456789abcdef0; 16],
+                flags: 0xed7,
+                ..Default::default()
+            };
+            cpu.registers[0] = (cpu.registers[0] & !0xffff) | ax;
+            let mut expected = cpu.registers;
+            if let Some(result) = result {
+                expected[0] = (expected[0] & !0xffff) | result;
+            }
+            divide(&mut cpu, divisor, 8, signed);
+            assert_eq!(cpu.registers, expected, "AX={ax:x}, divisor={divisor:x}");
+            assert_eq!(cpu.flags, 0xed7);
+            assert_eq!(cpu.fault, if result.is_some() { 0 } else { DIVIDE_ERROR });
+        }
+    }
+    #[test]
     fn division_rejects_invalid_modes_and_preserves_existing_faults() {
         for (bits, signed, prior, expected) in [
-            (8, 0, 0, 3),
+            (7, 0, 0, 3),
             (0, 0, 0, 3),
             (65, 0, 0, 3),
             (64, 2, 0, 3),
             (64, 0, 9, 9),
+            (8, 0, 9, 9),
         ] {
             let mut cpu = crate::legacy_cpu::Cpu {
                 registers: [u64::MAX; 16],
@@ -280,19 +310,24 @@ mod tests {
 /// Modeled x86 divide error (#DE): zero divisor or quotient out of range.
 pub const DIVIDE_ERROR: u64 = 13;
 
-/// Divide the double-width DX:AX / EDX:EAX / RDX:RAX value atomically.
+/// Divide AX / DX:AX / EDX:EAX / RDX:RAX atomically. Byte division places
+/// the quotient in AL and remainder in AH, leaving RDX and upper RAX alone.
 /// Arithmetic flags are undefined by x86 DIV/IDIV and are preserved here.
 pub fn divide(cpu: &mut crate::legacy_cpu::Cpu, divisor: u64, bits: u64, signed: u64) {
     if cpu.fault != 0 {
         return;
     }
-    if ![16, 32, 64].contains(&bits) || signed > 1 {
+    if ![8, 16, 32, 64].contains(&bits) || signed > 1 {
         cpu.fault = 3;
         return;
     }
     let mask = u64::MAX >> (64 - bits);
     let divisor = divisor & mask;
-    let dividend = ((cpu.registers[2] & mask) as u128) << bits | (cpu.registers[0] & mask) as u128;
+    let dividend = if bits == 8 {
+        (cpu.registers[0] & 0xffff) as u128
+    } else {
+        ((cpu.registers[2] & mask) as u128) << bits | (cpu.registers[0] & mask) as u128
+    };
     let output = if divisor == 0 {
         None
     } else if signed == 0 {
@@ -320,6 +355,10 @@ pub fn divide(cpu: &mut crate::legacy_cpu::Cpu, divisor: u64, bits: u64, signed:
         })
     };
     if let Some((quotient, remainder)) = output {
+        if bits == 8 {
+            cpu.registers[0] = (cpu.registers[0] & !0xffff) | quotient | (remainder << 8);
+            return;
+        }
         for (index, value) in [(0, quotient), (2, remainder)] {
             cpu.registers[index] = if bits == 16 {
                 (cpu.registers[index] & !mask) | value

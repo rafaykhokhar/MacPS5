@@ -1,5 +1,11 @@
 # Rust migration
 
+Byte DIV/IDIV now translates with AX input, AL/AH outputs and atomic modeled
+divide errors. The matching build passes 605 library tests, three integration
+tests, strict Clippy, 1,120,336 native byte-division checks and 175,008 existing
+wider-division checks. See [CPU evidence and boundaries](../docs/status/CPU.md).
+Production readiness and PS5 gameplay remain unverified.
+
 Unsigned MUL8/16/32/64 now translates to ARM64 with full-width implicit results,
 alias-safe inputs and guarded flags. The build passes 604 library tests, three
 integration tests, strict Clippy and 754,413 independent native checks. See

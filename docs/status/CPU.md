@@ -1,5 +1,39 @@
 # CPU completion criteria
 
+## Byte division
+
+DIV/IDIV r/m8 now translate through the Rust arithmetic helper. The dividend is
+AX, with quotient in AL and remainder in AH. Upper RAX and all of RDX are
+preserved. The explicit operand is captured before either output changes,
+including AL/AH aliases and memory addressed through RAX. Zero divisors and
+out-of-range quotients produce modeled divide-error diagnostic 13 without
+committing registers; a failed operand load takes priority. Undefined flags
+are preserved deterministically. This is not complete architectural exception
+delivery.
+
+Reference: AMD APM Volume 3 rev.3.31, DIV pp.173–174 and IDIV pp.177–178
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/24594_APM_v3-r3.31.pdf)).
+The build passes 605 library tests, three integration tests, strict Clippy and
+release compilation (`work/byte-divide-native/{tests,clippy,release}.log`,
+process 9716 exit 0).
+
+[Native verifier](../../rust/verification/byte_divide_native.rs) passes
+1,120,336 checks over 16 decoded forms (`work/byte-divide-native/native.log`,
+process 69479 exit 0). Independent u32/i32 references cover every AX value
+against six selected divisors, exhaustive AL/AH source aliases, randomized AX
+with all byte divisor values, high registers, readonly unaligned/high/RIP
+memory, address aliases, load failures, error atomicity, flags, FP state,
+fuel and preexisting faults. These are ARM64 executions compared with a Rust
+reference, not x86 hardware differential measurements.
+
+Existing DIV/IDIV16/32/64 also pass 175,008 comparisons with the bit-serial
+oracle, alongside the other arithmetic regression suites
+(`work/byte-divide-native/wide-regression.log`, process 38005 exit 0).
+The combined entry verifier compiles with warnings denied and includes the
+new suite. Full startup was not rerun for this instruction increment.
+LOCK/REP, FS/GS and address32 forms remain unsupported. No retail-game
+execution or production-readiness claim follows from these checks.
+
 ## Unsigned multiplication
 
 MUL r/m8, r/m16, r/m32 and r/m64 now lower to ARM64. Inputs are captured before
