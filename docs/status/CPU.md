@@ -1,5 +1,43 @@
 # CPU completion criteria
 
+## Narrow shifts and rotations
+
+SHL/SHR/SAR/ROL/ROR now support byte and word operands, with register or memory
+destinations and immediate, CL or implicit-one counts. Narrow counts use the
+x86 five-bit mask, not a width-minus-one mask. SAR sign-extends its input;
+rotations repeat the narrow bit pattern while preserving the masked count for
+flag handling. AH and other partial-register writes retain surrounding bits.
+Existing 32/64-bit result and writeback behavior remains unchanged.
+
+Flags follow AMD APM Volume 3 rev.3.31: ROL pp.308–309, ROR pp.310–311,
+SAL/SHL pp.315–317, SAR pp.318–320, SHR pp.334–336
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/24594_APM_v3-r3.31.pdf)).
+CF follows the last shifted-out bit; AF for shifts and OF for multi-bit counts
+retain their incoming values as the deterministic undefined-state policy.
+Masked count zero preserves flags. The existing memory profile still validates
+the read and store at count zero; faults preserve guest data and flags. These
+guard checks do not establish complete architectural exception ordering.
+
+The matching build passes 603 library tests, three integration tests, strict
+Clippy and release compilation (`work/narrow-shift-native/{tests,clippy,release}.log`,
+process 25709 exit 0). Independent native verification passes 502,020 checks
+over 300 decoded forms (`work/narrow-shift-native/native.log`, process 34400
+exit 0), including every CL byte count, immediate boundaries, partial-register
+aliases, high unaligned memory, load/store failures, FP-state preservation,
+fuel and 32/64-bit regressions. The reference shifts one bit at a time; no AMD
+hardware differential run is claimed.
+
+Static discovery reaches 54,225 instructions and 206 unsupported boundaries,
+up from 54,147 instructions and 210 boundaries. All four previous narrow-shift
+boundaries disappear, with no new boundary in this snapshot. The pinned sites
+include ROL AL,5 and SHR DIL/SIL,CL. This is static reachability, not evidence
+those payload paths executed. RCL/RCR, unsupported address modes and complete
+fault delivery remain outside this increment.
+
+Startup-only verification passes (`work/arm64-prototype/narrow-shift-entry.log`,
+process 64379 exit 0), with the same missing fscanf boundary after all ten named
+dependencies are accepted. Game main has not executed.
+
 ## Bit test, set and reset
 
 Exact BT/BTS/BTR 32/64-bit forms now lower to ARM64, with register or memory

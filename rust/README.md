@@ -1,5 +1,11 @@
 # Rust migration
 
+Byte/word SHL/SHR/SAR/ROL/ROR now translate to ARM64 with x86 count masking,
+partial-register writes and guarded flags. The matching build passes 603 library
+tests, three integration tests, strict Clippy and 502,020 native checks including
+32/64-bit regressions. [CPU status](../docs/status/CPU.md) records exact scope
+and remaining architectural gaps.
+
 The CPU translator now supports exact BT/BTS/BTR32/64 forms, including signed
 memory indices and guarded flag publication. 43,180 independent native checks
 pass alongside 602 library tests, three integration tests and strict Clippy.

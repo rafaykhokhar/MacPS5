@@ -37,6 +37,40 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn narrow_shift_forms_and_excluded_addressing() {
+        for operation in [0, 1, 4, 5, 7] {
+            for prefix in [&[][..], &[0x40][..], &[0x66][..]] {
+                let word = prefix == [0x66];
+                for (byte_opcode, immediate) in [(0xd0, false), (0xd2, false), (0xc0, true)] {
+                    for base in [0xc0, 0xc1, 0xc4, 0xc7, 0x07] {
+                        let mut bytes = prefix.to_vec();
+                        bytes.extend([byte_opcode + u8::from(word), base | (operation << 3)]);
+                        if immediate {
+                            bytes.push(255);
+                        }
+                        assert!(
+                            super::translate_rust_memory_region(&bytes, 0, "narrow_shift").is_ok(),
+                            "{bytes:x?}"
+                        );
+                    }
+                }
+            }
+        }
+        for bytes in [
+            &[0xf0, 0xd2, 0x27][..],
+            &[0x64, 0xd2, 0x27],
+            &[0x65, 0x66, 0xd3, 0x3f],
+            &[0x67, 0xd2, 0x2f],
+            &[0x67, 0xd2, 0x2c, 0x25, 0, 0, 0, 0],
+            &[0xd2, 0xd0], // RCL is a distinct carry-input instruction.
+        ] {
+            assert!(
+                super::translate_rust_memory_region(bytes, 0, "unsupported_shift").is_err(),
+                "{bytes:x?}"
+            );
+        }
+    }
+    #[test]
     fn bit_test_exact_forms_and_address_guards() {
         for rex in [&[][..], &[0x48][..]] {
             for opcode in [0xa3, 0xab, 0xb3] {
@@ -1120,11 +1154,21 @@ impl Emitter {
                 self.fault();
             }
             M::Shl | M::Shr | M::Sar | M::Rol | M::Ror => {
-                if ![32, 64].contains(&width) {
+                if ![8, 16, 32, 64].contains(&width) {
                     return Err("Shift width is not implemented".into());
                 }
+                if i.op0_kind() == OpKind::Memory
+                    && i.memory_base() == R::None
+                    && i.memory_index() == R::None
+                    && i.memory_displ_size() != 8
+                {
+                    return Err("32-bit absolute addressing is not implemented".into());
+                }
                 self.read(i, 1, 8, 20)?;
-                self.emit(format!("and x20, x20, #{}", width - 1));
+                self.emit(format!(
+                    "and x20, x20, #{}",
+                    if width == 64 { 63 } else { 31 }
+                ));
                 self.read(i, 0, width, 21)?;
                 let (op, flags) = match m {
                     M::Shl => ("lsl", 0),
@@ -1133,13 +1177,41 @@ impl Emitter {
                     M::Rol => ("ror", 3),
                     _ => ("ror", 4),
                 };
-                let count = if m == M::Rol {
-                    self.emit("neg x9, x20");
-                    9
+                if width < 32 {
+                    if matches!(m, M::Rol | M::Ror) {
+                        // Repeat the narrow word across 32 bits, then rotate the
+                        // repeated pattern. Keep masked count for CF/OF semantics.
+                        self.emit(if width == 8 {
+                            "orr w9, w21, w21, lsl #8"
+                        } else {
+                            "mov w9, w21"
+                        });
+                        self.emit("orr w9, w9, w9, lsl #16");
+                        if m == M::Rol {
+                            self.emit("neg w10, w20\nror w22, w9, w10");
+                        } else {
+                            self.emit("ror w22, w9, w20");
+                        }
+                    } else if m == M::Sar {
+                        self.emit(if width == 8 {
+                            "sxtb w9, w21"
+                        } else {
+                            "sxth w9, w21"
+                        });
+                        self.emit("asr w22, w9, w20");
+                    } else {
+                        self.emit(format!("{op} w22, w21, w20"));
+                    }
+                    self.emit(format!("and x22, x22, #{}", (1u64 << width) - 1));
                 } else {
-                    20
-                };
-                self.emit(format!("{op} {p}22, {p}21, {p}{count}"));
+                    let count = if m == M::Rol {
+                        self.emit("neg x9, x20");
+                        9
+                    } else {
+                        20
+                    };
+                    self.emit(format!("{op} {p}22, {p}21, {p}{count}"));
+                }
                 self.write(i, 0, width, 22)?;
                 self.emit(format!("ldr x0, [x19, #136]\nmov x1, x21\nmov x2, x20\nmov x3, x22\nmov x4, #{width}\nmov x5, #{flags}\nbl _native_ps5_shift_flags_v1\nstr x0, [x19, #136]\nstr x1, [x19, #152]"));
                 self.fault();

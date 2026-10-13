@@ -1,5 +1,7 @@
-//! SHL/SHR/SAR/ROL/ROR flags for the supported 32- and 64-bit operands.
-//! Undefined AF and multi-bit OF retain their incoming values.
+//! SHL/SHR/SAR/ROL/ROR flags for 8-, 16-, 32- and 64-bit operands.
+//! Undefined AF and multi-bit OF retain their incoming values. AMD APM Vol.3
+//! Rev.3.31 pp.315/318/334 specifies CF as the last shifted-out bit, including
+//! narrow counts at/beyond width. Rotate counts are masked before width reduction.
 use crate::arithmetic::FlagsResult;
 pub fn flags(
     old: u64,
@@ -9,13 +11,13 @@ pub fn flags(
     bits: u64,
     operation: u64,
 ) -> FlagsResult {
-    if ![32, 64].contains(&bits) || operation > 4 {
+    if ![8, 16, 32, 64].contains(&bits) || operation > 4 {
         return FlagsResult {
             flags: old,
             fault: 3,
         };
     }
-    let count = count & (bits - 1);
+    let count = count & if bits == 64 { 63 } else { 31 };
     if count == 0 {
         return FlagsResult {
             flags: old,
@@ -26,6 +28,8 @@ pub fn flags(
     let original = original & mask;
     let result = result & mask;
     let carry = match operation {
+        0 | 1 if count > bits => 0,
+        2 if count >= bits => original >> (bits - 1),
         0 => (original >> (bits - count)) & 1,
         1 | 2 => (original >> (count - 1)) & 1,
         3 => result & 1,
@@ -71,7 +75,7 @@ mod tests {
     use super::*;
     #[test]
     fn single_bit_reference_covers_counts_widths_rotates_and_preserved_flags() {
-        for bits in [32, 64] {
+        for bits in [8, 16, 32, 64] {
             let mask = u64::MAX >> (64 - bits);
             let sign = 1 << (bits - 1);
             for input in [
@@ -87,7 +91,7 @@ mod tests {
             ] {
                 for operation in 0..5 {
                     for raw_count in 0..256 {
-                        let count = raw_count & (bits - 1);
+                        let count = raw_count & if bits == 64 { 63 } else { 31 };
                         let original = input & mask;
                         let mut value = original;
                         let mut carry = false;
@@ -152,7 +156,7 @@ mod tests {
                 }
             }
         }
-        for (bits, operation) in [(0, 0), (8, 0), (16, 0), (65, 0), (32, 5), (64, u64::MAX)] {
+        for (bits, operation) in [(0, 0), (7, 0), (17, 0), (65, 0), (32, 5), (64, u64::MAX)] {
             assert_eq!(
                 flags(0x123, 0, 0, 0, bits, operation),
                 FlagsResult {
