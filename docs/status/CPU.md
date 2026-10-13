@@ -75,3 +75,9 @@ The exact `VEX_Vmovd_xmm_rm32` form is now lowered, including the pinned executa
 An isolated HEAD-plus-lowering build passes 8,219 independent native byte-copy cases (`work/vmovd-review/native.log`, 62020), including register edges/random values, high registers, readonly unaligned/full-width/RIP-relative loads, short/unmapped memory, unchanged unrelated state and fuel exhaustion. Isolated strict Clippy passes. These checks do not establish support for other MOVD forms; matching full-run integration remains separate. The baseline inventory's static counts predate this change.
 
 The same 8,219 cases also pass against the standard release archive (`work/vmovd-review/release-native.log`, 65815). With VMOVD lowering available, pinned startup discovery reaches 53,616 instructions and 228 unsupported boundaries: following previously blocked paths exposes additional boundaries rather than proving a monotonic percentage increase (`strftime-entry.log`).
+
+## Signed64 VCVTSI2SD
+
+The signed r/m64 form now converts using an integer-only rounding helper, preserves the source merge lane and clears the upper YMM half after successful conversion. It handles all MXCSR rounding modes, sticky precision and the prototype's explicit unmasked-precision fault without committing destination lanes. Invalid controls and failed memory loads retain their defined guard behavior.
+
+An independent exact binary64-lattice oracle passes 79,714 native comparisons against the standard release (`work/cvtsi2sd-review/release-native.log`, 24378), including integer boundaries/random inputs, exact pinned encoding, merge aliases, high registers, DAZ/FTZ combinations, masked/unmasked precision, full-width unaligned memory and short-read guards. Nineteen focused scalar tests and isolated strict Clippy also pass. This closes the stated instruction form, not general CPU or architectural exception-delivery coverage.

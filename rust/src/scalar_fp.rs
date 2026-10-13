@@ -6,6 +6,8 @@
 use crate::legacy_cpu::Cpu;
 mod arithmetic;
 mod fma;
+mod convert_i64;
+pub use convert_i64::convert_i64_binary64;
 pub use fma::fma213_binary64;
 mod truncate;
 pub use truncate::{TruncateError, TruncateResult, truncate_binary64_i32};

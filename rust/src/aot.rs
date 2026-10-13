@@ -426,12 +426,26 @@ impl Emitter {
                 self.write(i, 0, 32, 20)?;
             }
             M::Vcvtsi2sd => {
-                if i.code() != iced_x86::Code::VEX_Vcvtsi2sd_xmm_xmm_rm32 {
-                    return Err("Only signed32 VEX VCVTSI2SD is implemented".into());
-                }
+                let source_width = match i.code() {
+                    iced_x86::Code::VEX_Vcvtsi2sd_xmm_xmm_rm32 => 32,
+                    iced_x86::Code::VEX_Vcvtsi2sd_xmm_xmm_rm64 => 64,
+                    _ => return Err("Only signed32/64 VEX VCVTSI2SD is implemented".into()),
+                };
                 let dst = vector(i.op_register(0))?;
                 let merge = vector(i.op_register(1))?;
-                self.read(i, 2, 32, 20)?;
+                self.read(i, 2, source_width, 20)?;
+                if source_width == 64 {
+                    self.emit(format!(
+                        "ldr x21, [x19, #{}]\nmov x0, x19\nmov x1, x20\nbl _native_ps5_convert_i64_binary64_v1",
+                        216 + merge * 32
+                    ));
+                    self.fault();
+                    self.emit(format!(
+                        "str x0, [x19, #{}]\nstr x21, [x19, #{}]\nstr xzr, [x19, #{}]\nstr xzr, [x19, #{}]",
+                        208 + dst * 32, 216 + dst * 32, 224 + dst * 32, 232 + dst * 32
+                    ));
+                    return Ok(());
+                }
                 // Every signed32 integer fits exactly in binary64, independent
                 // of rounding mode. Snapshot merge before any aliased write.
                 self.emit(format!(
@@ -1046,7 +1060,7 @@ mod scalar_vmovsd_tests {
 mod scalar_integer_conversion_tests {
     use super::*;
     #[test]
-    fn exact_signed32_forms_only() {
+    fn exact_signed32_and_signed64_vex_forms_only() {
         for bytes in [
             &[0xc4, 0xc1, 0x03, 0x2a, 0xe1][..],
             &[0xc4, 0xe1, 0x03, 0x2a, 0x27][..],
@@ -1055,9 +1069,10 @@ mod scalar_integer_conversion_tests {
             assert_eq!(i.code(), iced_x86::Code::VEX_Vcvtsi2sd_xmm_xmm_rm32);
             assert!(supported(&i).is_ok());
         }
-        assert!(
-            translate_rust_memory_region(&[0xc4, 0xc1, 0x83, 0x2a, 0xe1], 0, "inexact64").is_err()
-        );
+        let i = decode::instruction(&[0xc4, 0xc1, 0x83, 0x2a, 0xe1], 0).unwrap();
+        assert_eq!(i.code(), iced_x86::Code::VEX_Vcvtsi2sd_xmm_xmm_rm64);
+        assert!(supported(&i).is_ok());
+        assert!(translate_rust_memory_region(&[0xf2, 0x48, 0x0f, 0x2a, 0xc0], 0, "legacy").is_err());
     }
 }
 #[cfg(test)]

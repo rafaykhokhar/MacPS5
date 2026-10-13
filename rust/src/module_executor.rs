@@ -935,6 +935,7 @@ pub enum Service {
     Strtoull,
     Atof,
     Strtod,
+    Strtof,
     Vsscanf,
     Gettimeofday,
     File(crate::stdio_file::Operation),
@@ -1125,6 +1126,7 @@ impl Service {
             | Self::Strtoull
             | Self::Atof
             | Self::Strtod
+            | Self::Strtof
             | Self::Vsscanf
             | Self::Gettimeofday
             | Self::File(_)
@@ -5598,24 +5600,28 @@ impl NativeExecutor {
                         }
                         cpu.mxcsr |= plan.mxcsr_flags;
                         plan.result as u32 as u64
-                    } else if matches!(service, Service::Atof | Service::Strtod) {
+                    } else if matches!(service, Service::Atof | Service::Strtod | Service::Strtof) {
                         let rounding = crate::float_service::rounding(&cpu)?;
                         let source = cpu.registers[7];
                         let input = crate::float_service::input(&memory, source)?;
-                        let effect = crate::float_parse::effects::parse_effects(&input, rounding)
-                            .map_err(|error| {
-                            format!("Unsupported float conversion: {error:?}")
-                        })?;
-                        let parsed = effect.parsed;
+                        let (bits, end_offset, errno_code, flags, width) = if matches!(service, Service::Strtof) {
+                            let effect = crate::float_parse::strtof_effects::parse_effects(&input, rounding)
+                                .map_err(|error| format!("Unsupported strtof conversion: {error:?}"))?;
+                            (u64::from(effect.bits), effect.end, effect.errno.map(|code| code as i32), effect.mxcsr_flags, 4)
+                        } else {
+                            let effect = crate::float_parse::effects::parse_effects(&input, rounding)
+                                .map_err(|error| format!("Unsupported float conversion: {error:?}"))?;
+                            (effect.parsed.bits, effect.parsed.end, effect.parsed.errno, effect.mxcsr_flags, 8)
+                        };
                         let endptr = if matches!(service, Service::Atof) {
                             0
                         } else {
                             cpu.registers[6]
                         };
                         let end = source
-                            .checked_add(parsed.end as u64)
+                            .checked_add(end_offset as u64)
                             .ok_or("Float end pointer overflow")?;
-                        let errno = if parsed.errno.is_some() {
+                        let errno = if errno_code.is_some() {
                             let address = self
                                 .kernel
                                 .as_ref()
@@ -5636,16 +5642,16 @@ impl NativeExecutor {
                         if let Some(address) = errno {
                             memory.store(
                                 address,
-                                parsed.errno.expect("Validated errno") as u32 as u64,
+                                errno_code.expect("Validated errno") as u32 as u64,
                                 4,
                             )?;
                         }
                         if endptr != 0 {
                             memory.store(endptr, end, 8)?;
                         }
-                        cpu.mxcsr |= effect.mxcsr_flags;
-                        cpu.vectors[0][..8].copy_from_slice(&parsed.bits.to_le_bytes());
-                        // SysV binary64 returns in XMM0; RAX is not the result.
+                        cpu.mxcsr |= flags;
+                        cpu.vectors[0][..width].copy_from_slice(&bits.to_le_bytes()[..width]);
+                        // SysV scalar floating results use XMM0; RAX is not the result.
                         cpu.registers[0]
                     } else if matches!(service, Service::Strlcpy | Service::Strlcat) {
                         let plan = crate::narrow_strings::copy_plan(
