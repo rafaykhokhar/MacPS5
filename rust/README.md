@@ -1,10 +1,17 @@
 # Rust migration
 
+`Fgetc` now reads unsigned bytes through the owned unbuffered FILE model,
+including exposed buffer metadata and guarded EOF/error handling. The matching
+build passes 598 library tests, three integration tests and strict Clippy.
+Native byte-input, existing FILE and fgets checks pass. Startup binds fgetc
+and stops at `fscanf`, retaining 20,288 dependency bytes; game main has not
+executed. See [byte-input evidence and limits](../docs/status/FGETC.md).
+
 `Putenv` now retains live caller-backed strings and interoperates with owned
 `Setenv` replacements. Prefix-only lookups and guarded failure publication
 have native checks. The build passes 593 library tests, three integration tests
 and strict Clippy; both environment native verifiers pass. Startup binds putenv
-and now stops at `fgetc`, retaining 20,240 dependency bytes. Game main has not
+and at that checkpoint stopped at `fgetc`, retaining 20,240 dependency bytes. Game main had not
 executed. See [environment evidence and limits](../docs/status/PUTENV.md).
 
 Owned `Opendir`, `Readdir` and `Closedir` services now use guest heap buffers

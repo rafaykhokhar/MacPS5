@@ -56,6 +56,7 @@ mod strncpy_native;
 mod sscanf_native;
 mod directory_native;
 mod putenv_native;
+mod fgetc_native;
 mod strcoll_native;
 mod strxfrm_native;
 mod wcscoll_native;
@@ -156,6 +157,7 @@ fn main() -> Result<(), String> {
         sscanf_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("sscanf"))?;
         directory_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("directory"))?;
         putenv_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("putenv"))?;
+        fgetc_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("fgetc"))?;
         strcoll_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strcoll"))?;
         strxfrm_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strxfrm"))?;
         wcscoll_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("wcscoll"))?;
@@ -592,6 +594,7 @@ fn main() -> Result<(), String> {
         ("readdir", Service::Readdir),
         ("closedir", Service::Closedir),
         ("putenv", Service::Putenv),
+        ("fgetc", Service::File(native_ps5::stdio_file::Operation::ReadByte)),
     ]
     .into_iter()
     .enumerate()
@@ -1571,6 +1574,7 @@ fn main() -> Result<(), String> {
                 (1280, "closedir"),
                 (1288, "readdir"),
                 (1296, "putenv"),
+                (1328, "fgetc"),
             ] {
                 let expected = libc_exports.iter().find(|(symbol, _)| *symbol == name)
                     .ok_or("Missing registered libc service")?.1;
@@ -1599,12 +1603,12 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 163 libc exports: 164*24=3936 symbol bytes
-                // and 1+163*12=1957 NID bytes (rounded1968).
-                || native.bytes_allocated() != 20240
+                // 164 libc exports: 165*24=3960 symbol bytes (rounded3968)
+                // and 1+164*12=1969 NID bytes (rounded1984).
+                || native.bytes_allocated() != 20288
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'fgetc'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'fscanf'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1614,7 +1618,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; putenv import bound; unresolved fgetc causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; fgetc import bound; unresolved fscanf causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1676,7 +1680,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved fgetc triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved fscanf triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     if let Some(result) = presentation_result {
