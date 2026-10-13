@@ -1,120 +1,136 @@
+//! Translated x86-to-ARM64 exercise of the pinned SDL direct-memory calls.
 use native_ps5::{
-    arm64_code::{Arm64Code, Branch},
-    guest_memory::{
-        Memory,
-        ffi::{native_ps5_module_load_v1, native_ps5_module_store_v1},
-    },
-    jit_memory::JitArena,
-    legacy_cpu::Cpu,
+    guest_memory::DataRegion,
+    loader::Image,
+    module_executor::{Execution, NativeExecutor, Service, memory_fixture},
+    modules::Arguments,
 };
-fn stub(store: bool) -> Vec<u32> {
-    let mut code = Arm64Code::new(32);
-    code.emit(0xa9bf7bf3).unwrap(); // stp x19,x30,[sp,#-16]!
-    code.emit(0xaa0003f3).unwrap(); // mov x19,x0
-    code.call_absolute(if store {
-        native_ps5_module_store_v1 as *const () as u64
-    } else {
-        native_ps5_module_load_v1 as *const () as u64
-    })
-    .unwrap();
-    if !store {
-        code.context_access(9, 19, std::mem::offset_of!(Cpu, fault), true, false)
-            .unwrap();
-        code.branch(
-            1,
-            Branch::CompareZero {
-                register: 9,
-                wide: true,
-                nonzero: true,
-            },
-        )
-        .unwrap();
-        code.context_access(0, 19, 0, true, true).unwrap();
+use std::{collections::BTreeSet, path::Path};
+
+pub fn verify(archive: &Path, directory: &Path) -> Result<(), String> {
+    const SIZE: u32 = 64 * 1024 * 1024;
+    const VALUE: u64 = 0x0123456789abcdef;
+    fn call(code: &mut Vec<u8>, address: u64) {
+        code.extend([0x48, 0xb8]);
+        code.extend(address.to_le_bytes());
+        code.extend([0xff, 0xd0]);
     }
-    code.bind(1).unwrap();
-    code.emit(0xa8c17bf3).unwrap(); // ldp x19,x30,[sp],#16
-    code.emit(0xd65f03c0).unwrap();
-    code.finish().unwrap()
-}
-fn main() {
-    // SAFETY: standalone host thread, known generated Cpu/helper ABI. Memory
-    // and Cpu remain exclusive/live throughout each synchronous native call.
-    unsafe {
-        let arena = JitArena::new(16384).unwrap();
-        let load = arena.publish(&stub(false)).unwrap();
-        let store = arena.publish(&stub(true)).unwrap();
-        let load_fn: unsafe extern "C" fn(*mut Cpu, u64, u64) =
-            std::mem::transmute(load.entry(0).unwrap());
-        let store_fn: unsafe extern "C" fn(*mut Cpu, u64, u64, u64) =
-            std::mem::transmute(store.entry(0).unwrap());
-        let mut count = 0;
-        for writable in [false, true] {
-            for size in [1, 2, 4, 8, 0, 3, 16] {
-                for address in [0xfff, 0x1000, 0x1001, 0x1008, 0x100f, 0x1010, u64::MAX] {
-                    for prior_fault in [0, 7] {
-                        let mut bytes = [0xa5; 16];
-                        let mut memory = Memory::default();
-                        memory.add(0x1000, &mut bytes, writable, false).unwrap();
-                        let mut cpu = Cpu {
-                            memory: (&mut memory as *mut Memory<'_>) as u64,
-                            fault: prior_fault,
-                            ..Cpu::default()
-                        };
-                        cpu.registers.fill(0x123456789abcdef0);
-                        let expected = memory.load(address, size);
-                        load_fn(&mut cpu, address, size);
-                        assert_eq!(
-                            cpu.fault,
-                            if prior_fault != 0 {
-                                prior_fault
-                            } else if expected.is_ok() {
-                                0
-                            } else {
-                                1
-                            }
-                        );
-                        assert_eq!(
-                            cpu.registers[0],
-                            if prior_fault == 0 {
-                                expected.unwrap_or(0x123456789abcdef0)
-                            } else {
-                                0x123456789abcdef0
-                            }
-                        );
-                        assert!(cpu.registers[1..].iter().all(|v| *v == 0x123456789abcdef0));
-                        cpu.fault = prior_fault;
-                        let old = memory.read(0x1000, 16).unwrap().to_vec();
-                        let valid = writable
-                            && [1, 2, 4, 8].contains(&size)
-                            && address >= 0x1000
-                            && address.checked_add(size).is_some_and(|end| end <= 0x1010);
-                        store_fn(&mut cpu, address, 0x1122334455667788, size);
-                        let success = prior_fault == 0 && valid;
-                        assert_eq!(
-                            cpu.fault,
-                            if prior_fault != 0 {
-                                prior_fault
-                            } else if valid {
-                                0
-                            } else {
-                                2
-                            }
-                        );
-                        let mut expected = old;
-                        if success {
-                            let at = (address - 0x1000) as usize;
-                            expected[at..at + size as usize].copy_from_slice(
-                                &0x1122334455667788u64.to_le_bytes()[..size as usize],
-                            );
-                        }
-                        assert_eq!(memory.read(0x1000, 16).unwrap(), expected);
-                        count += 2;
-                    }
-                }
+    fn immediate(code: &mut Vec<u8>, opcode: u8, value: u32) {
+        code.push(opcode);
+        code.extend(value.to_le_bytes());
+    }
+    for failure in 0..3 {
+        let mut file = memory_fixture();
+        let mut code = Vec::new();
+        immediate(&mut code, 0xbb, 0x30000000); // RBX preserved output storage.
+        immediate(&mut code, 0xbf, SIZE);
+        immediate(&mut code, 0xbe, 0x20000);
+        immediate(&mut code, 0xba, 3);
+        immediate(
+            &mut code,
+            0xb9,
+            if failure == 1 { 0x31000000 } else { 0x30000000 },
+        );
+        call(&mut code, 0x7b0000);
+        immediate(
+            &mut code,
+            0xbf,
+            if failure == 2 { 0x31000000 } else { 0x30000008 },
+        );
+        immediate(&mut code, 0xbe, SIZE);
+        immediate(&mut code, 0xba, 0x33);
+        code.extend([0x31, 0xc9, 0x4c, 0x8b, 0x03, 0x41, 0xb9]); // ECX0,R8=[RBX],R9Dalignment.
+        code.extend(0x20000u32.to_le_bytes());
+        call(&mut code, 0x7b0010);
+        code.extend([0x48, 0x8b, 0x53, 8, 0x48, 0xb8]); // RDX=virtual address.
+        code.extend(VALUE.to_le_bytes());
+        code.extend([0x48, 0x89, 0x02, 0x48, 0x89, 0x82]);
+        code.extend((SIZE - 8).to_le_bytes());
+        code.extend([0x48, 0x8b, 0x02, 0x48, 0x89, 0x43, 16, 0x48, 0x8b, 0x82]);
+        code.extend((SIZE - 8).to_le_bytes());
+        code.extend([0x48, 0x89, 0x43, 24, 0x48, 0x8b, 0x3b]);
+        immediate(&mut code, 0xbe, SIZE);
+        call(&mut code, 0x7b0020);
+        code.push(0xc3);
+        assert!(code.len() <= 0x400);
+        file[0x100..0x100 + code.len()].copy_from_slice(&code);
+        let mut native = NativeExecutor::new(0x900000, 4096, 1000, 1000)?;
+        for (address, service) in [
+            (0x7b0000, Service::DirectAllocate),
+            (0x7b0010, Service::DirectMap),
+            (0x7b0020, Service::DirectRelease),
+        ] {
+            native.register_service(address, service)?;
+        }
+        // SAFETY: caller supplies the locally built matching runtime archive.
+        unsafe {
+            native.compile_image(
+                &file,
+                0x100000,
+                BTreeSet::from([0x100]),
+                1000,
+                archive,
+                directory,
+            )?;
+        }
+        let mut image = Image::load(&file, 0x100000, 4096)?;
+        let mut outputs = [0u8; 32];
+        let mut readonly = [0u8; 8];
+        let result = {
+            let mut regions = [
+                DataRegion {
+                    address: 0x30000000,
+                    bytes: &mut outputs,
+                    writable: true,
+                },
+                DataRegion {
+                    address: 0x31000000,
+                    bytes: &mut readonly,
+                    writable: false,
+                },
+            ];
+            native.run_with_data(
+                &mut image,
+                0x100100,
+                Arguments::default(),
+                &mut [],
+                &mut regions,
+            )
+        };
+        if failure == 0 {
+            assert!(matches!(result?, Execution::Returned(0)));
+            let physical = u64::from_le_bytes(outputs[..8].try_into().unwrap());
+            let virtual_address = u64::from_le_bytes(outputs[8..16].try_into().unwrap());
+            assert_ne!(physical, 0);
+            assert_ne!(virtual_address, 0);
+            assert_eq!(physical % 0x20000, 0);
+            assert_eq!(virtual_address % 0x20000, 0);
+            assert_eq!(&outputs[16..24], &VALUE.to_le_bytes());
+            assert_eq!(&outputs[24..32], &VALUE.to_le_bytes());
+            assert_eq!(native.direct_memory.reserved_bytes(), 0);
+        } else {
+            assert!(
+                result
+                    .err()
+                    .ok_or("Readonly direct-memory output unexpectedly succeeded")?
+                    .contains("permission")
+            );
+            assert_eq!(
+                native.direct_memory.reserved_bytes(),
+                if failure == 1 { 0 } else { SIZE as u64 }
+            );
+            assert_eq!(&outputs[8..], &[0; 24]);
+            if failure == 1 {
+                assert_eq!(&outputs[..8], &[0; 8]);
             }
         }
-        println!(
-            "PASS: {count} direct guarded load/store calls, context state, prior faults, permissions, bounds and unchanged failed writes"
-        );
+        assert_eq!(native.bytes_allocated(), 0);
+        assert_eq!(readonly, [0; 8]);
+        assert_eq!(&image.segments[0].bytes[0x100..0x100 + code.len()], &code);
+        assert_eq!(&image.segments[1].bytes, &file[0x500..0x600]);
     }
+    println!(
+        "PASS: translated SDL direct allocate/map64MiB/store/load/release; readonly outputs preserve reservation ownership and bytes"
+    );
+    Ok(())
 }

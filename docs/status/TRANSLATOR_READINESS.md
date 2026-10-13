@@ -332,7 +332,7 @@ guest execution path still uses dylibs.
 The direct emitter supports W/X unsigned-offset LDR/STR for trusted host context
 fields. It validates registers, scaled alignment and the 12-bit offset range.
 These operations must not be used to dereference guest virtual addresses.
-`direct_memory_native.rs` generates call stubs for the existing guarded runtime
+`jit_guarded_memory_native.rs` generates call stubs for the existing guarded runtime
 load/store helpers. The load stub reads `Cpu.fault` and writes its result to the
 guest register only on success; callee-saved context and LR survive helper calls.
 
@@ -349,7 +349,7 @@ not independent proof of every guest-memory semantic.
 687 library tests, three integration tests, strict Clippy, release build,
 strict-warning verifiers, 100 native loop sums and 1440 arithmetic helper ABI
 checks pass (process 24038 exit 0; `work/direct-memory/` final logs).
-Compile/run `rust/verification/direct_memory_native.rs` with the matching release
+Compile/run `rust/verification/jit_guarded_memory_native.rs` with the matching release
 rlib/dependency flags used by the preceding verifiers; it needs no arguments.
 The normal guest translator/executor still uses dylibs. Guest decoding, fuel,
 PC progression and block publication have not yet been connected to this path.
