@@ -968,6 +968,7 @@ pub enum Service {
     Atof,
     Strtod,
     Strtof,
+    Strtold,
     Vsscanf,
     Gettimeofday,
     File(crate::stdio_file::Operation),
@@ -1159,6 +1160,7 @@ impl Service {
             | Self::Atof
             | Self::Strtod
             | Self::Strtof
+            | Self::Strtold
             | Self::Vsscanf
             | Self::Gettimeofday
             | Self::File(_)
@@ -5658,18 +5660,22 @@ impl NativeExecutor {
                         }
                         cpu.mxcsr |= plan.mxcsr_flags;
                         plan.result as u32 as u64
-                    } else if matches!(service, Service::Atof | Service::Strtod | Service::Strtof) {
+                    } else if matches!(service, Service::Atof | Service::Strtod | Service::Strtof | Service::Strtold) {
                         let rounding = crate::float_service::rounding(&cpu)?;
                         let source = cpu.registers[7];
                         let input = crate::float_service::input(&memory, source)?;
-                        let (bits, end_offset, errno_code, flags, width) = if matches!(service, Service::Strtof) {
+                        let (bits, end_offset, errno_code, flags, width, extended) = if matches!(service, Service::Strtold) {
+                            let effect = crate::float_parse::strtold_effects::parse_effects(&input, rounding)
+                                .map_err(|error| format!("Unsupported strtold conversion: {error:?}"))?;
+                            (0, effect.end, effect.errno.map(|code| code as i32), effect.mxcsr_flags, 0, Some(effect.bytes))
+                        } else if matches!(service, Service::Strtof) {
                             let effect = crate::float_parse::strtof_effects::parse_effects(&input, rounding)
                                 .map_err(|error| format!("Unsupported strtof conversion: {error:?}"))?;
-                            (u64::from(effect.bits), effect.end, effect.errno.map(|code| code as i32), effect.mxcsr_flags, 4)
+                            (u64::from(effect.bits), effect.end, effect.errno.map(|code| code as i32), effect.mxcsr_flags, 4, None)
                         } else {
                             let effect = crate::float_parse::effects::parse_effects(&input, rounding)
                                 .map_err(|error| format!("Unsupported float conversion: {error:?}"))?;
-                            (effect.parsed.bits, effect.parsed.end, effect.parsed.errno, effect.mxcsr_flags, 8)
+                            (effect.parsed.bits, effect.parsed.end, effect.parsed.errno, effect.mxcsr_flags, 8, None)
                         };
                         let endptr = if matches!(service, Service::Atof) {
                             0
@@ -5695,6 +5701,15 @@ impl NativeExecutor {
                             validate_net_output(&memory, endptr, 8, sp, ret)?;
                             memory.validate_write(endptr, 8)?;
                         }
+                        let x87_return = if let Some(value) = extended {
+                            let mut stack = cpu.x87.clone();
+                            let mut status = cpu.x87_status;
+                            stack.push_raw(cpu.x87_control, &mut status, value)
+                                .map_err(|error| format!("Unsupported strtold x87 return: {error:?}"))?;
+                            Some((stack, status))
+                        } else {
+                            None
+                        };
                         // All outputs are guarded before errno/endptr or FP state
                         // changes. Source was snapshotted, so output aliases are safe.
                         if let Some(address) = errno {
@@ -5708,8 +5723,13 @@ impl NativeExecutor {
                             memory.store(endptr, end, 8)?;
                         }
                         cpu.mxcsr |= flags;
-                        cpu.vectors[0][..width].copy_from_slice(&bits.to_le_bytes()[..width]);
-                        // SysV scalar floating results use XMM0; RAX is not the result.
+                        if let Some((stack, status)) = x87_return {
+                            cpu.x87 = stack;
+                            cpu.x87_status = status;
+                        } else {
+                            cpu.vectors[0][..width].copy_from_slice(&bits.to_le_bytes()[..width]);
+                        }
+                        // SysV long double returns in ST(0), float/double in XMM0.
                         cpu.registers[0]
                     } else if matches!(service, Service::Strlcpy | Service::Strlcat) {
                         let plan = crate::narrow_strings::copy_plan(

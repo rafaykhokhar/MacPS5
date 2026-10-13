@@ -51,6 +51,7 @@ mod vasprintf_hex_native;
 mod strcoll_native;
 mod strftime_native;
 mod strtof_native;
+mod strtold_native;
 mod vmovd_native;
 mod cvtsi2sd_native;
 mod vpxor_native;
@@ -122,6 +123,7 @@ fn main() -> Result<(), String> {
     strcoll_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strcoll"))?;
     strftime_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strftime"))?;
     strtof_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtof"))?;
+    strtold_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtold"))?;
     vmovd_native::verify(Path::new(&archive), &Path::new(&directory).join("vmovd"))?;
     cvtsi2sd_native::verify(Path::new(&archive), &Path::new(&directory).join("cvtsi2sd"))?;
     vpxor_native::verify(Path::new(&archive), &Path::new(&directory).join("vpxor"))?;
@@ -517,6 +519,7 @@ fn main() -> Result<(), String> {
         ("strcoll", Service::Strcoll),
         ("strftime", Service::Strftime),
         ("strtof", Service::Strtof),
+        ("strtold", Service::Strtold),
     ]
     .into_iter()
     .enumerate()
@@ -1481,13 +1484,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 139 libc exports: (139+1)*24=3360 symbol bytes (rounded3360)
-                // and 1+139*12=1669 NID bytes (rounded1680).
-                // Strtof adds32bytes to19344.
-                || native.bytes_allocated() != 19376
+                // 140 libc exports: (140+1)*24=3384 symbol bytes (rounded3392)
+                // and 1+140*12=1681 NID bytes (rounded1696).
+                // Strtold adds48bytes to19376.
+                || native.bytes_allocated() != 19424
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'strtold'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'strxfrm'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1497,7 +1500,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; strtof import bound; unresolved strtold causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; strtold import bound; unresolved strxfrm causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }

@@ -1,6 +1,6 @@
 # strtold requirement and initial extended80 model
 
-**Callable strtold is not implemented.** The pinned executable's `strtold_l` at `0x1161f0` is a six-byte tail jump (`ff 25 f2 98 15 00`) through GOT `0x26fae8`. Resolving that import to a binary64 or XMM0 result would violate the return ABI.
+**The actual pinned wrapper passes focused native verification.** The pinned executable's `strtold_l` at `0x1161f0` is a six-byte tail jump (`ff 25 f2 98 15 00`) through GOT `0x26fae8`. Resolving that import to a binary64 or XMM0 result would violate the return ABI.
 
 The AMD64 ABI classifies long double as X87/X87UP and returns it in ST(0). Its 80-bit value contains an explicit 64-bit significand followed by a 16-bit sign/exponent. A memory long-double object's ABI padding is separate from that ten-byte payload. `legacy_cpu::Cpu` now owns the eight raw registers and tags alongside CW/SW; the context integration is recorded in [CPU status](CPU.md). A host Rust `f64` cannot represent this return value. [AMD64 psABI source](https://gitlab.com/x86-psABIs/x86-64-ABI/-/blob/master/x86-64-ABI/low-level-sys-info.tex).
 
@@ -43,11 +43,34 @@ FreeBSD reference pass for raw80 output, errno and MXCSR effects, including both
 signs, all four rounding modes, exponent extremes and coefficients up to 4096
 digits (`work/strtold-review/decimal-expanded.log`). Three focused tests cover
 the initial exact-integer rounding discrepancy and signed-zero refinement.
-The source hex/NaN adapter and guest service remain separate unfinished work.
+The source hex/NaN adapter now passes 8,136 comparisons against actual unmodified
+`strtorx_l`/`ULtox`, checking ten output bytes, consumed input, errno and MXCSR.
+The cases include randomized hex inputs, extended exponent extremes, two-word
+NaN payloads, malformed payloads and source rounding quirks. Evidence:
+`work/strtold-review/effects-compare.log` and `EFFECTS-PROVENANCE.md`. These are
+upstream FreeBSD source comparisons under Rosetta, not console firmware tests.
+
+`Service::Strtold` is integrated with guarded input/endptr/errno and a staged
+raw x87 push; XMM0 is preserved. The callable domain is C locale with bounded
+input, masked exceptions, gradual underflow and matching x87/SSE rounding.
+Internal gdtoa allocation scheduling is not modeled. The wrapper's native
+verification is a separate gate below.
 
 CPU context storage is integrated, and guarded `FSTP m80fp` consumption has
 focused native evidence; see [CPU status](CPU.md) for operand and fault-policy
-limitations. The actual `strtold_l` wrapper has not yet been executed successfully.
+limitations. The actual `strtold_l` wrapper now passes 96 recorded raw80/endptr/
+errno/MXCSR cases through direct and pinned-wrapper calls in all four rounding
+modes. It consumes results with translated `FSTP m80`, including twelve
+consecutive call/store pairs within one caller. Checks cover precision beyond
+binary64, NaN/tiny/overflow source policies, unchanged XMM0/RAX, output aliases,
+read-only/crossing/unmapped/live-frame guards, short errno storage, unterminated
+input and unsupported FP controls. Evidence: `work/strtold-native/native.log`
+(14736, exit0), [native verifier](../../rust/verification/strtold_native.rs).
+
+AMD's [FLD reference, pp.264–265](https://kib.kiev.ua/x86docs/AMD/AMD64/26569_APM_v5-r3.13.pdf)
+exempts double-extended denormals from DE on load. Canonical parser output can
+therefore use the raw push without adding a denormal flag. No general x87
+arithmetic, physical PS5 ABI differential or retail compatibility claim follows.
 
 1. Introduce owned architectural x87 data/tag/TOP state preserved by every CPU clone, suspension, callback and thread handoff. Audit internal ABI offsets and any retained native fixtures; do not silently append state without updating size/layout contracts.
 2. Implement the source-faithful FPI64 decimal and hex/NaN policies with errno and source-ordered FP effects. Preserve unsupported control environments explicitly until independently covered.
