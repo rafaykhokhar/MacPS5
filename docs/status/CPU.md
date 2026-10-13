@@ -1,5 +1,26 @@
 # CPU completion criteria
 
+## Packed signed comparison and logical shift
+
+Exact VEX256 `VPCMPGTD ymm,ymm,ymm/m256` and `VPSRLD ymm,ymm,imm8`
+are implemented. Comparison treats each lane as signed32 and emits all ones
+or zero. The shift is logical; immediate counts at least32 produce zero.
+All source registers are captured before aliased destination writes. Memory
+comparison validates the complete32-byte span before committing any lane.
+Flags and floating-point state are preserved.
+
+The matching release passes 82,005 independent native checks
+(`work/cpu-inventory/packed-release.log`, session39440 exit0), including signed
+extrema, mixed random lanes, register aliases/high registers, all256 immediate
+counts, unaligned/read-only/full64 inputs, short-source atomic faults and fuel.
+Eight cases execute the pinned sequence at `0x11b255`: broadcast, comparison
+at `0x11b25b` against signed constants0..7, shift31 at `0x11b263`, and store.
+The reference computes eight boolean results independently of ARM64 lowering.
+The full runner includes this verifier. VEX128, legacy and other operand forms
+remain explicit gaps; this does not establish complete SIMD or game execution.
+
+Semantics: [AMD APM Volume4 rev3.24, pp316–317 and470–471](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf).
+
 ## VEX VPBROADCASTD
 
 Exact VEX128/256 `VPBROADCASTD xmm/ymm,xmm/m32` now lowers to ARM64.

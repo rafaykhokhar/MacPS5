@@ -949,6 +949,7 @@ pub enum Service {
     Wcstombs,
     Mbrtowc,
     Mbrlen,
+    Mbtowc,
     Wcrtomb,
     Mbsrtowcs,
     Qsort,
@@ -1145,6 +1146,7 @@ impl Service {
             | Self::Wcstombs
             | Self::Mbrtowc
             | Self::Mbrlen
+            | Self::Mbtowc
             | Self::Wcrtomb
             | Self::Mbsrtowcs
             | Self::Qsort
@@ -5309,7 +5311,11 @@ impl NativeExecutor {
                         }
                     } else if matches!(
                         service,
-                        Service::Mbrtowc | Service::Mbrlen | Service::Wcrtomb | Service::Mbsrtowcs
+                        Service::Mbrtowc
+                            | Service::Mbrlen
+                            | Service::Mbtowc
+                            | Service::Wcrtomb
+                            | Service::Mbsrtowcs
                     ) {
                         let args = [
                             cpu.registers[7],
@@ -5318,6 +5324,9 @@ impl NativeExecutor {
                             cpu.registers[1],
                         ];
                         let plan = match service {
+                            Service::Mbtowc => crate::guest_multibyte::mbtowc(
+                                &memory, args[0], args[1], args[2],
+                            )?,
                             // FreeBSD C/POSIX mbrlen delegates to mbrtowc with
                             // no output. This stateless backend ignores ps;
                             // future stateful locales need distinct implicit state.

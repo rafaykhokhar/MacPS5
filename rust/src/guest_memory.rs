@@ -701,6 +701,33 @@ pub fn vector_store(
     vector_operand(address, reg, size, aligned)?;
     memory.write(address, &vectors[reg as usize][..size as usize])
 }
+/// Guard the entire unaligned 256-bit source before changing any destination lane.
+pub fn vector_cmpgtd256(
+    memory: &Memory<'_>,
+    vectors: &mut [[u8; 32]; 16],
+    address: u64,
+    destination: u64,
+    first: u64,
+) -> Result<()> {
+    vector_operand(address, destination, 32, 0)?;
+    if first >= 16 {
+        return Err("Invalid source vector register".into());
+    }
+    let source = memory.read(address, 32)?;
+    let mut result = [0; 32];
+    for lane in 0..8 {
+        let start = lane * 4;
+        let lhs = i32::from_le_bytes(
+            vectors[first as usize][start..start + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let rhs = i32::from_le_bytes(source[start..start + 4].try_into().unwrap());
+        result[start..start + 4].fill(if lhs > rhs { 0xff } else { 0 });
+    }
+    vectors[destination as usize] = result;
+    Ok(())
+}
 pub fn vector_xor(
     memory: &Memory<'_>,
     vectors: &mut [[u8; 32]; 16],
@@ -818,6 +845,35 @@ pub mod ffi {
         cpu.fault = 1;
     }
     /// # Safety
+    /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn native_ps5_module_vector_cmpgtd256_v1(
+        cpu: *mut Cpu,
+        address: u64,
+        destination: u64,
+        first: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if cpu.memory != 0
+            && vector_cmpgtd256(
+                unsafe { &*(cpu.memory as *const Memory<'_>) },
+                &mut cpu.vectors,
+                address,
+                destination,
+                first,
+            )
+            .is_ok()
+        {
+            return;
+        }
+        cpu.fault = 1;
+    }
+    /// # Safety
     /// CPU is exclusive and live, and its memory field points to an exclusive
     /// live Memory for this synchronous call, installed by the Rust executor.
     #[unsafe(no_mangle)]
@@ -867,6 +923,27 @@ pub mod ffi {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn packed_compare_full_span_and_bad_registers_preserve_destination() {
+        for length in 1..32 {
+            let mut data = vec![0; length];
+            let mut memory = Memory::default();
+            memory.add(0x1000, &mut data, false, false).unwrap();
+            let mut vectors = [[0xa5; 32]; 16];
+            let before = vectors;
+            assert!(vector_cmpgtd256(&memory, &mut vectors, 0x1000, 0, 0).is_err());
+            assert_eq!(vectors, before);
+        }
+        let mut data = [0; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut data, false, false).unwrap();
+        let mut vectors = [[0xa5; 32]; 16];
+        let before = vectors;
+        for (dst, src) in [(16, 0), (0, 16), (u64::MAX, 0)] {
+            assert!(vector_cmpgtd256(&memory, &mut vectors, 0x1000, dst, src).is_err());
+            assert_eq!(vectors, before);
+        }
+    }
     #[test]
     fn runtime_pool_requires_identity_and_preserves_frame_barriers() {
         use super::{Memory, RuntimeOwner};

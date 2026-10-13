@@ -1,5 +1,33 @@
 # C-locale multibyte conversion
 
+## Legacy byte conversion
+
+`Service::Mbtowc` reuses the C/POSIX conversion plan but translates incomplete
+input into int−1 (low32 `ffffffff`) and EILSEQ86, as specified by FreeBSD11.4
+[mbtowc.c](https://raw.githubusercontent.com/freebsd/freebsd-src/releng/11.4/lib/libc/locale/mbtowc.c).
+NULL source returns zero before checking length or accessing the optional output.
+For non-NULL source and nonzero length it reads one byte and optionally writes
+one unsigned16 guest wide character. State is implicit and stateless under this
+supported locale policy; future stateful locales need distinct owned state.
+
+The matching release passes 8,216 direct/actual-wrapper value cases plus
+source/output/errno/frame guards (`work/mbtowc-native/native.log`, session26915
+exit0). The actual wrapper is at `0x116310`, GOT `0x26fb10`. Cases cover all256
+bytes, full64 lengths, exact optional output/no padding, invalid-pointer reset
+and incomplete paths, low32 return and errno semantics, protected outputs and
+success without errno context. The full entry runner includes this verifier.
+This is C/POSIX profile evidence, not UTF-8 or Sony binary equivalence.
+
+The integrated tree passes 510 library tests, three integration tests, strict
+all-target Clippy and release compilation (`work/mbtowc-build.log`, 19630 exit0).
+
+Startup-only import-slot and ownership assertions pass, reaching missing
+`__mb_cur_max` with 19,584 retained dependency bytes
+(`work/arm64-prototype/mbtowc-verified.log`, session67368 exit0). Components and
+Metal are skipped in that run. No game main has executed. The release archive
+used for both native component checks and startup has SHA-256
+`197679aa4a393513fca6807121f2e475fa6f266758c30877e80333effec9ecc1`.
+
 ## Restartable byte length
 
 `Service::Mbrlen` delegates to the existing C/POSIX `mbrtowc` plan with no

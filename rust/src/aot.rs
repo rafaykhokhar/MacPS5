@@ -37,6 +37,25 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn packed_compare_shift_exact_forms() {
+        for bytes in [
+            &[0xc5, 0xfd, 0x66, 0xc1][..],
+            &[0xc5, 0xfd, 0x66, 0x07],
+            &[0xc5, 0xfd, 0x72, 0xd0, 0x1f],
+        ] {
+            assert!(super::translate_rust_memory_region(bytes, 0, "packed").is_ok());
+        }
+        for bytes in [
+            &[0xc5, 0xf9, 0x66, 0xc1][..],
+            &[0xc5, 0xf9, 0x72, 0xd0, 0x1f],
+            &[0xc5, 0xfd, 0xd2, 0xc1],
+            &[0x66, 0x0f, 0x66, 0xc1],
+            &[0x67, 0xc5, 0xfd, 0x66, 0x07],
+        ] {
+            assert!(super::translate_rust_memory_region(bytes, 0, "unsupported_packed").is_err());
+        }
+    }
+    #[test]
     fn vpbroadcastd_exact_forms() {
         for bytes in [
             &[0xc4, 0xe2, 0x79, 0x58, 0xc0][..],
@@ -52,7 +71,9 @@ mod rust_memory_tests {
             &[0x67, 0xc4, 0xe2, 0x79, 0x58, 0x00],
             &[0x64, 0xc4, 0xe2, 0x79, 0x58, 0x00],
         ] {
-            assert!(super::translate_rust_memory_region(bytes, 0, "unsupported_broadcast").is_err());
+            assert!(
+                super::translate_rust_memory_region(bytes, 0, "unsupported_broadcast").is_err()
+            );
         }
     }
     #[test]
@@ -521,11 +542,57 @@ impl Emitter {
                     224 + dst * 32, 232 + dst * 32
                 ));
             }
+            M::Vpcmpgtd => {
+                if i.code() != iced_x86::Code::VEX_Vpcmpgtd_ymm_ymm_ymmm256 {
+                    return Err("Only VEX256 VPCMPGTD is implemented".into());
+                }
+                let dst = vector(i.op_register(0))?;
+                let first = vector(i.op_register(1))?;
+                if i.op_kind(2) == OpKind::Memory {
+                    self.address(i)?;
+                    self.emit(format!("mov x0, x19\nmov x2, #{dst}\nmov x3, #{first}\nbl _native_ps5_module_vector_cmpgtd256_v1"));
+                    self.fault();
+                } else {
+                    let second = vector(i.op_register(2))?;
+                    self.emit(format!("ldr q0, [x19, #{}]\nldr q1, [x19, #{}]\nldr q2, [x19, #{}]\nldr q3, [x19, #{}]\ncmgt v0.4s, v0.4s, v1.4s\ncmgt v2.4s, v2.4s, v3.4s\nstr q0, [x19, #{}]\nstr q2, [x19, #{}]",208+first*32,208+second*32,224+first*32,224+second*32,208+dst*32,224+dst*32));
+                }
+            }
+            M::Vpsrld => {
+                if i.code() != iced_x86::Code::VEX_Vpsrld_ymm_ymm_imm8 {
+                    return Err("Only VEX256 VPSRLD immediate is implemented".into());
+                }
+                let dst = vector(i.op_register(0))?;
+                let src = vector(i.op_register(1))?;
+                let count = i.immediate8();
+                if count > 31 {
+                    self.emit("movi v0.16b, #0\nmovi v1.16b, #0");
+                } else {
+                    self.emit(format!(
+                        "ldr q0, [x19, #{}]\nldr q1, [x19, #{}]",
+                        208 + src * 32,
+                        224 + src * 32
+                    ));
+                    if count != 0 {
+                        self.emit(format!(
+                            "ushr v0.4s, v0.4s, #{count}\nushr v1.4s, v1.4s, #{count}"
+                        ));
+                    }
+                }
+                self.emit(format!(
+                    "str q0, [x19, #{}]\nstr q1, [x19, #{}]",
+                    208 + dst * 32,
+                    224 + dst * 32
+                ));
+            }
             M::Vpbroadcastd => {
                 let wide = match i.code() {
                     iced_x86::Code::VEX_Vpbroadcastd_xmm_xmmm32 => false,
                     iced_x86::Code::VEX_Vpbroadcastd_ymm_xmmm32 => true,
-                    _ => return Err("Only VEX VPBROADCASTD XMM/YMM from XMM/m32 is implemented".into()),
+                    _ => {
+                        return Err(
+                            "Only VEX VPBROADCASTD XMM/YMM from XMM/m32 is implemented".into()
+                        );
+                    }
                 };
                 let dst = 208 + vector(i.op_register(0))? * 32;
                 if i.op_kind(1) == OpKind::Register {
@@ -538,7 +605,11 @@ impl Emitter {
                 // replicate integer bits without FP effects; read/fault before commit.
                 self.emit(format!("mov w20, w20\norr x20, x20, x20, lsl #32\nstr x20, [x19, #{dst}]\nstr x20, [x19, #{}]", dst + 8));
                 let upper = if wide { "x20" } else { "xzr" };
-                self.emit(format!("str {upper}, [x19, #{}]\nstr {upper}, [x19, #{}]", dst + 16, dst + 24));
+                self.emit(format!(
+                    "str {upper}, [x19, #{}]\nstr {upper}, [x19, #{}]",
+                    dst + 16,
+                    dst + 24
+                ));
             }
             M::Vmovd => {
                 if i.code() != iced_x86::Code::VEX_Vmovd_xmm_rm32 {
@@ -610,7 +681,13 @@ impl Emitter {
                     self.fault();
                 }
             }
-            M::Vmovaps | M::Vmovups | M::Vmovdqa | M::Vmovdqu | M::Vxorps | M::Vxorpd | M::Vpxor => {
+            M::Vmovaps
+            | M::Vmovups
+            | M::Vmovdqa
+            | M::Vmovdqu
+            | M::Vxorps
+            | M::Vxorpd
+            | M::Vpxor => {
                 // The pinned executable currently requires only VEX128 VPXOR.
                 // Do not inherit wider forms merely because XOR lowering is shared.
                 if m == M::Vpxor && i.code() != iced_x86::Code::VEX_Vpxor_xmm_xmm_xmmm128 {
@@ -1163,7 +1240,9 @@ mod scalar_integer_conversion_tests {
         let i = decode::instruction(&[0xc4, 0xc1, 0x83, 0x2a, 0xe1], 0).unwrap();
         assert_eq!(i.code(), iced_x86::Code::VEX_Vcvtsi2sd_xmm_xmm_rm64);
         assert!(supported(&i).is_ok());
-        assert!(translate_rust_memory_region(&[0xf2, 0x48, 0x0f, 0x2a, 0xc0], 0, "legacy").is_err());
+        assert!(
+            translate_rust_memory_region(&[0xf2, 0x48, 0x0f, 0x2a, 0xc0], 0, "legacy").is_err()
+        );
     }
 }
 #[cfg(test)]

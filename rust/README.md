@@ -1,5 +1,16 @@
 # Rust migration
 
+The matching release passes 82,005 native VEX256 packed comparison/shift checks,
+including the pinned broadcast/compare/shift/store sequence, and 8,216 direct
+and actual-wrapper `mbtowc` value cases plus memory/errno guards. The integrated
+build passes 510 library tests, three integration tests and strict Clippy.
+See [CPU status](../docs/status/CPU.md) and [conversion status](../docs/status/MULTIBYTE.md).
+Startup discovery resolves `mbtowc` and reaches missing `__mb_cur_max`, retaining
+19,584 dependency bytes (`work/arm64-prototype/mbtowc-entry.log`). Updated
+startup-only import and ownership assertions pass (`work/arm64-prototype/mbtowc-verified.log`,
+67368 exit0); component/Metal checks are explicitly skipped in that run. No game main
+or successful Metal presentation is established by these checks.
+
 The C/POSIX `mbrlen` service passes 4,238 native direct and actual guest-wrapper
 checks (`work/mbrlen-native/native.log`). The matching build passes 507 library
 tests, three integration tests and strict Clippy. Startup discovery resolves

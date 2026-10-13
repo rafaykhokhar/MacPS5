@@ -134,6 +134,19 @@ pub fn mbrtowc(
     }
     Ok(p)
 }
+/// FreeBSD releng/11.4 lib/libc/locale/mbtowc.c maps an incomplete
+/// restartable conversion to int -1 and EILSEQ. The C backend is stateless;
+/// a future stateful locale must own a separate implicit mbtowc state.
+pub fn mbtowc(memory: &Memory<'_>, destination: u64, source: u64, length: u64) -> Result<Plan> {
+    let mut plan = mbrtowc(memory, destination, source, length, 0)?;
+    if plan.value == INCOMPLETE {
+        plan.value = u32::MAX as u64;
+        plan.errno = Some(EILSEQ);
+    } else {
+        plan.value = plan.value as u32 as u64;
+    }
+    Ok(plan)
+}
 pub fn wcrtomb(destination: u64, wide: u64, _state: u64) -> Result<Plan> {
     let mut p = Plan::empty(destination, 1);
     if destination == 0 {
@@ -204,6 +217,20 @@ pub fn mbsrtowcs(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_conversion_reset_and_incomplete_are_distinct() {
+        let memory = crate::guest_memory::Memory::default();
+        let reset = super::mbtowc(&memory, u64::MAX, 0, 0).unwrap();
+        assert_eq!((reset.value, reset.errno), (0, None));
+        assert!(reset.bytes.is_empty());
+        let incomplete = super::mbtowc(&memory, u64::MAX, u64::MAX, 0).unwrap();
+        assert_eq!(
+            (incomplete.value, incomplete.errno),
+            (u32::MAX as u64, Some(86))
+        );
+        assert!(incomplete.bytes.is_empty());
+        assert!(super::mbtowc(&memory, u64::MAX, u64::MAX, 1).is_err());
+    }
     use super::*;
     const S: u64 = 0x1000;
     const D: u64 = 0x2000;
