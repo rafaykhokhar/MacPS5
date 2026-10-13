@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct packed integer add/subtract now uses ARM64 SIMD for register operands
+at byte/word/dword/qword widths, with guarded memory sources for SSE128 and
+VEX128/256. All 540672 native cases, library/integration tests and strict Clippy
+pass. See [packed arithmetic evidence](../docs/status/TRANSLATOR_READINESS.md#direct-packed-integer-add-and-subtract).
+
 Direct legacy MOVUPS/MOVUPD/MOVDQU and MOVAPS/MOVAPD/MOVDQA now support
 register copies and guarded loads/stores while preserving upper YMM bits.
 The combined SSE/VEX verifier passes 175104 native cases, with library tests

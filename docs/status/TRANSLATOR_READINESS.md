@@ -2265,3 +2265,29 @@ denied; reproduce using the release rlib/dependency flags above with
 `/tmp/macps5-legacy-move-{tests,clippy,build}.log`. Alignment faults remain runtime
 guard stops; architectural exception delivery, full SIMD readiness and PS5
 gameplay are not established.
+
+## Direct packed integer add and subtract
+
+Direct PADDB/PADDW/PADDD/PADDQ and PSUBB/PSUBW/PSUBD/PSUBQ, plus their VEX
+counterparts, support legacy SSE128 and VEX128/256. Register operands emit
+ARM64 SIMD ADD/SUB with the selected element size; 256-bit operations use two
+128-bit halves. Carries and borrows wrap within each element. Memory sources
+use the existing guarded Rust helper, with a legacy wrapper enforcing 16-byte
+alignment and preserving upper YMM bits. VEX128 clears upper YMM bits. Source
+and destination aliases are supported; flags and MXCSR remain unchanged.
+Semantics follow the [Intel instruction reference](https://cdrdv2-public.intel.com/868141/253667-089-sdm-vol-2b.pdf).
+
+`rust/verification/direct_packed_addsub_native.rs` independently calculates
+results using byte-by-byte carry/borrow propagation, reset at each element
+boundary. It checks every VEX destination/source triple and legacy register
+pair, all four element sizes, both operations, register and memory sources,
+aliases, alignment, last-valid spans, short/unmapped reads and overflow.
+Full modeled vectors, GPRs, memory, flags, MXCSR, RIP and fault/fuel/stop state
+are compared; fault cases preserve destination vectors.
+
+Validation passes: 540672 native cases, 687 library tests, three integration
+tests, strict Clippy and release build. The standalone verifier compiles with
+warnings denied; reproduce with the release rlib/dependency flags above using
+`direct_packed_addsub_native.rs`. Logs are
+`/tmp/macps5-packed-addsub-{tests,clippy,build}.log`. These checks establish
+scoped correctness, not measured game performance or complete CPU/GPU support.

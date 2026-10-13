@@ -5,6 +5,28 @@ use crate::{
     decode,
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
+fn packed_addsub(i: &Instruction) -> Option<(u64, u64, bool, bool)> {
+    let legacy = i.encoding() == iced_x86::EncodingKind::Legacy;
+    if !legacy && i.encoding() != iced_x86::EncodingKind::VEX {
+        return None;
+    }
+    let size = i.op0_register().size() as u64;
+    if size != 16 && (legacy || size != 32) {
+        return None;
+    }
+    let (lane, subtract) = match i.mnemonic() {
+        Mnemonic::Paddb | Mnemonic::Vpaddb => (1, false),
+        Mnemonic::Paddw | Mnemonic::Vpaddw => (2, false),
+        Mnemonic::Paddd | Mnemonic::Vpaddd => (4, false),
+        Mnemonic::Paddq | Mnemonic::Vpaddq => (8, false),
+        Mnemonic::Psubb | Mnemonic::Vpsubb => (1, true),
+        Mnemonic::Psubw | Mnemonic::Vpsubw => (2, true),
+        Mnemonic::Psubd | Mnemonic::Vpsubd => (4, true),
+        Mnemonic::Psubq | Mnemonic::Vpsubq => (8, true),
+        _ => return None,
+    };
+    Some((size, lane, subtract, legacy))
+}
 fn counter_branch(i: &Instruction) -> Option<(bool, u8)> {
     Some(match i.code() {
         Code::Loopne_rel8_64_ECX => (false, 0),
@@ -534,6 +556,7 @@ pub(crate) fn translate_span(
             _ if byte_arithmetic(&i) => {}
             _ if register_shift(&i) => {}
             _ if vector_logic(&i).is_some() => {}
+            _ if packed_addsub(&i).is_some() => {}
             _ if vector_move(&i).is_some() => {}
             Code::VEX_Vzeroupper | Code::VEX_Vzeroall => {}
             _ if conditional_move(&i) => {}
@@ -721,6 +744,62 @@ pub(crate) fn translate_span(
                         nonzero: true,
                     },
                 )?;
+            }
+            continue;
+        }
+        if let Some((size, lane, subtract, legacy)) = packed_addsub(i) {
+            let dst = vector_register(i.op0_register(), size)?;
+            let first = if legacy {
+                dst
+            } else {
+                vector_register(i.op1_register(), size)?
+            };
+            let second_operand = if legacy { 1 } else { 2 };
+            if i.op_kind(second_operand) == OpKind::Memory {
+                memory_address(&mut c, i)?;
+                c.emit(0xaa1303e0)?;
+                c.load_u64(2, dst as u64)?;
+                if legacy {
+                    c.load_u64(3, lane)?;
+                    c.load_u64(4, u64::from(subtract))?;
+                    c.call_absolute(
+                        crate::guest_memory::ffi::native_legacy_vector_addsub as *const () as u64,
+                    )?;
+                } else {
+                    c.load_u64(3, first as u64)?;
+                    c.load_u64(4, size)?;
+                    c.load_u64(5, lane)?;
+                    c.load_u64(6, u64::from(subtract))?;
+                    c.call_absolute(
+                        crate::guest_memory::ffi::native_ps5_module_vector_addsub_v1 as *const ()
+                            as u64,
+                    )?;
+                }
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+            } else {
+                let second = vector_register(i.op_register(second_operand), size)?;
+                for half in 0..size as usize / 16 {
+                    c.emit(0x3dc00260 | (((208 + first * 32 + half * 16) as u32 / 16) << 10))?; // ldr q0,[x19,#offset]
+                    c.emit(0x3dc00261 | (((208 + second * 32 + half * 16) as u32 / 16) << 10))?; // ldr q1
+                    c.emit(
+                        (if subtract { 0x6e218400 } else { 0x4e218400 })
+                            | (lane.trailing_zeros() << 22),
+                    )?; // SIMD sub/add v0,v0,v1
+                    c.emit(0x3d800260 | (((208 + dst * 32 + half * 16) as u32 / 16) << 10))?; // str q0
+                }
+                if size == 16 && !legacy {
+                    c.load_u64(9, 0)?;
+                    c.context_access(9, 19, 224 + dst * 32, true, true)?;
+                    c.context_access(9, 19, 232 + dst * 32, true, true)?;
+                }
             }
             continue;
         }
