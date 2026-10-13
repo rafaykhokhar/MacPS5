@@ -5,6 +5,21 @@ use crate::{
     decode,
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
+fn bit_test(i: &Instruction) -> bool {
+    matches!(
+        i.mnemonic(),
+        Mnemonic::Bt | Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc
+    ) && i.encoding() == iced_x86::EncodingKind::Legacy
+        && !i.has_lock_prefix()
+        && matches!(
+            if i.op0_kind() == OpKind::Memory {
+                i.memory_size().size()
+            } else {
+                i.op0_register().size()
+            },
+            2 | 4 | 8
+        )
+}
 fn bit_scan(i: &Instruction) -> bool {
     if matches!(
         i.mnemonic(),
@@ -479,6 +494,7 @@ pub(crate) fn translate_span(
             Code::Cbw | Code::Cwde | Code::Cdqe | Code::Cwd | Code::Cdq | Code::Cqo => {}
             Code::Bswap_r32 | Code::Bswap_r64 => {}
             _ if bit_scan(&i) => {}
+            _ if bit_test(&i) => {}
             Code::VEX_Andn_r32_r32_rm32 | Code::VEX_Andn_r64_r64_rm64 => {}
             Code::VEX_Rorx_r32_rm32_imm8 | Code::VEX_Rorx_r64_rm64_imm8 => {}
             Code::VEX_Mulx_r32_r32_rm32 | Code::VEX_Mulx_r64_r64_rm64 => {}
@@ -1041,6 +1057,63 @@ pub(crate) fn translate_span(
             c.context_access(9, 19, reg * 8, wide, false)?;
             c.emit(if wide { 0xdac00d29 } else { 0x5ac00929 })?; // REV x9/w9
             c.context_access(9, 19, reg * 8, true, true)?;
+            continue;
+        }
+        if bit_test(i) {
+            let memory = i.op0_kind() == OpKind::Memory;
+            let size = if memory {
+                i.memory_size().size()
+            } else {
+                i.op0_register().size()
+            };
+            if memory {
+                memory_address(&mut c, i)?;
+            } else {
+                c.load_u64(1, register(i.op0_register().full_register(), true)? as u64)?;
+            }
+            let immediate = i.op1_kind() == OpKind::Immediate8;
+            if immediate {
+                c.load_u64(2, i.immediate8() as u64)?;
+            } else {
+                c.context_access(
+                    2,
+                    19,
+                    register(i.op1_register().full_register(), true)? * 8,
+                    true,
+                    false,
+                )?;
+            }
+            c.emit(0xaa1303e0)?;
+            c.load_u64(3, size as u64)?;
+            c.load_u64(
+                4,
+                match i.mnemonic() {
+                    Mnemonic::Bt => 0,
+                    Mnemonic::Bts => 1,
+                    Mnemonic::Btr => 2,
+                    _ => 3,
+                },
+            )?;
+            c.load_u64(
+                5,
+                if !memory {
+                    0
+                } else if immediate {
+                    1
+                } else {
+                    2
+                },
+            )?;
+            c.call_absolute(crate::bit_scan::ffi::bit_test as *const () as u64)?;
+            c.context_access(9, 19, 152, true, false)?;
+            c.branch(
+                EXIT,
+                Branch::CompareZero {
+                    register: 9,
+                    wide: true,
+                    nonzero: true,
+                },
+            )?;
             continue;
         }
         if bit_scan(i) {

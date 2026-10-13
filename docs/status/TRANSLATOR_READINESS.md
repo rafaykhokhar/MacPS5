@@ -2087,3 +2087,33 @@ warnings denied; reproduce using the release rlib/dependency flags above and
 `/tmp/macps5-parallel-bits-{tests,clippy,build}.log`. These are correctness
 checks for this instruction family; helper performance, production translator
 readiness and PS5 gameplay are not established.
+
+## Direct bit tests and mutations
+
+Direct legacy BT/BTS/BTR/BTC supports 16/32/64-bit register and guarded-memory
+operands with register or immediate indices. A native Rust helper publishes
+the old selected bit to CF, preserving other flags deterministically. Register
+indices wrap within operand width; memory register indices are signed and
+select an operand-sized word before selecting its bit. Immediate indices stay
+within the addressed word. Word register writes preserve upper bits; dword
+mutations zero-extend, while BT leaves the entire register unchanged. The
+addressing rules follow the [AMD instruction reference](https://www.amd.com/content/dam/amd/en/documents/processor-tech-docs/programmer-references/24594.pdf).
+
+Memory reads and writes use guarded mappings. A failed read or write preserves
+CF; read-only BT works, while mutations require a writable full operand span.
+LOCK-prefixed forms remain unsupported and explicitly rejected. This path
+does not claim atomic read-modify-write behavior.
+
+`rust/verification/direct_bit_test_native.rs` independently selects and changes
+bits within byte arrays. Native checks cover all register/base/index pairs,
+aliases, all widths and operations, signed index boundaries, out-of-mapping
+addresses, read-only mappings, and every encoded immediate against each
+single-bit input. Full GPR, flags, memory, RIP and fault/fuel/stop state are
+checked, including destination/CF preservation on faults and read-only writes.
+
+Validation passes: 823296 native cases plus explicit LOCK rejection, 687
+library tests, three integration tests, strict Clippy and release build.
+The standalone verifier compiles with warnings denied; reproduce with the
+release rlib/dependency flags above using `direct_bit_test_native.rs`. Logs are
+`/tmp/macps5-bittest-{tests,clippy,build}.log`. Full translator readiness,
+atomic instruction support and PS5 gameplay remain incomplete.

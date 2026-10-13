@@ -83,6 +83,78 @@ pub fn execute(cpu: &mut Cpu, value: u64, destination: u64, size: u64, operation
 
 #[allow(unsafe_code)]
 pub mod ffi {
+    /// BT/BTS/BTR/BTC (operation 0..3). Mode 0 is a register slot, 1 is
+    /// memory with an immediate index, and 2 is memory with a signed register index.
+    /// # Safety
+    /// CPU and its Memory must be live, exclusive and disjoint for this call.
+    pub unsafe extern "C" fn bit_test(
+        cpu: *mut super::Cpu,
+        mut target: u64,
+        index: u64,
+        size: u64,
+        operation: u64,
+        mode: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if ![2, 4, 8].contains(&size) || operation > 3 || mode > 2 || (mode == 0 && target >= 16) {
+            cpu.fault = 3;
+            return;
+        }
+        let bits = size * 8;
+        if mode == 2 {
+            let signed = match size {
+                2 => index as i16 as i64,
+                4 => index as i32 as i64,
+                _ => index as i64,
+            };
+            target = target.wrapping_add((signed.div_euclid(bits as i64) * size as i64) as u64);
+        }
+        let selected = 1u64 << (index & (bits - 1));
+        let value = if mode == 0 {
+            cpu.registers[target as usize]
+        } else {
+            if cpu.memory == 0 {
+                cpu.fault = 1;
+                return;
+            }
+            match unsafe { &*(cpu.memory as *const crate::guest_memory::Memory<'_>) }
+                .load(target, size)
+            {
+                Ok(v) => v,
+                Err(_) => {
+                    cpu.fault = 1;
+                    return;
+                }
+            }
+        };
+        if operation != 0 {
+            let result = match operation {
+                1 => value | selected,
+                2 => value & !selected,
+                _ => value ^ selected,
+            };
+            if mode == 0 {
+                cpu.registers[target as usize] = if size == 4 {
+                    result as u32 as u64
+                } else {
+                    result
+                };
+            } else if unsafe { &mut *(cpu.memory as *mut crate::guest_memory::Memory<'_>) }
+                .store(target, result, size)
+                .is_err()
+            {
+                cpu.fault = 2;
+                return;
+            }
+        }
+        cpu.flags = (cpu.flags & !1) | u64::from(value & selected != 0);
+    }
+
     /// # Safety
     /// CPU must be live and exclusively owned for this synchronous call.
     #[unsafe(no_mangle)]

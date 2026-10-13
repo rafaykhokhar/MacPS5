@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct BT/BTS/BTR/BTC now supports 16/32/64-bit registers and guarded memory,
+including signed register indices. All 823296 native state checks pass, along
+with library/integration tests and strict Clippy. LOCK forms remain rejected.
+See [bit-test evidence](../docs/status/TRANSLATOR_READINESS.md#direct-bit-tests-and-mutations).
+
 Direct PDEP/PEXT32/64 now supports register and guarded-memory masks through
 a bounded native Rust helper. All 1589248 native state checks pass, alongside
 library/integration tests and strict Clippy. See
