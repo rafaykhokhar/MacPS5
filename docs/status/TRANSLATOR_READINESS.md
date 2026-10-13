@@ -446,3 +446,30 @@ the preceding release rlib/dependency flags; no arguments required.
 This adds functional guest control flow to the opt-in backend. Arithmetic,
 cross-block translation, automatic discovery and retail gameplay remain
 unverified or unimplemented in this direct path.
+
+## Direct integer arithmetic
+
+Direct lowering now supports register/register ADD, SUB, CMP, AND, OR, XOR and
+TEST at 32/64-bit widths. ARM64 computes the result and the existing Rust helper
+computes x86 flags from captured operands/result. Operand capture precedes alias
+writes; 32-bit destination writes zero-extend. CMP/TEST preserve the destination.
+The helper uses fixed valid width/operation arguments and does not fail for these
+inputs. Logical AF follows the existing helper's zero policy for undefined AF.
+Memory/immediate arithmetic, byte/word widths, carry-input and multiplication
+families remain unsupported by this direct lowering.
+
+`direct_arithmetic_native.rs` passes 86016 native cases covering both widths,
+all source/destination register aliases and integer extrema. Its independent
+oracle uses widened signed arithmetic for overflow, widened unsigned arithmetic
+for carry, nibble arithmetic for AF and result bits for sign/zero/parity. This
+verifier exercises one register encoding direction per family; it is not an
+exhaustive encoding inventory. A real Image/NativeExecutor program computes
+1+...+10000 = 50005000 using direct MOV/ADD/SUB/JNE/RET, with no clang/dlopen.
+
+687 library tests, three integration tests, strict Clippy, release build and
+strict-warning native verifier pass (process 7573 exit 0). Direct register
+(4128 plus 512 invalid-PC), memory (10260) and branch (5120) regressions pass
+against the same build (process 35157 exit 0). Logs: `work/direct-arithmetic/`.
+Compile/run the new standalone verifier with the preceding release rlib and
+dependency flags; no arguments required. The direct backend remains opt-in and
+incomplete; this integer-loop result is not game compatibility evidence.

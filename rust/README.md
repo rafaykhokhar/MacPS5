@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct register arithmetic now supports ADD/SUB/CMP/AND/OR/XOR/TEST at 32/64
+bits. 86016 independent result/flag cases pass, and the real executor computes
+the 10000-iteration sum 50005000 entirely through direct translation. See
+[integer-arithmetic evidence](../docs/status/TRANSLATOR_READINESS.md#direct-integer-arithmetic)
+for remaining form and backend limits.
+
 Direct guest JMP/Jcc now resolve instruction-boundary targets and preserve
 fuel limits through loops. 5120 condition/fuel cases and an actual executor
 branch program pass, alongside direct register/memory regressions. Cross-block

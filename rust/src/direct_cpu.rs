@@ -4,7 +4,22 @@ use crate::{
     arm64_code::{Arm64Code, Branch},
     decode,
 };
-use iced_x86::{Code, Instruction, OpKind, Register};
+use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
+fn register_arithmetic(i: &Instruction) -> bool {
+    matches!(
+        i.mnemonic(),
+        Mnemonic::Add
+            | Mnemonic::Sub
+            | Mnemonic::Cmp
+            | Mnemonic::And
+            | Mnemonic::Or
+            | Mnemonic::Xor
+            | Mnemonic::Test
+    ) && i.op0_kind() == OpKind::Register
+        && i.op1_kind() == OpKind::Register
+        && matches!(i.op0_register().size(), 4 | 8)
+        && i.op0_register().size() == i.op1_register().size()
+}
 fn memory_address(c: &mut Arm64Code, i: &Instruction) -> Result<()> {
     if matches!(i.memory_segment(), Register::FS | Register::GS) {
         return Err("Direct FS/GS addressing unsupported".into());
@@ -60,6 +75,7 @@ pub fn translate(bytes: &[u8], address: u64, instruction_limit: usize) -> Result
             Code::Mov_r32_imm32 | Code::Mov_r64_imm64 => {}
             Code::Mov_r32_rm32 | Code::Mov_rm32_r32 | Code::Mov_r64_rm64 | Code::Mov_rm64_r64 => {}
             _ if i.is_jcc_short_or_near() || i.is_jmp_short_or_near() => {}
+            _ if register_arithmetic(&i) => {}
             _ => return Err(format!("Direct lowering unsupported: {:?}", i.code())),
         }
         offset += i.len();
@@ -151,6 +167,33 @@ pub fn translate(bytes: &[u8], address: u64, instruction_limit: usize) -> Result
                     nonzero: true,
                 },
             )?;
+            continue;
+        }
+        if register_arithmetic(i) {
+            let wide = i.op0_register().size() == 8;
+            let destination = register(i.op0_register(), wide)?;
+            c.context_access(1, 19, destination * 8, wide, false)?;
+            c.context_access(2, 19, register(i.op1_register(), wide)? * 8, wide, false)?;
+            let (opcode, operation) = match i.mnemonic() {
+                Mnemonic::Add => (0x0b020023, 1),
+                Mnemonic::Sub | Mnemonic::Cmp => (0x4b020023, 0),
+                Mnemonic::And | Mnemonic::Test => (0x0a020023, 2),
+                Mnemonic::Or => (0x2a020023, 2),
+                Mnemonic::Xor => (0x4a020023, 2),
+                _ => unreachable!(),
+            };
+            c.emit(opcode | if wide { 0x80000000 } else { 0 })?;
+            if !matches!(i.mnemonic(), Mnemonic::Cmp | Mnemonic::Test) {
+                c.context_access(3, 19, destination * 8, true, true)?;
+            }
+            c.context_access(0, 19, 136, true, false)?;
+            c.load_u64(4, if wide { 64 } else { 32 })?;
+            c.load_u64(5, operation)?;
+            // Valid constant width/operation make this integer-only helper
+            // infallible; operands and result were captured before alias writes.
+            c.call_absolute(crate::arithmetic::native_ps5_arithmetic_flags_v1 as *const () as u64)?;
+            c.context_access(0, 19, 136, true, true)?;
+            c.context_access(1, 19, 152, true, true)?;
             continue;
         }
         match i.code() {
