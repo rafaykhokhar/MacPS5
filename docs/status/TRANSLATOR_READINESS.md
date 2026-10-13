@@ -1903,3 +1903,25 @@ integration tests, strict Clippy and release build. The standalone verifier
 compiles with warnings denied. Logs are
 `/tmp/macps5-divide-{tests,clippy,build}.log`. This establishes scoped division
 behavior, not full CPU readiness or PS5 gameplay.
+
+## Direct accumulator sign extension
+
+Direct CBW/CWDE/CDQE sign-extends AL to AX, AX to EAX, or EAX to RAX.
+CWD/CDQ/CQO replicates the accumulator sign into DX/EDX/RDX while preserving
+the accumulator itself. ARM64 bitfield instructions extract and extend the
+required sign bits. Word stores preserve surrounding bits, while dword outputs
+zero-extend into the 64-bit guest register. All guest flags remain unchanged.
+
+`rust/verification/direct_accumulator_extend_native.rs` checks all byte inputs
+for CBW, all word inputs for CWDE/CWD, and boundary values for every form,
+including nonzero upper bits that must be preserved or cleared. It checks full
+GPR state, flags, prior faults, instruction budgets and RIP. Composed native
+sign-extension/IDIV sequences exercise signed quotient/remainder behavior at
+all four widths. Reproduce with the release rlib/dependency flags above using
+`direct_accumulator_extend_native.rs`.
+
+Validation passes: 525736 native state/composition checks, 687 library tests,
+three integration tests, strict Clippy and release build. The standalone
+verifier compiles with warnings denied. Logs are
+`/tmp/macps5-accumext-{tests,clippy,build}.log`. These checks establish scoped
+CPU behavior; full translator readiness and PS5 gameplay remain incomplete.

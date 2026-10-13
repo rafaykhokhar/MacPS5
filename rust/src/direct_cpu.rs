@@ -457,6 +457,7 @@ pub(crate) fn translate_span(
             _ if truncated_imul(&i) => {}
             _ if full_multiply(&i) => {}
             _ if divide_instruction(&i) => {}
+            Code::Cbw | Code::Cwde | Code::Cdqe | Code::Cwd | Code::Cdq | Code::Cqo => {}
             Code::VEX_Andn_r32_r32_rm32 | Code::VEX_Andn_r64_r64_rm64 => {}
             Code::VEX_Rorx_r32_rm32_imm8 | Code::VEX_Rorx_r64_rm64_imm8 => {}
             Code::VEX_Mulx_r32_r32_rm32 | Code::VEX_Mulx_r64_r64_rm64 => {}
@@ -938,6 +939,40 @@ pub(crate) fn translate_span(
                     )?;
                     c.context_access(0, 19, 136, true, true)?;
                     c.context_access(1, 19, 152, true, true)?;
+                }
+            }
+            continue;
+        }
+        if matches!(
+            i.code(),
+            Code::Cbw | Code::Cwde | Code::Cdqe | Code::Cwd | Code::Cdq | Code::Cqo
+        ) {
+            c.context_access(9, 19, 0, true, false)?;
+            match i.code() {
+                Code::Cbw => {
+                    c.emit(0x93401d29)?; // sxtb x9,w9
+                    c.emit(0x79000269)?; // AX
+                }
+                Code::Cwde => {
+                    c.emit(0x13003d29)?; // sxth w9,w9 (zero-extends EAX)
+                    c.context_access(9, 19, 0, true, true)?;
+                }
+                Code::Cdqe => {
+                    c.emit(0x93407d29)?; // sxtw x9,w9
+                    c.context_access(9, 19, 0, true, true)?;
+                }
+                Code::Cwd => {
+                    c.emit(0x934f3d29)?; // replicate AX sign bit
+                    c.emit(0x79002269)?; // DX
+                }
+                Code::Cdq => {
+                    c.emit(0x935f7d29)?; // replicate EAX sign bit
+                    c.emit(0x2a0903e9)?; // zero-extend EDX
+                    c.context_access(9, 19, 16, true, true)?;
+                }
+                _ => {
+                    c.emit(0x937ffd29)?; // replicate RAX sign bit
+                    c.context_access(9, 19, 16, true, true)?;
                 }
             }
             continue;

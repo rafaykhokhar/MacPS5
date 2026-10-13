@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct CBW/CWDE/CDQE and CWD/CDQ/CQO now provide accumulator sign extension
+with correct partial-register and zero-extension rules. 525736 native state
+and division-composition checks pass, along with library/integration tests and
+strict Clippy. See
+[accumulator extension evidence](../docs/status/TRANSLATOR_READINESS.md#direct-accumulator-sign-extension).
+
 Direct DIV/IDIV now supports register and guarded-memory divisors at every
 integer width. 221184 native quotient/remainder/fault checks pass, along with
 the library/integration suites and strict Clippy. Divide errors stop with the
