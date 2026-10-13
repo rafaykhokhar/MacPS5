@@ -5,13 +5,18 @@ fn main() {
         let mut checks = 0;
         for prefix in [vec![], vec![0x66], vec![0x48], vec![0x64], vec![0x67]] {
             for operand in [
+                vec![],
                 vec![0],
                 vec![0x44, 0x24, 0x80],
                 vec![0x84, 0x8d, 0xff, 0xff, 0xff, 0x7f],
                 vec![0xc0],
             ] {
                 let mut bytes = prefix.clone();
-                bytes.extend_from_slice(&[0x0f, 0x1f]);
+                if operand.is_empty() {
+                    bytes.push(0x90);
+                } else {
+                    bytes.extend_from_slice(&[0x0f, 0x1f]);
+                }
                 bytes.extend_from_slice(&operand);
                 let end = 0x100 + bytes.len() as u64;
                 bytes.push(0xc3);

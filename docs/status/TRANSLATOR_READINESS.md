@@ -1221,3 +1221,46 @@ Logs are `/tmp/macps5-byte-compare-{tests,clippy,build,startup}.log` and still r
 the first real dlsym lookup. The next observed gap is memory-destination integer
 arithmetic, requiring guarded read-modify-write semantics. Bootstrap and PS5
 gameplay remain incomplete; the startup-only run skips Metal presentation.
+
+## Direct memory destination arithmetic
+
+The direct backend now accepts unlocked legacy ADD/SUB/AND/OR/XOR memory
+destinations at 8/16/32/64 bits, with register or encoded immediate sources.
+The new Rust helper `native_ps5_module_integer_rmw_v1` uses the existing guarded
+Memory load/store operations. It calculates flags without changing CPU state,
+then commits them only after the store succeeds. Read failures produce fault 1;
+write failures produce fault 2, leaving flags and bytes unchanged. Invalid helper
+parameters produce fault 3. Prior faults return without work. The exclusive
+Memory contract still applies: this helper is not a host atomic operation, and
+LOCK-prefixed instructions are explicitly rejected by direct lowering.
+
+`rust/verification/direct_memory_arithmetic_native.rs` passes 407205 checks,
+including native translated cases for all five operations and four widths, every
+GPR source/address pairing, narrow and full immediate encodings, sign extension,
+unaligned/end-of-mapping accesses, read-only versus writable mappings, legacy
+high-byte sources and source/base aliases. An independent widened arithmetic
+reference checks flags and the complete modified mapping. Ancillary helper cases
+check null CPU, missing Memory, invalid widths/operations and prior faults. Every
+emitted instruction fixture is also retried with LOCK and must fail translation.
+The verifier compiles with warnings denied; 687 library tests, three integration
+tests, strict Clippy and release build pass. An initial verifier parse error
+from adjacent comparison/minus tokens was fixed before its native run.
+Reproduce with the release rlib/dependency flags above using
+`direct_memory_arithmetic_native.rs`.
+
+The first configured startup run passes the memory ADD blocker at 0x8e0 and
+reaches unsupported `Nopw` at 0x969. The direct backend now also accepts this
+operand-size-prefixed 0x90 no-op. The existing NOP verifier includes 0x90 with
+its prefix combinations in addition to 0F 1F forms, retaining prior-fault,
+fuel, null-memory and state-preservation checks. Initial startup evidence is
+`/tmp/macps5-memory-arith-startup.log`; the post-NOP run uses
+`/tmp/macps5-memory-arith-nop-startup.log`.
+
+After the NOP addition, all 150 native NOP cases pass, as do the rebuilt 687
+library tests, three integration tests, strict Clippy and release build.
+
+The post-NOP configured run exits 1 in the same span at image-relative 0x969,
+now with `Direct lowering unsupported: Mov_rm8_r8`. NOPw is accepted during
+translation, but that entire span has not executed. The next gap is byte MOV
+between registers and memory. Bootstrap and PS5 gameplay remain incomplete;
+these startup-only runs skip Metal presentation.

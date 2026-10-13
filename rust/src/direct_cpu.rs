@@ -5,6 +5,26 @@ use crate::{
     decode,
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
+fn memory_arithmetic(i: &Instruction) -> bool {
+    matches!(
+        i.mnemonic(),
+        Mnemonic::Add | Mnemonic::Sub | Mnemonic::And | Mnemonic::Or | Mnemonic::Xor
+    ) && !i.has_lock_prefix()
+        && i.encoding() == iced_x86::EncodingKind::Legacy
+        && i.op0_kind() == OpKind::Memory
+        && matches!(i.memory_size().size(), 1 | 2 | 4 | 8)
+        && match i.op1_kind() {
+            OpKind::Register => i.op1_register().size() == i.memory_size().size(),
+            OpKind::Immediate8
+            | OpKind::Immediate16
+            | OpKind::Immediate32
+            | OpKind::Immediate8to16
+            | OpKind::Immediate8to32
+            | OpKind::Immediate8to64
+            | OpKind::Immediate32to64 => true,
+            _ => false,
+        }
+}
 fn extending_move(i: &Instruction) -> Option<(u64, bool)> {
     match i.code() {
         Code::Movzx_r32_rm8 | Code::Movzx_r64_rm8 => Some((1, false)),
@@ -275,7 +295,8 @@ pub(crate) fn translate_span(
             .ok_or("Direct PC overflow")?;
         let i = decode::instruction(&bytes[offset..], pc)?;
         match i.code() {
-            Code::Nopd
+            Code::Nopw
+            | Code::Nopd
             | Code::Nopq
             | Code::Nop_rm16
             | Code::Nop_rm32
@@ -301,6 +322,7 @@ pub(crate) fn translate_span(
             _ if vector_xor(&i).is_some() => {}
             _ if vector_move(&i).is_some() => {}
             _ if conditional_move(&i) => {}
+            _ if memory_arithmetic(&i) => {}
             _ => return Err(format!("Direct lowering unsupported: {:?}", i.code())),
         }
         offset += i.len();
@@ -480,6 +502,50 @@ pub(crate) fn translate_span(
                     c.context_access(9, 19, 232 + dst * 32, true, true)?;
                 }
             }
+            continue;
+        }
+        if memory_arithmetic(i) {
+            let size = i.memory_size().size();
+            memory_address(&mut c, i)?;
+            if i.op1_kind() == OpKind::Register {
+                if size == 1 {
+                    c.emit(0x39400262 | (byte_offset(i.op1_register())? << 10))?;
+                } else {
+                    let src = register(i.op1_register().full_register(), true)?;
+                    if size == 2 {
+                        c.emit(0x79400262 | ((src as u32 * 4) << 10))?;
+                    } else {
+                        c.context_access(2, 19, src * 8, size == 8, false)?;
+                    }
+                }
+            } else {
+                c.load_u64(2, i.immediate(1))?;
+            }
+            c.emit(0xaa1303e0)?;
+            c.load_u64(3, size as u64)?;
+            c.load_u64(
+                4,
+                match i.mnemonic() {
+                    Mnemonic::Add => 0,
+                    Mnemonic::Sub => 1,
+                    Mnemonic::And => 2,
+                    Mnemonic::Or => 3,
+                    Mnemonic::Xor => 4,
+                    _ => unreachable!(),
+                },
+            )?;
+            c.call_absolute(
+                crate::guest_memory::ffi::native_ps5_module_integer_rmw_v1 as *const () as u64,
+            )?;
+            c.context_access(9, 19, 152, true, false)?;
+            c.branch(
+                EXIT,
+                Branch::CompareZero {
+                    register: 9,
+                    wide: true,
+                    nonzero: true,
+                },
+            )?;
             continue;
         }
         if byte_arithmetic(i) {
@@ -930,7 +996,12 @@ pub(crate) fn translate_span(
             continue;
         }
         match i.code() {
-            Code::Nopd | Code::Nopq | Code::Nop_rm16 | Code::Nop_rm32 | Code::Nop_rm64 => {}
+            Code::Nopw
+            | Code::Nopd
+            | Code::Nopq
+            | Code::Nop_rm16
+            | Code::Nop_rm32
+            | Code::Nop_rm64 => {}
             Code::Retnq => {
                 c.load_u64(9, 3)?;
                 c.context_access(9, 19, 168, true, true)?;

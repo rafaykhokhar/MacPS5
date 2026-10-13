@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct unlocked memory ADD/SUB/AND/OR/XOR now supports all four integer widths
+and register/immediate sources, with flags committed only after a successful
+guarded store. 407205 native checks pass. NOPw is also accepted (150 NOP cases).
+Startup's next gap is byte MOV in the block at 0x969. See
+[memory arithmetic evidence](../docs/status/TRANSLATOR_READINESS.md#direct-memory-destination-arithmetic).
+
 Direct byte-memory CMP/TEST now supports immediate and byte-register operands,
 including both CMP operand orders. 6193152 native cases and 143430 byte-register
 regression cases pass. Configured startup advances to memory ADD32 at 0x8e0.

@@ -1391,6 +1391,62 @@ pub fn vector_xor(
 pub mod ffi {
     use super::*;
     use crate::legacy_cpu::Cpu;
+    /// Unlocked integer memory arithmetic: 0=ADD, 1=SUB, 2=AND, 3=OR, 4=XOR.
+    /// Flags commit only after the guarded store succeeds. This is not a host atomic operation.
+    /// # Safety
+    /// Same exclusive, disjoint CPU/Memory ownership contract as native_ps5_module_load_v1.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn native_ps5_module_integer_rmw_v1(
+        cpu: *mut Cpu,
+        address: u64,
+        rhs: u64,
+        size: u64,
+        operation: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if ![1, 2, 4, 8].contains(&size) || operation > 4 {
+            cpu.fault = 3;
+            return;
+        }
+        if cpu.memory == 0 {
+            cpu.fault = 1;
+            return;
+        }
+        let memory = unsafe { &mut *(cpu.memory as *mut Memory<'_>) };
+        let Ok(lhs) = memory.load(address, size) else {
+            cpu.fault = 1;
+            return;
+        };
+        let result = match operation {
+            0 => lhs.wrapping_add(rhs),
+            1 => lhs.wrapping_sub(rhs),
+            2 => lhs & rhs,
+            3 => lhs | rhs,
+            _ => lhs ^ rhs,
+        };
+        let flags = crate::arithmetic::flags(
+            cpu.flags,
+            lhs,
+            rhs,
+            result,
+            size * 8,
+            match operation {
+                0 => 1,
+                1 => 0,
+                _ => 2,
+            },
+        );
+        if memory.store(address, result, size).is_err() {
+            cpu.fault = 2;
+            return;
+        }
+        cpu.flags = flags.flags;
+    }
     /// # Safety
     /// CPU and its Memory context are live, exclusive, disjoint and valid for the call.
     #[unsafe(no_mangle)]
