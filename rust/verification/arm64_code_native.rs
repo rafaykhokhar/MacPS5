@@ -85,6 +85,33 @@ fn main() {
     }
     code.call_absolute(0x123456789abcdef0).unwrap();
     source.push_str("movz x16, #57072\nmovk x16, #39612, lsl #16\nmovk x16, #22136, lsl #32\nmovk x16, #4660, lsl #48\nblr x16\n");
+    for wide in [false, true] {
+        let scale = if wide { 8 } else { 4 };
+        for store in [false, true] {
+            for register in 0..32 {
+                for base in 0..32 {
+                    for offset in [0, scale, 4095 * scale] {
+                        code.context_access(register, base, offset, wide, store)
+                            .unwrap();
+                        let reg = if register == 31 {
+                            if wide { "xzr".into() } else { "wzr".into() }
+                        } else {
+                            format!("{}{register}", if wide { 'x' } else { 'w' })
+                        };
+                        let base = if base == 31 {
+                            "sp".into()
+                        } else {
+                            format!("x{base}")
+                        };
+                        source.push_str(&format!(
+                            "{} {reg}, [{base}, #{offset}]\n",
+                            if store { "str" } else { "ldr" }
+                        ));
+                    }
+                }
+            }
+        }
+    }
     let words = code.finish().unwrap();
     std::fs::write(directory.join("oracle.s"), source).unwrap();
     assert!(
@@ -170,7 +197,7 @@ fn main() {
         }
     }
     println!(
-        "PASS: {} branch forms, 155 constants and an absolute call match clang bytes; 100 native loop sums and 1440 runtime helper ABI checks",
+        "PASS: {} branch forms, 155 constants, 12288 context accesses and an absolute call match clang bytes; 100 native loop sums and 1440 runtime helper ABI checks",
         cases.len() * 2
     );
 }

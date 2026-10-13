@@ -98,6 +98,33 @@ impl Arm64Code {
         self.labels.insert(label, self.words.len());
         Ok(())
     }
+    /// Unsigned-offset LDR/STR for trusted host context fields, not guest
+    /// addresses. X31 base means SP; register 31 means WZR/XZR.
+    pub fn context_access(
+        &mut self,
+        register: u8,
+        base: u8,
+        offset: usize,
+        wide: bool,
+        store: bool,
+    ) -> Result<()> {
+        let scale = if wide { 8 } else { 4 };
+        if register > 31 || base > 31 || offset % scale != 0 || offset / scale > 4095 {
+            return Err("Invalid ARM64 context access".into());
+        }
+        let opcode = match (wide, store) {
+            (false, false) => 0xb9400000,
+            (false, true) => 0xb9000000,
+            (true, false) => 0xf9400000,
+            (true, true) => 0xf9000000,
+        };
+        self.emit(
+            opcode
+                | (((offset / scale) as u32) << 10)
+                | (u32::from(base) << 5)
+                | u32::from(register),
+        )
+    }
     /// Materialize all 64 bits with MOVZ/MOVK, without changing flags.
     /// X31 is excluded because this API promises a stored register value.
     pub fn load_u64(&mut self, register: u8, value: u64) -> Result<()> {
@@ -165,6 +192,22 @@ impl Arm64Code {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn context_address_rejections_do_not_emit() {
+        let mut code = Arm64Code::new(1);
+        for (reg, base, offset, wide) in [
+            (32, 0, 0, true),
+            (0, 32, 0, true),
+            (0, 0, 1, false),
+            (0, 0, 4, true),
+            (0, 0, 32768, true),
+            (0, 0, 16384, false),
+        ] {
+            assert!(code.context_access(reg, base, offset, wide, false).is_err());
+        }
+        code.context_access(0, 0, 0, true, false).unwrap();
+        assert_eq!(code.finish().unwrap(), [0xf9400000]);
+    }
     #[test]
     fn multiword_emission_is_atomic_on_rejection() {
         let mut code = Arm64Code::new(5);

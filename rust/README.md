@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct CPU-context loads/stores now match 12288 clang encodings. Generated
+runtime bridges pass 392 guarded-memory calls, including unchanged state on
+faults. Guest decoding and executor integration remain unfinished. See
+[context/memory evidence](../docs/status/TRANSLATOR_READINESS.md#direct-cpu-context-and-guarded-memory-bridge).
+
 The direct emitter now materializes 64-bit constants and calls runtime helpers
 through X16/BLR. A generated stub passes 1440 ABI checks against the existing
 Rust arithmetic helper; encoding and native-loop regressions also pass.
