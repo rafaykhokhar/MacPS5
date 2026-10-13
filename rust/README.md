@@ -1,5 +1,10 @@
 # Rust migration
 
+The CPU translator now supports exact BT/BTS/BTR32/64 forms, including signed
+memory indices and guarded flag publication. 43,180 independent native checks
+pass alongside 602 library tests, three integration tests and strict Clippy.
+See [CPU evidence and remaining boundaries](../docs/status/CPU.md).
+
 The CPU translation cache now limits retained native libraries and their
 page-rounded Mach-O mappings before loading new batches. Host policy defaults
 to 256 MiB and 256 libraries; it is configurable and does not evict live code.

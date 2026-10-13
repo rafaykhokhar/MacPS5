@@ -37,6 +37,55 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn bit_test_exact_forms_and_address_guards() {
+        for rex in [&[][..], &[0x48][..]] {
+            for opcode in [0xa3, 0xab, 0xb3] {
+                for modrm in [0xc8, 0xc0, 0x0f] {
+                    let bytes = [rex, &[0x0f, opcode, modrm]].concat();
+                    assert!(
+                        super::translate_rust_memory_region(&bytes, 0, "bits").is_ok(),
+                        "{bytes:x?}"
+                    );
+                }
+            }
+            for operation in [4, 5, 6] {
+                for base in [0xc0, 0x07] {
+                    let bytes = [rex, &[0x0f, 0xba, base | (operation << 3), 255]].concat();
+                    assert!(
+                        super::translate_rust_memory_region(&bytes, 0, "bits").is_ok(),
+                        "{bytes:x?}"
+                    );
+                }
+            }
+        }
+        for bytes in [
+            &[0x66, 0x0f, 0xa3, 0xc8][..],
+            &[0x66, 0x0f, 0xab, 0x0f],
+            &[0x66, 0x0f, 0xba, 0xf0, 1],
+            &[0xf0, 0x0f, 0xab, 0x0f],
+            &[0xf0, 0x48, 0x0f, 0xb3, 0x0f],
+            &[0x64, 0x0f, 0xa3, 0x0f],
+            &[0x65, 0x48, 0x0f, 0xba, 0x2f, 1],
+            &[0x67, 0x0f, 0xa3, 0x0f],
+            &[0x67, 0x0f, 0xab, 0x0c, 0x25, 0, 0, 0, 0],
+            &[0x67, 0x48, 0x0f, 0xba, 0x34, 0x25, 0, 0, 0, 0, 1],
+        ] {
+            assert!(
+                super::translate_rust_memory_region(bytes, 0, "unsupported_bits").is_err(),
+                "{bytes:x?}"
+            );
+        }
+        // Absolute address64 SIB displacement remains supported.
+        assert!(
+            super::translate_rust_memory_region(
+                &[0x0f, 0xa3, 0x0c, 0x25, 0, 0, 0, 0],
+                0,
+                "absolute_bits"
+            )
+            .is_ok()
+        );
+    }
+    #[test]
     fn packed_compare_shift_exact_forms() {
         for bytes in [
             &[0xc5, 0xfd, 0x66, 0xc1][..],
@@ -405,6 +454,88 @@ impl Emitter {
             return Ok(());
         }
         match m {
+            M::Bt | M::Bts | M::Btr => {
+                use iced_x86::Code;
+                if !matches!(
+                    i.code(),
+                    Code::Bt_rm32_r32
+                        | Code::Bt_rm64_r64
+                        | Code::Bt_rm32_imm8
+                        | Code::Bt_rm64_imm8
+                        | Code::Bts_rm32_r32
+                        | Code::Bts_rm64_r64
+                        | Code::Bts_rm32_imm8
+                        | Code::Bts_rm64_imm8
+                        | Code::Btr_rm32_r32
+                        | Code::Btr_rm64_r64
+                        | Code::Btr_rm32_imm8
+                        | Code::Btr_rm64_imm8
+                ) {
+                    return Err("Only BT/BTS/BTR 32/64-bit forms are implemented".into());
+                }
+                let memory = i.op0_kind() == OpKind::Memory;
+                // With neither base nor index, iced retains address size in the
+                // displacement size. Do not admit the address32 absolute form.
+                if memory
+                    && i.memory_base() == R::None
+                    && i.memory_index() == R::None
+                    && i.memory_displ_size() != 8
+                {
+                    return Err("32-bit absolute addressing is not implemented".into());
+                }
+                self.read(i, 1, width, 20)?;
+                if memory {
+                    self.address(i)?;
+                    // AMD APM Vol.3 BT/BTS/BTR: a register memory index is
+                    // signed; an immediate is masked within the addressed word.
+                    // Arithmetic shift gives floor division for negative indices.
+                    if i.op1_kind() == OpKind::Register {
+                        self.emit(if width == 32 {
+                            "sxtw x9, w20"
+                        } else {
+                            "mov x9, x20"
+                        });
+                        self.emit(format!(
+                            "asr x9, x9, #{}\nadd x21, x1, x9, lsl #{}",
+                            if width == 32 { 5 } else { 6 },
+                            if width == 32 { 2 } else { 3 }
+                        ));
+                    } else {
+                        self.emit("mov x21, x1");
+                    }
+                    self.emit(format!(
+                        "mov x0, x19\nmov x1, x21\nmov x2, #{}\nbl _guest_load",
+                        width / 8
+                    ));
+                    self.fault();
+                    self.emit("mov x22, x0");
+                } else {
+                    self.read(i, 0, width, 22)?;
+                }
+                self.emit(format!("and x20, x20, #{}", width - 1));
+                if m != M::Bt {
+                    self.emit("mov x10, #1\nlsl x10, x10, x20");
+                    self.emit(if m == M::Bts {
+                        "orr x10, x22, x10"
+                    } else {
+                        "bic x10, x22, x10"
+                    });
+                    if memory {
+                        // Keep the adjusted address, index and original value in
+                        // callee-saved registers. A store fault must not publish CF.
+                        self.emit(format!(
+                            "mov x0, x19\nmov x1, x21\nmov x2, x10\nmov x3, #{}\nbl _guest_store",
+                            width / 8
+                        ));
+                        self.fault();
+                    } else {
+                        self.write(i, 0, width, 10)?;
+                    }
+                }
+                // AMD APM marks OF/SF/ZF/AF/PF undefined. Preserve them
+                // deterministically, publishing CF only after successful access.
+                self.emit("lsr x9, x22, x20\nand x9, x9, #1\nldr x10, [x19, #136]\nbic x10, x10, #1\norr x10, x10, x9\nstr x10, [x19, #136]");
+            }
             M::Lzcnt => {
                 if !lzcnt32 {
                     return Err("Only LZCNT r32,r/m32 is implemented".into());

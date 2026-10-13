@@ -61,6 +61,7 @@ mod strcoll_native;
 mod strxfrm_native;
 mod wcscoll_native;
 mod lzcnt_native;
+mod bit_test_native;
 mod wcsxfrm_native;
 mod mbrlen_native;
 mod mbtowc_native;
@@ -162,6 +163,7 @@ fn main() -> Result<(), String> {
         strxfrm_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strxfrm"))?;
         wcscoll_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("wcscoll"))?;
         lzcnt_native::verify(Path::new(&archive), &Path::new(&directory).join("lzcnt"))?;
+        bit_test_native::verify(Path::new(&archive), &Path::new(&directory).join("bit-test"))?;
         wcsxfrm_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("wcsxfrm"))?;
         mbrlen_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("mbrlen"))?;
         mbtowc_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("mbtowc"))?;

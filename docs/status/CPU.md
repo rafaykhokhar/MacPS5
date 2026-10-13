@@ -1,5 +1,44 @@
 # CPU completion criteria
 
+## Bit test, set and reset
+
+Exact BT/BTS/BTR 32/64-bit forms now lower to ARM64, with register or memory
+destinations and register or immediate indices. Register indices select a bit
+modulo operand width for register destinations. For memory, signed register
+indices adjust the accessed word before selecting the bit; immediate indices
+remain within the addressed word. CF receives the original bit after successful
+access, including successful stores for BTS/BTR. BT leaves its operand intact.
+Non-CF flags are preserved as a deterministic policy; AMD marks OF/SF/ZF/AF/PF
+undefined for these instructions. Register writes obey 32-bit zero extension.
+
+Semantics reference: AMD APM Volume 3 rev. 3.31, BT pp.120–121, BTR pp.124–125,
+BTS pp.126–127 ([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/24594_APM_v3-r3.31.pdf)).
+The source was also inspected locally in `work/amd-lzcnt.pdf`.
+
+The build passes 602 library tests, three integration tests, strict Clippy and
+release compilation (`work/bit-test-native/{tests,clippy,release}.log`, process
+69866 exit 0). The native verifier passes 43,180 checks across 44 decoded
+encodings (`work/bit-test-native/native-verified.log`, process 45303 exit 0):
+register aliasing, signed indices, immediate masking, high addresses, unaligned
+and biased RIP-relative reads, readonly BT, guarded stores, short spans, flags,
+FP-state preservation and fuel. An initial verifier incorrectly expected a
+load-fault code for readonly stores; it now checks load code 1 and store code 2
+separately. State-preservation assertions were retained.
+
+Static discovery of the pinned homebrew increases from 54,009 to 54,147
+instructions. Ten old bit-operation boundaries disappear and one newly reached
+shift boundary appears, so the total falls from 219 to 210. Before/after
+manifests are `work/bit-test-native/{before,after}.json`. These are reachable
+translation counts, not executed instruction coverage or a CPU percentage.
+
+16-bit forms, LOCK variants, BTC, FS/GS, address32, architectural fault delivery
+and hardware differential validation remain incomplete. The native reference
+computes expected bits independently in Rust; it is not a PS5 hardware oracle.
+
+The matching startup-only regression passes (`work/arm64-prototype/bit-test-entry.log`,
+process 43037 exit 0), reaching the existing missing fscanf import after all ten
+named dependencies are accepted. Game main has not executed.
+
 ## Packed signed comparison and logical shift
 
 Exact VEX256 `VPCMPGTD ymm,ymm,ymm/m256` and `VPSRLD ymm,ymm,imm8`
