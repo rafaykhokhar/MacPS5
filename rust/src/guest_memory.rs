@@ -758,6 +758,48 @@ pub fn vector_cmpgtd256(
     vectors[destination as usize] = result;
     Ok(())
 }
+/// Parameters for packed low/high interleaving within independent 128-bit halves.
+#[derive(Clone, Copy)]
+pub struct VectorUnpack {
+    pub destination: u64,
+    pub first: u64,
+    pub size: u64,
+    pub lane_size: u64,
+    pub high: u64,
+}
+pub fn vector_unpack(
+    memory: &Memory<'_>,
+    vectors: &mut [[u8; 32]; 16],
+    address: u64,
+    operation: VectorUnpack,
+) -> Result<()> {
+    let VectorUnpack {
+        destination,
+        first,
+        size,
+        lane_size,
+        high,
+    } = operation;
+    vector_operand(address, destination, size, 0)?;
+    if first >= 16 || ![1, 2, 4, 8].contains(&lane_size) || high > 1 {
+        return Err("Invalid packed unpack operand".into());
+    }
+    let source = memory.read(address, size as usize)?;
+    let mut result = [0; 32];
+    let width = lane_size as usize;
+    for base in (0..size as usize).step_by(16) {
+        for lane in 0..8 / width {
+            let input = base + high as usize * 8 + lane * width;
+            let output = base + lane * width * 2;
+            result[output..output + width]
+                .copy_from_slice(&vectors[first as usize][input..input + width]);
+            result[output + width..output + width * 2]
+                .copy_from_slice(&source[input..input + width]);
+        }
+    }
+    vectors[destination as usize] = result;
+    Ok(())
+}
 /// Shuffle dwords independently within each 128-bit lane of a guarded source.
 pub fn vector_shufd(
     memory: &Memory<'_>,
@@ -1114,6 +1156,43 @@ pub mod ffi {
                 destination,
                 first,
                 size,
+            )
+            .is_ok()
+        {
+            return;
+        }
+        cpu.fault = 1;
+    }
+    /// # Safety
+    /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn native_ps5_module_vector_unpack_v1(
+        cpu: *mut Cpu,
+        address: u64,
+        destination: u64,
+        first: u64,
+        size: u64,
+        lane_size: u64,
+        high: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if cpu.memory != 0
+            && vector_unpack(
+                unsafe { &*(cpu.memory as *const Memory<'_>) },
+                &mut cpu.vectors,
+                address,
+                VectorUnpack {
+                    destination,
+                    first,
+                    size,
+                    lane_size,
+                    high,
+                },
             )
             .is_ok()
         {
@@ -1936,6 +2015,163 @@ mod tests {
         assert_eq!(cpu.fault, 2);
         assert_eq!(memory.read(0x1001, 16).unwrap(), &original[15][16..]);
         assert_eq!(cpu.vectors, original);
+        assert_eq!(cpu.flags, u64::MAX);
+    }
+    #[test]
+    fn packed_unpack_interleaves_selected_halves_and_aliases() {
+        for size in [16usize, 32] {
+            for width in [1usize, 2, 4, 8] {
+                for high in [0usize, 1] {
+                    for destination in [3usize, 15] {
+                        for poison in [0, 255] {
+                            let mut vectors = [[0xa5; 32]; 16];
+                            vectors[15] = std::array::from_fn(|i| (i + 1) as u8);
+                            let mut data: [u8; 32] = std::array::from_fn(|i| (i + 65) as u8);
+                            for base in [0, 16] {
+                                let unused = base + (1 - high) * 8;
+                                data[unused..unused + 8].fill(poison);
+                                vectors[15][unused..unused + 8].fill(poison);
+                            }
+                            let mut expected = vectors;
+                            expected[destination] = [0; 32];
+                            for base in (0..size).step_by(16) {
+                                let begin = base + high * 8;
+                                let left = vectors[15][begin..begin + 8].chunks_exact(width);
+                                let right = data[begin..begin + 8].chunks_exact(width);
+                                let interleaved: Vec<u8> = left
+                                    .zip(right)
+                                    .flat_map(|(a, b)| a.iter().chain(b).copied())
+                                    .collect();
+                                expected[destination][base..base + 16]
+                                    .copy_from_slice(&interleaved);
+                            }
+                            let mut memory = Memory::default();
+                            memory
+                                .add(0x1_0000_0001, &mut data[..size], false, false)
+                                .unwrap();
+                            vector_unpack(
+                                &memory,
+                                &mut vectors,
+                                0x1_0000_0001,
+                                VectorUnpack {
+                                    destination: destination as u64,
+                                    first: 15,
+                                    size: size as u64,
+                                    lane_size: width as u64,
+                                    high: high as u64,
+                                },
+                            )
+                            .unwrap();
+                            assert_eq!(vectors, expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn packed_unpack_full_span_and_invalid_parameters_are_atomic() {
+        let original = [[0xa5; 32]; 16];
+        for size in [16u64, 32] {
+            for lane_size in [1, 2, 4, 8] {
+                for high in [0, 1] {
+                    for length in 0..size as usize {
+                        let mut data = vec![0; length];
+                        let mut memory = Memory::default();
+                        if length != 0 {
+                            memory.add(0x1001, &mut data, false, false).unwrap();
+                        }
+                        let mut vectors = original;
+                        assert!(
+                            vector_unpack(
+                                &memory,
+                                &mut vectors,
+                                0x1001,
+                                VectorUnpack {
+                                    destination: 0,
+                                    first: 0,
+                                    size,
+                                    lane_size,
+                                    high,
+                                }
+                            )
+                            .is_err()
+                        );
+                        assert_eq!(vectors, original);
+                    }
+                }
+            }
+        }
+        let mut data = [0; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        for (destination, first, size, lane_size, high) in [
+            (16, 0, 16, 1, 0),
+            (u64::MAX, 0, 16, 1, 0),
+            (0, 16, 16, 1, 0),
+            (0, u64::MAX, 16, 1, 0),
+            (0, 0, 0, 1, 0),
+            (0, 0, 8, 1, 0),
+            (0, 0, 64, 1, 0),
+            (0, 0, u64::MAX, 1, 0),
+            (0, 0, 16, 0, 0),
+            (0, 0, 16, 3, 0),
+            (0, 0, 16, 16, 0),
+            (0, 0, 16, u64::MAX, 0),
+            (0, 0, 16, 1, 2),
+            (0, 0, 16, 1, u64::MAX),
+        ] {
+            let mut vectors = original;
+            assert!(
+                vector_unpack(
+                    &memory,
+                    &mut vectors,
+                    0x1001,
+                    VectorUnpack {
+                        destination,
+                        first,
+                        size,
+                        lane_size,
+                        high,
+                    }
+                )
+                .is_err()
+            );
+            assert_eq!(vectors, original);
+        }
+    }
+    #[test]
+    #[allow(unsafe_code)]
+    fn packed_unpack_ffi_preserves_faults_and_flags() {
+        use crate::legacy_cpu::Cpu;
+        unsafe { ffi::native_ps5_module_vector_unpack_v1(std::ptr::null_mut(), 0, 0, 0, 16, 1, 0) };
+        let mut cpu = Cpu {
+            vectors: [[0x55; 32]; 16],
+            flags: u64::MAX,
+            ..Cpu::default()
+        };
+        for fault in [0, 2, 13] {
+            cpu.fault = fault;
+            unsafe { ffi::native_ps5_module_vector_unpack_v1(&mut cpu, 0x1001, 0, 0, 16, 8, 1) };
+            assert_eq!(cpu.fault, if fault == 0 { 1 } else { fault });
+            assert_eq!(cpu.vectors, [[0x55; 32]; 16]);
+            assert_eq!(cpu.flags, u64::MAX);
+        }
+        let mut data = [0xcc; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        cpu.memory = (&mut memory as *mut Memory<'_>) as u64;
+        cpu.fault = 0;
+        unsafe { ffi::native_ps5_module_vector_unpack_v1(&mut cpu, 0x1001, 0, 0, 16, 8, 1) };
+        assert_eq!(cpu.fault, 0);
+        assert_eq!(&cpu.vectors[0][..8], &[0x55; 8]);
+        assert_eq!(&cpu.vectors[0][8..16], &[0xcc; 8]);
+        assert_eq!(&cpu.vectors[0][16..], &[0; 16]);
+        assert_eq!(cpu.flags, u64::MAX);
+        let before = cpu.vectors;
+        unsafe { ffi::native_ps5_module_vector_unpack_v1(&mut cpu, 0x1001, 0, 0, 16, 8, 2) };
+        assert_eq!(cpu.fault, 1);
+        assert_eq!(cpu.vectors, before);
         assert_eq!(cpu.flags, u64::MAX);
     }
     #[test]

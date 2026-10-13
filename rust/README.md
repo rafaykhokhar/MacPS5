@@ -1,5 +1,12 @@
 # Rust migration
 
+VEX packed low/high interleaving now covers byte/word/dword/qword elements in
+XMM/YMM operands. The matching build passes 646 library tests, three integration
+tests, strict Clippy and 23,232 native checks. Discovery reaches 56,949 instructions;
+startup remains at missing `fscanf`, before game main. See [CPU evidence](../docs/status/CPU.md),
+including the full-operand memory-guard policy. Production readiness and retail
+gameplay remain unverified.
+
 VEX truncating double-to-integer conversion now supports signed64 destinations,
 with explicit MXCSR status and guarded memory. The matching build passes 642
 library tests, three integration tests, strict Clippy, 2,160,068 native signed64

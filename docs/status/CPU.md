@@ -1,5 +1,41 @@
 # CPU completion criteria
 
+## Packed low/high interleaving
+
+VEX VPUNPCKL/H BW, WD, DQ and QDQ now support XMM/YMM register and memory
+operands (16 exact forms). ARM64 ZIP1/ZIP2 interleaves the selected low/high
+halves at byte/word/dword/qword width independently within each 128-bit half.
+Both sources are consumed before destination stores; XMM writes clear upper
+YMM bits. Flags/FP state remain unchanged. WIG is accepted; legacy/EVEX and
+unsupported FS/GS/address32 forms remain rejected.
+
+Reference: AMD APM Volume 4 rev.3.24 pp.499–522
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)).
+The memory helper retains our full 16/32-byte operand guard before committing
+the result. This is a guard-policy check, not proof of PS5 partial-fetch fault
+behavior: [Intel SDM Volume 2B](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-2b-manual.pdf)
+permits a low-unpack implementation to fetch only the relevant half of a
+128-bit memory operand. Architectural alignment controls and complete exception
+delivery remain unimplemented.
+
+The matching build passes 646 library tests, three integration tests, strict
+Clippy and release compilation (`work/packed-unpack-native/{tests,clippy,release}.log`,
+process 2018 exit 0). The [native verifier](../../rust/verification/packed_unpack_native.rs)
+passes 23,232 interleave-reference checks across 192 decoded fixtures: all lane
+widths/low/high forms, distinct sources/halves, ignored-half poison, edge/random
+bytes, aliases/high registers/WIG, full readonly high/unaligned/RIP operands,
+every short span under the stated guard policy, flags/FP/fuel/prior faults
+(`work/packed-unpack-native/native.log`, process 23129 exit 0).
+
+Discovery reaches 56,949 instructions and 12,954 blocks with 163 unsupported
+sites: five old stops are removed and one later stop is exposed. These counts
+do not establish CPU coverage. The entry runner compiles with warnings denied
+and startup-only verification retains the missing `fscanf` boundary, ten
+accepted dependencies, 20,288 owned dependency bytes and pending cleanup.
+Game main has not executed (`work/packed-unpack-native/entry.log`, process 8590
+exit 0). Full GPU checks were not run for this CPU change. Production readiness
+and retail gameplay remain unverified.
+
 ## Signed64 truncating double conversion
 
 VEX VCVTTSD2SI now supports 64-bit GPR destinations as well as the existing

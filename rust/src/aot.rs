@@ -37,6 +37,27 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn packed_unpack_absolute_address_guard() {
+        for opcode in [0x60, 0x61, 0x62, 0x6c, 0x68, 0x69, 0x6a, 0x6d] {
+            for length in [0, 4] {
+                let bytes = [
+                    0x67,
+                    0xc4,
+                    0xe1,
+                    0x79 | length,
+                    opcode,
+                    0x04,
+                    0x25,
+                    0,
+                    0,
+                    0,
+                    0,
+                ];
+                assert!(super::translate_rust_memory_region(&bytes, 0, "address").is_err());
+            }
+        }
+    }
+    #[test]
     fn vector_extract128_absolute_address_guard() {
         for opcode in [0x19, 0x39] {
             let bytes = [0x67, 0xc4, 0xe3, 0x7d, opcode, 0x04, 0x25, 0, 0, 0, 0, 1];
@@ -1060,6 +1081,77 @@ impl Emitter {
                     216 + merge * 32, 208 + dst * 32, 216 + dst * 32,
                     224 + dst * 32, 232 + dst * 32
                 ));
+            }
+            M::Vpunpcklbw
+            | M::Vpunpcklwd
+            | M::Vpunpckldq
+            | M::Vpunpcklqdq
+            | M::Vpunpckhbw
+            | M::Vpunpckhwd
+            | M::Vpunpckhdq
+            | M::Vpunpckhqdq => {
+                use iced_x86::Code;
+                let (lane_size, wide, high) = match i.code() {
+                    Code::VEX_Vpunpcklbw_xmm_xmm_xmmm128 => (1, false, false),
+                    Code::VEX_Vpunpcklbw_ymm_ymm_ymmm256 => (1, true, false),
+                    Code::VEX_Vpunpcklwd_xmm_xmm_xmmm128 => (2, false, false),
+                    Code::VEX_Vpunpcklwd_ymm_ymm_ymmm256 => (2, true, false),
+                    Code::VEX_Vpunpckldq_xmm_xmm_xmmm128 => (4, false, false),
+                    Code::VEX_Vpunpckldq_ymm_ymm_ymmm256 => (4, true, false),
+                    Code::VEX_Vpunpcklqdq_xmm_xmm_xmmm128 => (8, false, false),
+                    Code::VEX_Vpunpcklqdq_ymm_ymm_ymmm256 => (8, true, false),
+                    Code::VEX_Vpunpckhbw_xmm_xmm_xmmm128 => (1, false, true),
+                    Code::VEX_Vpunpckhbw_ymm_ymm_ymmm256 => (1, true, true),
+                    Code::VEX_Vpunpckhwd_xmm_xmm_xmmm128 => (2, false, true),
+                    Code::VEX_Vpunpckhwd_ymm_ymm_ymmm256 => (2, true, true),
+                    Code::VEX_Vpunpckhdq_xmm_xmm_xmmm128 => (4, false, true),
+                    Code::VEX_Vpunpckhdq_ymm_ymm_ymmm256 => (4, true, true),
+                    Code::VEX_Vpunpckhqdq_xmm_xmm_xmmm128 => (8, false, true),
+                    Code::VEX_Vpunpckhqdq_ymm_ymm_ymmm256 => (8, true, true),
+                    _ => return Err("Only VEX128/256 packed integer unpack is implemented".into()),
+                };
+                let dst = vector(i.op0_register())?;
+                let first = vector(i.op1_register())?;
+                if i.op2_kind() == OpKind::Memory {
+                    if i.memory_base() == R::None
+                        && i.memory_index() == R::None
+                        && i.memory_displ_size() != 8
+                    {
+                        return Err("32-bit absolute addressing is not implemented".into());
+                    }
+                    self.address(i)?;
+                    self.emit(format!(
+                        "mov x0, x19\nmov x2, #{dst}\nmov x3, #{first}\nmov x4, #{}\nmov x5, #{lane_size}\nmov x6, #{}\nbl _native_ps5_module_vector_unpack_v1",
+                        if wide { 32 } else { 16 }, u8::from(high)
+                    ));
+                    self.fault();
+                } else {
+                    let second = vector(i.op2_register())?;
+                    let lanes = match lane_size {
+                        1 => "16b",
+                        2 => "8h",
+                        4 => "4s",
+                        _ => "2d",
+                    };
+                    let zip = if high { "zip2" } else { "zip1" };
+                    self.emit(format!(
+                        "ldr q0, [x19, #{}]\nldr q1, [x19, #{}]\n{zip} v0.{lanes}, v0.{lanes}, v1.{lanes}",
+                        208 + first * 32, 208 + second * 32
+                    ));
+                    if wide {
+                        self.emit(format!(
+                            "ldr q2, [x19, #{}]\nldr q3, [x19, #{}]\n{zip} v2.{lanes}, v2.{lanes}, v3.{lanes}",
+                            224 + first * 32, 224 + second * 32
+                        ));
+                    } else {
+                        self.emit("movi v2.16b, #0");
+                    }
+                    self.emit(format!(
+                        "str q0, [x19, #{}]\nstr q2, [x19, #{}]",
+                        208 + dst * 32,
+                        224 + dst * 32
+                    ));
+                }
             }
             M::Vextracti128 | M::Vextractf128 => {
                 if !matches!(
