@@ -37,6 +37,27 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn vector_sign_test_absolute_address_guard() {
+        for opcode in [0x0e, 0x0f] {
+            for length in [0, 4] {
+                let bytes = [
+                    0x67,
+                    0xc4,
+                    0xe2,
+                    0x79 | length,
+                    opcode,
+                    0x04,
+                    0x25,
+                    0,
+                    0,
+                    0,
+                    0,
+                ];
+                assert!(super::translate_rust_memory_region(&bytes, 0, "address").is_err());
+            }
+        }
+    }
+    #[test]
     fn scalar_move_absolute_address_guard() {
         for prefix in [0x7a, 0x7b] {
             for opcode in [0x10, 0x11] {
@@ -1821,11 +1842,15 @@ impl Emitter {
                     ));
                 }
             }
-            M::Vptest => {
-                let size = match i.code() {
-                    iced_x86::Code::VEX_Vptest_xmm_xmmm128 => 16,
-                    iced_x86::Code::VEX_Vptest_ymm_ymmm256 => 32,
-                    _ => return Err("Only VEX VPTEST is implemented".into()),
+            M::Vptest | M::Vtestps | M::Vtestpd => {
+                let (size, sign_lane_size) = match i.code() {
+                    iced_x86::Code::VEX_Vptest_xmm_xmmm128 => (16, 0),
+                    iced_x86::Code::VEX_Vptest_ymm_ymmm256 => (32, 0),
+                    iced_x86::Code::VEX_Vtestps_xmm_xmmm128 => (16, 4),
+                    iced_x86::Code::VEX_Vtestps_ymm_ymmm256 => (32, 4),
+                    iced_x86::Code::VEX_Vtestpd_xmm_xmmm128 => (16, 8),
+                    iced_x86::Code::VEX_Vtestpd_ymm_ymmm256 => (32, 8),
+                    _ => return Err("Only VEX vector bit/sign tests are implemented".into()),
                 };
                 let first = vector(i.op0_register())?;
                 if i.op1_kind() == OpKind::Memory {
@@ -1836,16 +1861,28 @@ impl Emitter {
                         return Err("32-bit absolute addressing is not implemented".into());
                     }
                     self.address(i)?;
-                    self.emit(format!("mov x0, x19\nmov x2, #{first}\nmov x3, #{size}\nbl _native_ps5_module_vector_test_v1"));
+                    if sign_lane_size == 0 {
+                        self.emit(format!("mov x0, x19\nmov x2, #{first}\nmov x3, #{size}\nbl _native_ps5_module_vector_test_v1"));
+                    } else {
+                        self.emit(format!("mov x0, x19\nmov x2, #{first}\nmov x3, #{size}\nmov x4, #{sign_lane_size}\nbl _native_ps5_module_vector_sign_test_v1"));
+                    }
                     self.fault();
                 } else {
                     let second = vector(i.op1_register())?;
                     self.emit("mov x20, #0\nmov x21, #0");
-                    for offset in (0..size).step_by(8) {
+                    let (start, step, load, register) = if sign_lane_size == 0 {
+                        (0, 8, "ldr", "x")
+                    } else {
+                        (sign_lane_size - 1, sign_lane_size, "ldrb", "w")
+                    };
+                    for offset in (start..size).step_by(step) {
                         self.emit(format!(
-                            "ldr x9, [x19, #{}]\nldr x10, [x19, #{}]\nand x11, x9, x10\nbic x12, x10, x9\norr x20, x20, x11\norr x21, x21, x12",
+                            "{load} {register}9, [x19, #{}]\n{load} {register}10, [x19, #{}]\nand x11, x9, x10\nbic x12, x10, x9\norr x20, x20, x11\norr x21, x21, x12",
                             208 + first * 32 + offset, 208 + second * 32 + offset
                         ));
+                    }
+                    if sign_lane_size != 0 {
+                        self.emit("and x20, x20, #0x80\nand x21, x21, #0x80");
                     }
                     // Reduce over the complete vector. Only ZF and CF receive
                     // computed values; OF/SF/AF/PF clear and other flags survive.

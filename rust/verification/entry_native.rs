@@ -95,6 +95,7 @@ mod scalar_broadcast_native;
 mod packed_double_move_native;
 mod scalar_move_native;
 mod vector_register_native;
+mod vector_sign_test_native;
 mod vector_extract128_native;
 mod strftime_native;
 mod strtof_native;
@@ -224,6 +225,7 @@ fn main() -> Result<(), String> {
         packed_double_move_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-double-move"))?;
         scalar_move_native::verify(Path::new(&archive), &Path::new(&directory).join("scalar-move"))?;
         vector_register_native::verify(Path::new(&archive), &Path::new(&directory).join("vector-register"))?;
+        vector_sign_test_native::verify(Path::new(&archive), &Path::new(&directory).join("vector-sign-test"))?;
         vector_extract128_native::verify(Path::new(&archive), &Path::new(&directory).join("vector-extract128"))?;
         strftime_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strftime"))?;
         strtof_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtof"))?;

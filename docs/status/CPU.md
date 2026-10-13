@@ -1,5 +1,42 @@
 # CPU completion criteria
 
+## Vector sign-bit tests
+
+VEX VTESTPS/PD now support four XMM/YMM forms. ZF tests whether any matching
+source sign bits are both set; CF tests whether the second source has any sign
+bit outside the first source's sign set. Nonsign bits do not affect either
+result. OF/SF/AF/PF clear; other guest flags and all vectors/FP state survive.
+Memory operands guard the full 16/32-byte span before flags commit. Register
+lowering shares the final flag update with VPTEST while preserving VPTEST's
+full-bit comparison. W1, reserved vvvv, legacy/EVEX and unsupported
+FS/GS/address32 forms remain rejected.
+
+References: AMD APM Volume 4 rev.3.24 pp.855–858
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)); Intel
+SDM Volume 2C, VTESTPD/VTESTPS Flags Affected
+([manual](https://cdrdv2-public.intel.com/835781/325462-sdm-vol-1-2abcd-3abcd-4.pdf)).
+Architectural alignment-control behavior and full exception delivery remain
+outside the guard model.
+
+The matching build passes 678 library tests, three integration tests, strict
+Clippy and release compilation (`work/vector-sign-test-native/{tests,clippy,release}.log`,
+process 15321 exit 0). The [native verifier](../../rust/verification/vector_sign_test_native.rs)
+passes 527,556 checks across 36 decoded fixtures using independent sign-lane
+set intersection/difference: all sign-mask pairs, nonsign poison, every bit,
+asymmetric/random values, old flag patterns, aliases/high registers, readonly
+high/unaligned/RIP operands, every short span, FP/fuel/prior faults. The existing
+VPTEST regression passes 19,800 checks
+(`work/vector-sign-test-native/{native,regression}.log`, process 72312 exit 0).
+
+Discovery reaches 58,034 instructions and 13,147 blocks with 140 unsupported
+sites: one former stop removed and no new stops. These counts do not measure
+CPU completion. The entry runner compiles with warnings denied; startup-only
+verification passes at missing `fscanf`, with ten accepted dependencies,
+20,288 owned dependency bytes and pending cleanup. Game main has not executed
+(`work/vector-sign-test-native/entry.log`, process 90552 exit 0). No full GPU
+suite was run for this CPU change. Production readiness and retail gameplay
+remain unverified.
+
 ## Register half moves and sign masks
 
 VEX VMOVLHPS/VMOVHLPS now combine the appropriate 64-bit halves of two XMM

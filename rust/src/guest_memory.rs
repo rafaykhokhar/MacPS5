@@ -1264,6 +1264,31 @@ pub fn vector_addsub(
     vectors[destination as usize] = result;
     Ok(())
 }
+/// VTESTPS/PD inspect only each floating-point lane's sign bit.
+pub fn vector_sign_test(
+    memory: &Memory<'_>,
+    vectors: &[[u8; 32]; 16],
+    address: u64,
+    first: u64,
+    size: u64,
+    lane_size: u64,
+    old_flags: u64,
+) -> Result<u64> {
+    vector_operand(address, first, size, 0)?;
+    if ![4, 8].contains(&lane_size) {
+        return Err("Invalid packed sign-test lane size".into());
+    }
+    let source = memory.read(address, size as usize)?;
+    let mut intersection = 0u8;
+    let mut complement_intersection = 0u8;
+    for last in (lane_size as usize - 1..size as usize).step_by(lane_size as usize) {
+        intersection |= vectors[first as usize][last] & source[last] & 0x80;
+        complement_intersection |= !vectors[first as usize][last] & source[last] & 0x80;
+    }
+    Ok((old_flags & !0x8d5)
+        | if intersection == 0 { 0x40 } else { 0 }
+        | u64::from(complement_intersection == 0))
+}
 /// Compute VPTEST flags after guarding its complete memory operand.
 pub fn vector_test(
     memory: &Memory<'_>,
@@ -1885,6 +1910,38 @@ pub mod ffi {
             .is_ok()
         {
             return;
+        }
+        cpu.fault = 1;
+    }
+    /// # Safety
+    /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn native_ps5_module_vector_sign_test_v1(
+        cpu: *mut Cpu,
+        address: u64,
+        first: u64,
+        size: u64,
+        lane_size: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if cpu.memory != 0 {
+            if let Ok(flags) = vector_sign_test(
+                unsafe { &*(cpu.memory as *const Memory<'_>) },
+                &cpu.vectors,
+                address,
+                first,
+                size,
+                lane_size,
+                cpu.flags,
+            ) {
+                cpu.flags = flags;
+                return;
+            }
         }
         cpu.fault = 1;
     }
@@ -2572,6 +2629,135 @@ mod tests {
         assert_eq!(memory.read(0x1001, 16).unwrap(), &original[15][16..]);
         assert_eq!(cpu.vectors, original);
         assert_eq!(cpu.flags, u64::MAX);
+    }
+    #[test]
+    fn vector_sign_test_exhaustive_sign_masks_ignore_other_bits() {
+        for size in [16usize, 32] {
+            for width in [4usize, 8] {
+                let lanes = size / width;
+                for left_mask in 0..1u16 << lanes {
+                    for right_mask in 0..1u16 << lanes {
+                        for poison in [0, 255] {
+                            let mut vectors = [[poison; 32]; 16];
+                            let mut data = [poison; 32];
+                            let mut any_both = false;
+                            let mut any_right_only = false;
+                            for lane in 0..lanes {
+                                let left = left_mask & (1 << lane) != 0;
+                                let right = right_mask & (1 << lane) != 0;
+                                vectors[15][lane * width + width - 1] =
+                                    (poison & 127) | (u8::from(left) << 7);
+                                data[lane * width + width - 1] =
+                                    (poison & 127) | (u8::from(right) << 7);
+                                any_both |= left && right;
+                                any_right_only |= !left && right;
+                            }
+                            let original = vectors;
+                            let mut memory = Memory::default();
+                            memory
+                                .add(0x1_0000_0001, &mut data[..size], false, false)
+                                .unwrap();
+                            for old_flags in [0, u64::MAX, 0x246] {
+                                let expected = (old_flags & !0x8d5)
+                                    | (u64::from(!any_both) << 6)
+                                    | u64::from(!any_right_only);
+                                assert_eq!(
+                                    vector_sign_test(
+                                        &memory,
+                                        &vectors,
+                                        0x1_0000_0001,
+                                        15,
+                                        size as u64,
+                                        width as u64,
+                                        old_flags
+                                    )
+                                    .unwrap(),
+                                    expected
+                                );
+                                assert_eq!(vectors, original);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn vector_sign_test_full_span_and_operand_guards() {
+        let vectors = [[0xa5; 32]; 16];
+        for size in [16u64, 32] {
+            for lane_size in [4, 8] {
+                for length in 0..size as usize {
+                    let mut data = vec![0; length];
+                    let mut memory = Memory::default();
+                    if length != 0 {
+                        memory.add(0x1001, &mut data, false, false).unwrap();
+                    }
+                    assert!(
+                        vector_sign_test(&memory, &vectors, 0x1001, 0, size, lane_size, u64::MAX)
+                            .is_err()
+                    );
+                }
+            }
+        }
+        let mut data = [0; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        for (first, size, lane_size) in [
+            (16, 16, 4),
+            (u64::MAX, 16, 4),
+            (0, 0, 4),
+            (0, 8, 4),
+            (0, 64, 4),
+            (0, u64::MAX, 4),
+            (0, 16, 0),
+            (0, 16, 1),
+            (0, 16, 2),
+            (0, 16, 16),
+            (0, 16, u64::MAX),
+        ] {
+            assert!(
+                vector_sign_test(&memory, &vectors, 0x1001, first, size, lane_size, u64::MAX)
+                    .is_err()
+            );
+        }
+    }
+    #[test]
+    #[allow(unsafe_code)]
+    fn vector_sign_test_ffi_fault_atomicity_and_fp_state() {
+        use crate::legacy_cpu::Cpu;
+        unsafe { ffi::native_ps5_module_vector_sign_test_v1(std::ptr::null_mut(), 0, 0, 16, 4) };
+        let mut cpu = Cpu {
+            vectors: [[0xff; 32]; 16],
+            flags: u64::MAX,
+            mxcsr: 0xffff,
+            x87_control: 0x137f,
+            x87_status: 0x5555,
+            ..Cpu::default()
+        };
+        for fault in [0, 2, 13] {
+            cpu.fault = fault;
+            unsafe { ffi::native_ps5_module_vector_sign_test_v1(&mut cpu, 0x1001, 0, 16, 4) };
+            assert_eq!(cpu.fault, if fault == 0 { 1 } else { fault });
+            assert_eq!(cpu.flags, u64::MAX);
+        }
+        let mut data = [0xff; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        cpu.memory = (&mut memory as *mut Memory<'_>) as u64;
+        cpu.fault = 0;
+        unsafe { ffi::native_ps5_module_vector_sign_test_v1(&mut cpu, 0x1001, 0, 16, 4) };
+        assert_eq!(cpu.fault, 0);
+        assert_eq!(cpu.flags, !0x8d5u64 | 1);
+        let flags = cpu.flags;
+        unsafe { ffi::native_ps5_module_vector_sign_test_v1(&mut cpu, 0x1001, 0, 16, 2) };
+        assert_eq!(cpu.fault, 1);
+        assert_eq!(cpu.flags, flags);
+        assert_eq!(cpu.vectors, [[0xff; 32]; 16]);
+        assert_eq!(
+            (cpu.mxcsr, cpu.x87_control, cpu.x87_status),
+            (0xffff, 0x137f, 0x5555)
+        );
     }
     #[test]
     fn packed_saturation_boundaries_ordering_and_aliases() {

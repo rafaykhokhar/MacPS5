@@ -1,5 +1,13 @@
 # Rust migration
 
+VEX VTESTPS/PD now support four XMM/YMM sign-bit flag tests while preserving
+the separate full-bit VPTEST behavior. The matching build passes 678 library
+tests, three integration tests, strict Clippy, 527,556 new native checks and
+19,800 VPTEST regression checks. Discovery reaches 58,034 instructions with
+140 unsupported sites. Startup remains at missing `fscanf`, before game main.
+See [CPU evidence](../docs/status/CPU.md). Production readiness and retail
+gameplay remain unverified.
+
 VEX vector half moves and sign-mask extraction now support ten exact decoded
 forms, including r32/r64 mask destinations. The matching build passes 674
 library tests, three integration tests, strict Clippy and 86,144 native checks.
