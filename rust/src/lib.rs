@@ -115,3 +115,4 @@ pub mod guest_sort;
 
 pub mod guest_getcwd;
 pub mod guest_strcoll;
+pub mod guest_gdtoa;
