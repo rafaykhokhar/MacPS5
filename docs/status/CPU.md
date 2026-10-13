@@ -2,6 +2,37 @@
 
 ## x87 context integration
 
+### Extended store consumption
+
+Exact `FSTP m80fp` (`DB /7`) now lowers to a guarded Rust helper. It writes ten
+payload bytes without binary64 conversion, then commits the stack pop. Failed
+memory checks retain the complete stack and status. Empty-stack handling uses
+the existing masked-indefinite or explicit unmasked-fault paths. Other FST/FSTP
+forms remain unsupported.
+
+The matching ARM64 verifier passes 907 cases spanning all TOP positions and
+supported precision/rounding controls, signed zero/infinity/qNaN, precision
+beyond binary64, unaligned stores, short/read-only destinations, empty stacks
+and pending exceptions (`work/x87-store-review/native.log`). This is independent
+byte/state expectation testing, not an AMD hardware differential run. The
+verifier is included in the full entry runner; full startup has not been rerun
+for this increment.
+
+AMD's [FST/FSTP reference, pp.303–304](https://kib.kiev.ua/x86docs/AMD/AMD64/26569_APM_v5-r3.13.pdf)
+specifies invalid-operation status for SNaN and unsupported formats. The helper
+uses masked SNaN quieting with retained payload, and indefinite for unsupported
+formats, following the general invalid-response policy. Exact FSTx NaN payload
+propagation still needs AMD hardware validation. Pseudo-denormals stop explicitly
+with unsupported-operand code20 because normalization/denormal-status behavior
+is unresolved. Unit regressions cover these policy boundaries and protected
+runtime memory.
+
+Wait-first and memory-validation-before-new-stack-fault are prototype policies.
+[AMD Volume2 §8.5](https://kib.kiev.ua/x86docs/AMD/AMD64/24593_APM_v2-r3.36.pdf)
+allows implementation-dependent priority within the group containing memory and
+pending x87 exceptions. Prototype stop18 is not complete architectural exception
+delivery. No exact PS5 fault-ordering claim follows from these checks.
+
 The Rust CPU now owns eight raw 80-bit registers and physical tags. Its size is
 816 bytes, with the stack at offset 720; all historical prefix offsets remain
 unchanged. Historical C++ 720-byte allocations are not valid extended contexts.

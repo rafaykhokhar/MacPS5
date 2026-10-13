@@ -337,6 +337,14 @@ impl Emitter {
             return Ok(());
         }
         match m {
+            M::Fstp => {
+                if i.code() != iced_x86::Code::Fstp_m80fp {
+                    return Err("Only FSTP m80fp is implemented".into());
+                }
+                self.address(i)?;
+                self.emit("mov x0, x19\nbl _native_ps5_x87_store80_v1");
+                self.fault();
+            }
             M::Fldcw => {
                 self.emit("mov x0, x19\nbl _native_ps5_x87_wait_v1");
                 self.fault();

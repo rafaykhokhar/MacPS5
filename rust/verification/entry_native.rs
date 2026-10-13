@@ -71,6 +71,7 @@ mod wide_strings_native;
 mod narrow_strings_native;
 mod integer_parse_native;
 mod x87_control_native;
+mod x87_store_native;
 mod c_locale_native;
 mod float_parse_native;
 mod scan_native;
@@ -151,6 +152,7 @@ fn main() -> Result<(), String> {
     narrow_strings_native::verify(Path::new(&archive), Path::new(&directory))?;
     integer_parse_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     x87_control_native::verify(Path::new(&archive), Path::new(&directory))?;
+    x87_store_native::verify(Path::new(&archive), Path::new(&directory))?;
     c_locale_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     float_parse_native::verify(&file, Path::new(&archive), Path::new(&directory))?;
     scan_native::verify(&file, Path::new(&archive), Path::new(&directory))?;

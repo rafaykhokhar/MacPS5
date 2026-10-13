@@ -7,7 +7,9 @@ mod decimal_big;
 mod decimal_effects;
 mod decimal_refinement;
 pub mod effects;
+pub mod extended80;
 mod strtof_decimal;
+pub mod strtold_decimal;
 pub mod strtof_effects;
 use big::Big;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
