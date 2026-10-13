@@ -1,5 +1,33 @@
 # CPU completion criteria
 
+## Unsigned multiplication
+
+MUL r/m8, r/m16, r/m32 and r/m64 now lower to ARM64. Inputs are captured before
+implicit outputs change, including accumulator/high-half aliases. Byte products
+write AX; word products write DX:AX while retaining surrounding bits; dword
+products zero-extend EDX:EAX; qword products write the complete RDX:RAX result.
+CF and OF indicate a nonzero upper half. Undefined arithmetic flags are preserved
+deterministically. A rejected memory load leaves all outputs and flags intact.
+
+Reference: AMD APM Volume 3 rev.3.31, MUL p.253
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/24594_APM_v3-r3.31.pdf)), also
+inspected in the local retained manual. This increment does not change IMUL.
+
+The build passes 604 library tests, three integration tests, strict Clippy and
+release compilation (`work/mul-native/{tests,clippy,release}.log`, process 20749
+exit 0). An old unsupported-instruction test used MUL as its rejection fixture;
+it now uses still-unsupported RCL, while new tests assert MUL acceptance.
+Independent native checks pass 754,413 cases over 33 decoded forms
+(`work/mul-native/native.log`, process 15517 exit 0): exhaustive byte pairs,
+wide edge/random inputs, u128 product reference, register aliases, AH/high
+registers, partial writes, flags, readonly unaligned/high/RIP-relative memory,
+aliased memory bases, load failures, FP-state preservation and fuel.
+
+The full entry verifier includes this suite and compiles with warnings denied
+(process 40562 exit 0). Full startup was not rerun for this isolated instruction
+addition. No PS5 hardware differential run or gameplay improvement is established.
+LOCK/REP, FS/GS and address32 forms remain explicit rejection boundaries.
+
 ## Narrow shifts and rotations
 
 SHL/SHR/SAR/ROL/ROR now support byte and word operands, with register or memory

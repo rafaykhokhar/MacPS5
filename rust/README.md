@@ -1,5 +1,10 @@
 # Rust migration
 
+Unsigned MUL8/16/32/64 now translates to ARM64 with full-width implicit results,
+alias-safe inputs and guarded flags. The build passes 604 library tests, three
+integration tests, strict Clippy and 754,413 independent native checks. See
+[CPU evidence and boundaries](../docs/status/CPU.md).
+
 Byte/word SHL/SHR/SAR/ROL/ROR now translate to ARM64 with x86 count masking,
 partial-register writes and guarded flags. The matching build passes 603 library
 tests, three integration tests, strict Clippy and 502,020 native checks including

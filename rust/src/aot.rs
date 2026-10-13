@@ -37,6 +37,38 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn unsigned_multiply_exact_forms_and_guards() {
+        for (prefix, opcode) in [
+            (&[][..], 0xf6),
+            (&[0x40][..], 0xf6),
+            (&[0x66][..], 0xf7),
+            (&[][..], 0xf7),
+            (&[0x48][..], 0xf7),
+        ] {
+            for modrm in [0xe0, 0xe2, 0xe4, 0xe7, 0x27] {
+                let bytes = [prefix, &[opcode, modrm]].concat();
+                assert!(
+                    super::translate_rust_memory_region(&bytes, 0, "mul").is_ok(),
+                    "{bytes:x?}"
+                );
+            }
+        }
+        for bytes in [
+            &[0xf0, 0xf6, 0x27][..],
+            &[0xf3, 0xf7, 0xe0],
+            &[0xf2, 0x48, 0xf7, 0xe0],
+            &[0x64, 0xf6, 0x27],
+            &[0x65, 0x66, 0xf7, 0x27],
+            &[0x67, 0x48, 0xf7, 0x27],
+            &[0x67, 0xf7, 0x24, 0x25, 0, 0, 0, 0],
+        ] {
+            assert!(
+                super::translate_rust_memory_region(bytes, 0, "unsupported_mul").is_err(),
+                "{bytes:x?}"
+            );
+        }
+    }
+    #[test]
     fn narrow_shift_forms_and_excluded_addressing() {
         for operation in [0, 1, 4, 5, 7] {
             for prefix in [&[][..], &[0x40][..], &[0x66][..]] {
@@ -1110,6 +1142,47 @@ impl Emitter {
                 self.emit(format!("mov x0, x19\nmov x1, x20\nmov x2, #{width}\nmov x3, #{}\nbl _native_ps5_divide_v1", u8::from(m == M::Idiv)));
                 self.fault();
             }
+            M::Mul => {
+                // AMD APM Vol.3 Rev.3.31 p.253: unsigned full product in
+                // AX/DX:AX/EDX:EAX/RDX:RAX, CF=OF=(upper half != 0).
+                if !matches!(
+                    i.code(),
+                    iced_x86::Code::Mul_rm8
+                        | iced_x86::Code::Mul_rm16
+                        | iced_x86::Code::Mul_rm32
+                        | iced_x86::Code::Mul_rm64
+                ) {
+                    return Err("Only one-operand MUL8/16/32/64 is implemented".into());
+                }
+                if i.op0_kind() == OpKind::Memory
+                    && i.memory_base() == R::None
+                    && i.memory_index() == R::None
+                    && i.memory_displ_size() != 8
+                {
+                    return Err("32-bit absolute addressing is not implemented".into());
+                }
+                // Snapshot the explicit source before any implicit destination
+                // changes, including AL/AH/RAX/RDX aliases. Memory faults leave
+                // both implicit destinations and all flags untouched.
+                self.read(i, 0, width, 20)?;
+                self.emit("ldr x21, [x19, #0]");
+                if width < 64 {
+                    self.emit(format!("ubfx x21, x21, #0, #{width}"));
+                }
+                self.emit("mul x22, x21, x20");
+                if width == 64 {
+                    self.emit("umulh x9, x21, x20\nstr x22, [x19, #0]\nstr x9, [x19, #16]");
+                } else {
+                    self.emit(format!("lsr x9, x22, #{width}"));
+                    match width {
+                        32 => self.emit("mov w22, w22\nstr x22, [x19, #0]\nstr x9, [x19, #16]"),
+                        16 => self.emit("strh w22, [x19, #0]\nstrh w9, [x19, #16]"),
+                        _ => self.emit("strh w22, [x19, #0]"),
+                    }
+                }
+                // Preserve undefined arithmetic flags deterministically.
+                self.emit("cmp x9, #0\ncset x9, ne\norr x9, x9, x9, lsl #11\nldr x10, [x19, #136]\nmov x11, #2049\nbic x10, x10, x11\norr x10, x10, x9\nstr x10, [x19, #136]");
+            }
             M::Imul if i.op_count() == 1 => {
                 // Intel SDM IMUL: signed full-width product goes to AX or
                 // DX:AX/EDX:EAX/RDX:RAX. Only CF/OF are defined.
@@ -1371,7 +1444,7 @@ mod tests {
     #[test]
     fn reject_unsupported_instead_of_silently_skipping() {
         for bytes in [
-            &[0xf7, 0xe0, 0xc3][..],
+            &[0xd2, 0xd0, 0xc3][..], // RCL AL,CL still needs carry-input support.
             &[0xf6, 0xf0, 0xc3],
             &[0xf0, 0x01, 0x00, 0xc3],
             &[0x64, 0x48, 0x8b, 0x00, 0xc3],
