@@ -82,6 +82,7 @@ mod packed_addsub_native;
 mod packed_test_native;
 mod packed_extend_native;
 mod packed_logical_native;
+mod packed_shuffle_native;
 mod strftime_native;
 mod strtof_native;
 mod strtold_native;
@@ -197,6 +198,7 @@ fn main() -> Result<(), String> {
         packed_test_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-test"))?;
         packed_extend_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-extend"))?;
         packed_logical_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-logical"))?;
+        packed_shuffle_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-shuffle"))?;
         strftime_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strftime"))?;
         strtof_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtof"))?;
         strtold_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtold"))?;

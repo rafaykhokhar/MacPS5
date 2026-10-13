@@ -1,5 +1,12 @@
 # Rust migration
 
+VEX byte/doubleword shuffles now support XMM/YMM and guarded memory operands.
+The matching build passes 634 library tests, three integration tests, strict
+Clippy and 95,616 native checks across 2,136 encoding fixtures. Discovery reaches
+56,528 instructions; startup still stops at missing `fscanf`, before game main.
+See [CPU evidence](../docs/status/CPU.md). Production readiness and retail
+gameplay remain unverified.
+
 VEX packed AND/AND-NOT/OR/XOR now support both XMM and YMM, including guarded
 memory operands. The matching build passes 630 library tests, three integration
 tests, strict Clippy, 534,880 native logical checks and 7,257 XOR regressions.

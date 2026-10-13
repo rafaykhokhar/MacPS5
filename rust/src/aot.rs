@@ -37,6 +37,28 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn packed_shuffle_absolute_address_guard() {
+        for length in [0, 4] {
+            for (map, opcode) in [(1, 0x70), (2, 0)] {
+                let bytes = [
+                    0x67,
+                    0xc4,
+                    0xe0 | map,
+                    0x79 | length,
+                    opcode,
+                    0x04,
+                    0x25,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ];
+                assert!(super::translate_rust_memory_region(&bytes, 0, "address").is_err());
+            }
+        }
+    }
+    #[test]
     fn packed_logical_address_guards() {
         for opcode in [0xdb, 0xdf, 0xeb, 0xef] {
             for length in [0, 4] {
@@ -1017,6 +1039,86 @@ impl Emitter {
                     216 + merge * 32, 208 + dst * 32, 216 + dst * 32,
                     224 + dst * 32, 232 + dst * 32
                 ));
+            }
+            M::Vpshufd | M::Vpshufb => {
+                use iced_x86::Code;
+                let (bytes, wide) = match i.code() {
+                    Code::VEX_Vpshufd_xmm_xmmm128_imm8 => (false, false),
+                    Code::VEX_Vpshufd_ymm_ymmm256_imm8 => (false, true),
+                    Code::VEX_Vpshufb_xmm_xmm_xmmm128 => (true, false),
+                    Code::VEX_Vpshufb_ymm_ymm_ymmm256 => (true, true),
+                    _ => {
+                        return Err(
+                            "Only VEX128/256 packed byte/dword shuffle is implemented".into()
+                        );
+                    }
+                };
+                let dst = vector(i.op0_register())?;
+                let operand = if bytes { 2 } else { 1 };
+                if i.op_kind(operand) == OpKind::Memory {
+                    if i.memory_base() == R::None
+                        && i.memory_index() == R::None
+                        && i.memory_displ_size() != 8
+                    {
+                        return Err("32-bit absolute addressing is not implemented".into());
+                    }
+                    self.address(i)?;
+                    if bytes {
+                        let first = vector(i.op1_register())?;
+                        self.emit(format!(
+                            "mov x0, x19\nmov x2, #{dst}\nmov x3, #{first}\nmov x4, #{}\nbl _native_ps5_module_vector_shufb_v1",
+                            if wide { 32 } else { 16 }
+                        ));
+                    } else {
+                        self.emit(format!(
+                            "mov x0, x19\nmov x2, #{dst}\nmov x3, #{}\nmov x4, #{}\nbl _native_ps5_module_vector_shufd_v1",
+                            if wide { 32 } else { 16 }, i.immediate8()
+                        ));
+                    }
+                    self.fault();
+                } else if bytes {
+                    let first = vector(i.op1_register())?;
+                    let control = vector(i.op2_register())?;
+                    // Retain bit 7 so TBL zeroes those bytes, and clear ignored
+                    // bits 6:4. Each 128-bit half has its own lookup table.
+                    self.emit(format!(
+                        "ldr q0, [x19, #{}]\nldr q1, [x19, #{}]\nmovi v4.16b, #143\nand v1.16b, v1.16b, v4.16b\ntbl v0.16b, {{v0.16b}}, v1.16b",
+                        208 + first * 32, 208 + control * 32
+                    ));
+                    if wide {
+                        self.emit(format!(
+                            "ldr q2, [x19, #{}]\nldr q3, [x19, #{}]\nand v3.16b, v3.16b, v4.16b\ntbl v2.16b, {{v2.16b}}, v3.16b",
+                            224 + first * 32, 224 + control * 32
+                        ));
+                    } else {
+                        self.emit("movi v2.16b, #0");
+                    }
+                    self.emit(format!(
+                        "str q0, [x19, #{}]\nstr q2, [x19, #{}]",
+                        208 + dst * 32,
+                        224 + dst * 32
+                    ));
+                } else {
+                    let source = vector(i.op1_register())?;
+                    self.emit(format!("ldr q0, [x19, #{}]", 208 + source * 32));
+                    if wide {
+                        self.emit(format!("ldr q2, [x19, #{}]", 224 + source * 32));
+                    } else {
+                        self.emit("movi v3.16b, #0");
+                    }
+                    for lane in 0..4 {
+                        let index = (i.immediate8() >> (lane * 2)) & 3;
+                        self.emit(format!("ins v1.s[{lane}], v0.s[{index}]"));
+                        if wide {
+                            self.emit(format!("ins v3.s[{lane}], v2.s[{index}]"));
+                        }
+                    }
+                    self.emit(format!(
+                        "str q1, [x19, #{}]\nstr q3, [x19, #{}]",
+                        208 + dst * 32,
+                        224 + dst * 32
+                    ));
+                }
             }
             M::Vpand | M::Vpandn | M::Vpor | M::Vpxor => {
                 use iced_x86::Code;

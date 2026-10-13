@@ -743,6 +743,54 @@ pub fn vector_cmpgtd256(
     vectors[destination as usize] = result;
     Ok(())
 }
+/// Shuffle dwords independently within each 128-bit lane of a guarded source.
+pub fn vector_shufd(
+    memory: &Memory<'_>,
+    vectors: &mut [[u8; 32]; 16],
+    address: u64,
+    destination: u64,
+    size: u64,
+    immediate: u64,
+) -> Result<()> {
+    vector_operand(address, destination, size, 0)?;
+    if immediate > 255 {
+        return Err("Invalid packed dword shuffle immediate".into());
+    }
+    let source = memory.read(address, size as usize)?;
+    let mut result = [0; 32];
+    for base in (0..size as usize).step_by(16) {
+        for lane in 0..4 {
+            let input = base + ((immediate >> (lane * 2)) & 3) as usize * 4;
+            let output = base + lane * 4;
+            result[output..output + 4].copy_from_slice(&source[input..input + 4]);
+        }
+    }
+    vectors[destination as usize] = result;
+    Ok(())
+}
+/// Use guarded byte controls to shuffle the first vector within 128-bit lanes.
+pub fn vector_shufb(
+    memory: &Memory<'_>,
+    vectors: &mut [[u8; 32]; 16],
+    address: u64,
+    destination: u64,
+    first: u64,
+    size: u64,
+) -> Result<()> {
+    vector_operand(address, destination, size, 0)?;
+    if first >= 16 {
+        return Err("Invalid packed byte shuffle source".into());
+    }
+    let controls = memory.read(address, size as usize)?;
+    let mut result = [0; 32];
+    for (index, control) in controls.iter().copied().enumerate() {
+        if control & 0x80 == 0 {
+            result[index] = vectors[first as usize][(index & !15) + usize::from(control & 15)];
+        }
+    }
+    vectors[destination as usize] = result;
+    Ok(())
+}
 /// Apply packed bitwise logic after guarding the complete memory operand.
 /// Operations are AND=0, AND-NOT=1 (~first & memory), OR=2, XOR=3.
 pub fn vector_logical(
@@ -1016,6 +1064,68 @@ pub mod ffi {
         }
         if cpu.memory != 0
             && vector_xor(
+                unsafe { &*(cpu.memory as *const Memory<'_>) },
+                &mut cpu.vectors,
+                address,
+                destination,
+                first,
+                size,
+            )
+            .is_ok()
+        {
+            return;
+        }
+        cpu.fault = 1;
+    }
+    /// # Safety
+    /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn native_ps5_module_vector_shufd_v1(
+        cpu: *mut Cpu,
+        address: u64,
+        destination: u64,
+        size: u64,
+        immediate: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if cpu.memory != 0
+            && vector_shufd(
+                unsafe { &*(cpu.memory as *const Memory<'_>) },
+                &mut cpu.vectors,
+                address,
+                destination,
+                size,
+                immediate,
+            )
+            .is_ok()
+        {
+            return;
+        }
+        cpu.fault = 1;
+    }
+    /// # Safety
+    /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn native_ps5_module_vector_shufb_v1(
+        cpu: *mut Cpu,
+        address: u64,
+        destination: u64,
+        first: u64,
+        size: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if cpu.memory != 0
+            && vector_shufb(
                 unsafe { &*(cpu.memory as *const Memory<'_>) },
                 &mut cpu.vectors,
                 address,
@@ -1696,6 +1806,175 @@ mod tests {
         unsafe { ffi::native_ps5_module_vector_addsub_v1(&mut cpu, 0x1000, 0, 0, 16, 1, 2) };
         assert_eq!(cpu.fault, 1);
         assert_eq!(cpu.vectors, before);
+    }
+    #[test]
+    fn packed_shuffles_all_controls_keep_128bit_lanes_separate() {
+        for size in [16usize, 32] {
+            for immediate in 0..=255u64 {
+                let mut data: [u8; 32] = std::array::from_fn(|i| (i + 1) as u8);
+                let source = data;
+                let mut memory = Memory::default();
+                memory
+                    .add(0x1_0000_0001, &mut data[..size], false, false)
+                    .unwrap();
+                let mut vectors = [[0xa5; 32]; 16];
+                let mut expected = vectors;
+                expected[15] = [0; 32];
+                let mut selectors = immediate;
+                for lane in 0..4 {
+                    let selected = (selectors % 4) as usize;
+                    selectors /= 4;
+                    for base in (0..size).step_by(16) {
+                        expected[15][base + lane * 4..base + lane * 4 + 4]
+                            .copy_from_slice(&source[base + selected * 4..base + selected * 4 + 4]);
+                    }
+                }
+                vector_shufd(
+                    &memory,
+                    &mut vectors,
+                    0x1_0000_0001,
+                    15,
+                    size as u64,
+                    immediate,
+                )
+                .unwrap();
+                assert_eq!(vectors, expected);
+            }
+            for control in 0..=255u8 {
+                for destination in [3usize, 15] {
+                    let mut vectors = [[0xa5; 32]; 16];
+                    vectors[15] = std::array::from_fn(|i| (i + 1) as u8);
+                    let mut controls: [u8; 32] =
+                        std::array::from_fn(|i| control.wrapping_add(i as u8));
+                    let mut expected = vectors;
+                    expected[destination] = [0; 32];
+                    for (i, &selector) in controls[..size].iter().enumerate() {
+                        if selector < 128 {
+                            expected[destination][i] =
+                                vectors[15][i / 16 * 16 + usize::from(selector % 16)];
+                        }
+                    }
+                    let mut memory = Memory::default();
+                    memory
+                        .add(0x1_0000_0001, &mut controls[..size], false, false)
+                        .unwrap();
+                    vector_shufb(
+                        &memory,
+                        &mut vectors,
+                        0x1_0000_0001,
+                        destination as u64,
+                        15,
+                        size as u64,
+                    )
+                    .unwrap();
+                    assert_eq!(vectors, expected);
+                }
+            }
+        }
+    }
+    #[test]
+    fn packed_shuffles_invalid_parameters_and_short_reads_are_atomic() {
+        let original = [[0xa5; 32]; 16];
+        for size in [16u64, 32] {
+            for length in 0..size as usize {
+                let mut data = vec![0; length];
+                let mut memory = Memory::default();
+                if length != 0 {
+                    memory.add(0x1001, &mut data, false, false).unwrap();
+                }
+                let mut vectors = original;
+                assert!(vector_shufd(&memory, &mut vectors, 0x1001, 0, size, 0).is_err());
+                assert_eq!(vectors, original);
+                assert!(vector_shufb(&memory, &mut vectors, 0x1001, 0, 0, size).is_err());
+                assert_eq!(vectors, original);
+            }
+        }
+        let mut data = [0; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        for (dst, size) in [
+            (16, 16),
+            (u64::MAX, 16),
+            (0, 0),
+            (0, 8),
+            (0, 64),
+            (0, u64::MAX),
+        ] {
+            let mut vectors = original;
+            assert!(vector_shufd(&memory, &mut vectors, 0x1001, dst, size, 0).is_err());
+            assert_eq!(vectors, original);
+            assert!(vector_shufb(&memory, &mut vectors, 0x1001, dst, 0, size).is_err());
+            assert_eq!(vectors, original);
+        }
+        for invalid in [256, u64::MAX] {
+            let mut vectors = original;
+            assert!(vector_shufd(&memory, &mut vectors, 0x1001, 0, 16, invalid).is_err());
+            assert_eq!(vectors, original);
+        }
+        for invalid in [16, u64::MAX] {
+            let mut vectors = original;
+            assert!(vector_shufb(&memory, &mut vectors, 0x1001, 0, invalid, 16).is_err());
+            assert_eq!(vectors, original);
+        }
+    }
+    #[test]
+    #[allow(unsafe_code)]
+    fn packed_shuffle_ffi_guards_faults_and_preserves_flags() {
+        use crate::legacy_cpu::Cpu;
+        unsafe {
+            ffi::native_ps5_module_vector_shufd_v1(std::ptr::null_mut(), 0, 0, 16, 0);
+            ffi::native_ps5_module_vector_shufb_v1(std::ptr::null_mut(), 0, 0, 0, 16);
+        }
+        for byte_shuffle in [false, true] {
+            let mut cpu = Cpu {
+                vectors: [[0x55; 32]; 16],
+                flags: u64::MAX,
+                ..Cpu::default()
+            };
+            for fault in [0, 2, 13] {
+                cpu.fault = fault;
+                unsafe {
+                    if byte_shuffle {
+                        ffi::native_ps5_module_vector_shufb_v1(&mut cpu, 0x1001, 0, 0, 16);
+                    } else {
+                        ffi::native_ps5_module_vector_shufd_v1(&mut cpu, 0x1001, 0, 16, 0);
+                    }
+                }
+                assert_eq!(cpu.fault, if fault == 0 { 1 } else { fault });
+                assert_eq!(cpu.vectors, [[0x55; 32]; 16]);
+                assert_eq!(cpu.flags, u64::MAX);
+            }
+            let mut data = [0x80; 32];
+            let mut memory = Memory::default();
+            memory.add(0x1001, &mut data, false, false).unwrap();
+            cpu.memory = (&mut memory as *mut Memory<'_>) as u64;
+            cpu.fault = 0;
+            unsafe {
+                if byte_shuffle {
+                    ffi::native_ps5_module_vector_shufb_v1(&mut cpu, 0x1001, 0, 0, 16);
+                } else {
+                    ffi::native_ps5_module_vector_shufd_v1(&mut cpu, 0x1001, 0, 16, 0);
+                }
+            }
+            assert_eq!(cpu.fault, 0);
+            assert_eq!(
+                &cpu.vectors[0][..16],
+                &[if byte_shuffle { 0 } else { 0x80 }; 16]
+            );
+            assert_eq!(&cpu.vectors[0][16..], &[0; 16]);
+            assert_eq!(cpu.flags, u64::MAX);
+            let before = cpu.vectors;
+            unsafe {
+                if byte_shuffle {
+                    ffi::native_ps5_module_vector_shufb_v1(&mut cpu, 0x1001, 0, 16, 16);
+                } else {
+                    ffi::native_ps5_module_vector_shufd_v1(&mut cpu, 0x1001, 0, 16, 256);
+                }
+            }
+            assert_eq!(cpu.fault, 1);
+            assert_eq!(cpu.vectors, before);
+            assert_eq!(cpu.flags, u64::MAX);
+        }
     }
     #[test]
     fn packed_logical_truth_table_widths_and_aliases() {

@@ -1,5 +1,41 @@
 # CPU completion criteria
 
+## Packed byte and doubleword shuffles
+
+VEX VPSHUFB and VPSHUFD now cover XMM and YMM register/memory forms.
+Byte shuffles use ARM64 TBL independently per 128-bit half, masking controls
+with 0x8f so bit 7 zeroes the output and bits 6:4 are ignored. Doubleword
+shuffles use immediate-selected ARM64 lane inserts. Sources are consumed before
+destination writes, including aliases; XMM writes clear the upper YMM half.
+Memory helpers guard the complete 16/32-byte operand before committing a result.
+Flags/FP state are preserved. Legacy/EVEX, reserved VPSHUFD vvvv and unsupported
+FS/GS/address32 forms remain rejected; WIG is accepted.
+
+Reference: AMD APM Volume 4 rev.3.24 pp.436–440
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)).
+Architectural alignment-control exceptions and full exception delivery remain
+outside the guarded-memory model.
+
+The matching build passes 634 library tests, three integration tests, strict
+Clippy and release compilation (`work/packed-shuffle-native/{tests,clippy,release}.log`,
+process 53180 exit 0). The [native verifier](../../rust/verification/packed_shuffle_native.rs)
+passes 95,616 independent source-selection checks across 2,136 decoded fixtures:
+all doubleword immediates for register and memory forms; all byte controls;
+mixed random controls, single-position zeroing, reverse/permutation patterns,
+and separate upper/lower lane selection; aliases/high registers/WIG; exact-end
+readonly high/unaligned/RIP reads; every short span; flags/FP/fuel/prior faults
+(`work/packed-shuffle-native/native.log`, process 28308 exit 0).
+
+Discovery reaches 56,528 instructions and 12,853 blocks with 179 unsupported
+sites: 11 former stops removed, six later stops exposed (process 37241 exit 0).
+These are discovery counts, not CPU coverage percentages. The integrated entry
+runner compiles with warnings denied. Its startup-only run still stops at
+missing `fscanf`, with ten accepted dependencies and 20,288 owned dependency
+bytes; cleanup remains pending and game main has not executed
+(`work/packed-shuffle-native/entry.log`, process 65294 exit 0). Full GPU checks
+were not run for this CPU change. Production readiness and retail gameplay
+remain unverified.
+
 ## Packed logical operations
 
 VEX VPAND, VPANDN, VPOR and VPXOR now cover both XMM and YMM operands
