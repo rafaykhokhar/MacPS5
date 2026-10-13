@@ -1,5 +1,35 @@
 # CPU completion criteria
 
+## Packed vector bit tests
+
+VEX VPTEST supports XMM and YMM register or memory sources. ZF reports whether
+the intersection is empty; CF reports whether any bit in the second source is
+absent from the first. OF/SF/AF/PF clear and other flags survive. Neither vector
+changes. The register emitter reduces over the entire selected width; the
+memory helper validates the whole source before publishing flags. Reserved
+vvvv, legacy/EVEX and FS/GS/address32 remain rejected; WIG forms are accepted.
+
+Reference: AMD APM Volume 4 rev.3.24 pp.497–498
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)).
+The matching build passes 622 library tests, three integration tests, strict
+Clippy and release compilation (`work/packed-test-native/{tests,clippy,release}.log`,
+process 38550 exit 0). An initial Clippy run found an identity operation in a
+test expectation; that expression was simplified before the passing build.
+The [native verifier](../../rust/verification/packed_test_native.rs) passes
+19,800 comparisons across 18 decoded fixtures: independent per-bit flag
+expectations, all four CF/ZF outcomes, each bit including the upper256 half,
+asymmetric/random inputs, aliases/high registers/WIG, multiple old-flag patterns,
+exact-end readonly high/unaligned/RIP memory, every short span and state/fuel
+guards (`work/packed-test-native/native.log`, process 29057 exit 0).
+
+Pinned discovery clears all six former VPTEST boundaries and adds no new
+boundaries, reaching 56,022 instructions in 12,766 blocks with 192 unsupported
+stops. The combined verifier compiles and startup-only execution retains its
+expected missing `fscanf` exit: ten named dependencies accepted, 20,288
+dependency bytes owned, cleanup pending and game main not executed
+(`work/packed-test-native/entry.log`, process 29057 exit 0).
+These counts are not a CPU coverage percentage or proof of gameplay.
+
 ## Packed wrapping arithmetic
 
 VEX VPADDB/W/D/Q and VPSUBB/W/D/Q now support XMM/YMM register and memory

@@ -37,6 +37,35 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn packed_test_forms_and_guards() {
+        for length in [0, 4] {
+            for operand in [0xc0, 0xc1, 0x07] {
+                let bytes = [0xc4, 0xe2, 0x79 | length, 0x17, operand];
+                assert!(super::translate_rust_memory_region(&bytes, 0, "vptest").is_ok());
+                let reserved = [0xc4, 0xe2, 0x71 | length, 0x17, operand];
+                assert!(super::translate_rust_memory_region(&reserved, 0, "reserved").is_err());
+            }
+            for prefix in [0x64, 0x65, 0x67] {
+                let bytes = [prefix, 0xc4, 0xe2, 0x79 | length, 0x17, 0x07];
+                assert!(super::translate_rust_memory_region(&bytes, 0, "address").is_err());
+            }
+            let bytes = [
+                0x67,
+                0xc4,
+                0xe2,
+                0x79 | length,
+                0x17,
+                0x04,
+                0x25,
+                0,
+                0,
+                0,
+                0,
+            ];
+            assert!(super::translate_rust_memory_region(&bytes, 0, "address").is_err());
+        }
+    }
+    #[test]
     fn packed_wrapping_arithmetic_forms_and_guards() {
         for opcode in [0xfc, 0xfd, 0xfe, 0xd4, 0xf8, 0xf9, 0xfa, 0xfb] {
             for length in [0, 4] {
@@ -1000,6 +1029,37 @@ impl Emitter {
                         208 + dst * 32,
                         224 + dst * 32
                     ));
+                }
+            }
+            M::Vptest => {
+                let size = match i.code() {
+                    iced_x86::Code::VEX_Vptest_xmm_xmmm128 => 16,
+                    iced_x86::Code::VEX_Vptest_ymm_ymmm256 => 32,
+                    _ => return Err("Only VEX VPTEST is implemented".into()),
+                };
+                let first = vector(i.op0_register())?;
+                if i.op1_kind() == OpKind::Memory {
+                    if i.memory_base() == R::None
+                        && i.memory_index() == R::None
+                        && i.memory_displ_size() != 8
+                    {
+                        return Err("32-bit absolute addressing is not implemented".into());
+                    }
+                    self.address(i)?;
+                    self.emit(format!("mov x0, x19\nmov x2, #{first}\nmov x3, #{size}\nbl _native_ps5_module_vector_test_v1"));
+                    self.fault();
+                } else {
+                    let second = vector(i.op1_register())?;
+                    self.emit("mov x20, #0\nmov x21, #0");
+                    for offset in (0..size).step_by(8) {
+                        self.emit(format!(
+                            "ldr x9, [x19, #{}]\nldr x10, [x19, #{}]\nand x11, x9, x10\nbic x12, x10, x9\norr x20, x20, x11\norr x21, x21, x12",
+                            208 + first * 32 + offset, 208 + second * 32 + offset
+                        ));
+                    }
+                    // Reduce over the complete vector. Only ZF and CF receive
+                    // computed values; OF/SF/AF/PF clear and other flags survive.
+                    self.emit("ldr x9, [x19, #136]\nmov x10, #0x8d5\nbic x9, x9, x10\ncmp x20, #0\ncset x10, eq\norr x9, x9, x10, lsl #6\ncmp x21, #0\ncset x10, eq\norr x9, x9, x10\nstr x9, [x19, #136]");
                 }
             }
             M::Vpcmpeqb | M::Vpcmpeqw | M::Vpcmpeqd | M::Vpcmpeqq => {

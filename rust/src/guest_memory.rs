@@ -819,6 +819,28 @@ pub fn vector_addsub(
     vectors[destination as usize] = result;
     Ok(())
 }
+/// Compute VPTEST flags after guarding its complete memory operand.
+pub fn vector_test(
+    memory: &Memory<'_>,
+    vectors: &[[u8; 32]; 16],
+    address: u64,
+    first: u64,
+    size: u64,
+    old_flags: u64,
+) -> Result<u64> {
+    vector_operand(address, first, size, 0)?;
+    let source = memory.read(address, size as usize)?;
+    let mut intersection = 0u8;
+    let mut complement_intersection = 0u8;
+    for (lhs, rhs) in vectors[first as usize].iter().zip(source) {
+        intersection |= lhs & rhs;
+        complement_intersection |= !lhs & rhs;
+    }
+    // CF/PF/AF/ZF/SF/OF are the only flags written by VPTEST.
+    Ok((old_flags & !0x8d5)
+        | if intersection == 0 { 0x40 } else { 0 }
+        | u64::from(complement_intersection == 0))
+}
 pub fn vector_xor(
     memory: &Memory<'_>,
     vectors: &mut [[u8; 32]; 16],
@@ -932,6 +954,36 @@ pub mod ffi {
             .is_ok()
         {
             return;
+        }
+        cpu.fault = 1;
+    }
+    /// # Safety
+    /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn native_ps5_module_vector_test_v1(
+        cpu: *mut Cpu,
+        address: u64,
+        first: u64,
+        size: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if cpu.memory != 0 {
+            if let Ok(flags) = vector_test(
+                unsafe { &*(cpu.memory as *const Memory<'_>) },
+                &cpu.vectors,
+                address,
+                first,
+                size,
+                cpu.flags,
+            ) {
+                cpu.flags = flags;
+                return;
+            }
         }
         cpu.fault = 1;
     }
@@ -1084,6 +1136,108 @@ pub mod ffi {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn packed_test_flags_all_outcomes_and_operand_direction() {
+        for size in [16u64, 32] {
+            for (lhs, rhs, expected) in [
+                (0u8, 0u8, 0x41),
+                (1, 1, 1),
+                (1, 2, 0x40),
+                (1, 3, 0),
+                (3, 1, 1),
+            ] {
+                for at in [0, size as usize - 1] {
+                    let mut vectors = [[0; 32]; 16];
+                    let mut data = [0; 32];
+                    vectors[15][at] = lhs;
+                    data[at] = rhs;
+                    let before = vectors;
+                    let mut memory = Memory::default();
+                    memory
+                        .add(0x1_0000_0001, &mut data[..size as usize], false, false)
+                        .unwrap();
+                    for old_flags in [0, u64::MAX, 0x246] {
+                        let result =
+                            vector_test(&memory, &vectors, 0x1_0000_0001, 15, size, old_flags)
+                                .unwrap();
+                        assert_eq!(result, (old_flags & !0x8d5) | expected);
+                        assert_eq!(vectors, before);
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn packed_test_width_and_full_span_guards() {
+        let mut vectors = [[0; 32]; 16];
+        vectors[0][31] = 1;
+        let before = vectors;
+        let mut data = [0; 32];
+        data[31] = 3;
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        assert_eq!(
+            vector_test(&memory, &vectors, 0x1001, 0, 16, 0).unwrap(),
+            0x41
+        );
+        assert_eq!(vector_test(&memory, &vectors, 0x1001, 0, 32, 0).unwrap(), 0);
+        for (first, size) in [
+            (16, 16),
+            (u64::MAX, 16),
+            (0, 0),
+            (0, 8),
+            (0, 64),
+            (0, u64::MAX),
+        ] {
+            assert!(vector_test(&memory, &vectors, 0x1001, first, size, u64::MAX).is_err());
+        }
+        assert_eq!(vectors, before);
+        for size in [16u64, 32] {
+            for length in 0..size as usize {
+                let mut data = vec![0; length];
+                let mut memory = Memory::default();
+                if length != 0 {
+                    memory.add(0x1001, &mut data, false, false).unwrap();
+                }
+                assert!(vector_test(&memory, &vectors, 0x1001, 0, size, u64::MAX).is_err());
+                assert_eq!(vectors, before);
+            }
+        }
+    }
+    #[test]
+    #[allow(unsafe_code)]
+    fn packed_test_ffi_commits_flags_only_after_success() {
+        use crate::legacy_cpu::Cpu;
+        let mut cpu = Cpu {
+            flags: u64::MAX,
+            vectors: [[0xa5; 32]; 16],
+            ..Cpu::default()
+        };
+        let vectors = cpu.vectors;
+        for fault in [0, 2, 13] {
+            cpu.fault = fault;
+            unsafe { ffi::native_ps5_module_vector_test_v1(&mut cpu, 0x1001, 0, 32) };
+            assert_eq!(cpu.fault, if fault == 0 { 1 } else { fault });
+            assert_eq!(cpu.flags, u64::MAX);
+            assert_eq!(cpu.vectors, vectors);
+        }
+        let mut data = [0; 31];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        cpu.memory = (&mut memory as *mut Memory<'_>) as u64;
+        for (first, size) in [(0, 32), (16, 16), (0, 0)] {
+            cpu.fault = 0;
+            unsafe { ffi::native_ps5_module_vector_test_v1(&mut cpu, 0x1001, first, size) };
+            assert_eq!(cpu.fault, 1);
+            assert_eq!(cpu.flags, u64::MAX);
+            assert_eq!(cpu.vectors, vectors);
+        }
+        cpu.fault = 0;
+        unsafe { ffi::native_ps5_module_vector_test_v1(&mut cpu, 0x1001, 0, 16) };
+        assert_eq!(cpu.fault, 0);
+        assert_eq!(cpu.flags, !0x8d5u64 | 0x41);
+        assert_eq!(cpu.vectors, vectors);
+    }
     #[test]
     fn packed_addsub_wraps_each_lane_and_preserves_aliases() {
         for size in [16usize, 32] {

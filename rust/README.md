@@ -1,5 +1,10 @@
 # Rust migration
 
+VEX VPTEST now computes full-width XMM/YMM bit-test flags with guarded memory
+reads. The matching build passes 622 library tests, three integration tests,
+strict Clippy and 19,800 native checks. Discovery reaches 56,022 instructions;
+startup remains at missing `fscanf`, before game main. See [CPU evidence](../docs/status/CPU.md).
+
 VEX packed wrapping add/sub supports B/W/D/Q lanes and XMM/YMM destinations,
 including guarded memory operands. The build passes 618 library tests, three
 integration tests, strict Clippy and 284,864 native checks. Discovery reaches
