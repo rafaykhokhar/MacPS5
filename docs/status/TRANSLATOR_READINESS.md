@@ -740,3 +740,26 @@ Compile the stack verifier using the release rlib/dependency flags above. The
 ELF probe additionally needs `--extern iced_x86=<release deps/libiced_x86-*.rlib>`
 and takes the ELF pathname as its sole argument. Its STOP output must be read;
 a successful probe process exit does not mean guest execution succeeded.
+
+## Direct LEA address calculation
+
+Direct `LEA r32,m` and `LEA r64,m` now reuse effective-address calculation without
+calling a memory helper. The 32-bit destination truncates and zero-extends the
+result; register aliases are read before destination commit. FS/GS prefixes are
+ignored for LEA only, as no segment base participates in the calculation. Actual
+loads/stores retain their explicit unsupported FS/GS boundary. 16-bit destinations
+and 32-bit address-size forms remain unsupported.
+
+`direct_lea_native.rs` passes 92268 native cases with null memory context:
+destination/base/index combinations (excluding the SIB no-index encoding), four
+scales, wraparound values, 32/64-bit results, RIP-relative bias, segment prefixes,
+fuel and prior faults. This is selected form coverage, not the complete x86 ISA.
+687 library tests, three integration tests, strict Clippy, release build and the
+strict-warning LEA verifier pass (process 76006, exit 0). Guarded MOV, stack and
+automatic translation regressions also pass (process 7321, exit 0).
+
+The same crispy-doom raw entry probe now rejects `Cmp_r64_rm64` at 0x58, a memory
+operand form. The entry span still publishes zero JIT bytes and never executes;
+accepting preceding instructions during translation is not homebrew startup.
+Reproduce the LEA verifier with the release rlib/dependency flags above and no
+arguments; use the preceding ELF probe instructions for the real-file boundary.

@@ -25,7 +25,7 @@ fn register_arithmetic(i: &Instruction) -> bool {
         }
 }
 fn memory_address(c: &mut Arm64Code, i: &Instruction) -> Result<()> {
-    if matches!(i.memory_segment(), Register::FS | Register::GS) {
+    if i.mnemonic() != Mnemonic::Lea && matches!(i.memory_segment(), Register::FS | Register::GS) {
         return Err("Direct FS/GS addressing unsupported".into());
     }
     if i.is_ip_rel_memory_operand() {
@@ -87,6 +87,7 @@ pub(crate) fn translate_span(
         match i.code() {
             Code::Nopd | Code::Nopq | Code::Retnq => {}
             Code::Push_r64 | Code::Pop_r64 => {}
+            Code::Lea_r32_m | Code::Lea_r64_m => {}
             Code::Mov_r32_imm32 | Code::Mov_r64_imm64 => {}
             Code::Mov_r32_rm32 | Code::Mov_rm32_r32 | Code::Mov_r64_rm64 | Code::Mov_rm64_r64 => {}
             _ if i.is_jcc_short_or_near() || i.is_jmp_short_or_near() => {}
@@ -195,6 +196,15 @@ pub(crate) fn translate_span(
         )?;
         c.emit(0xd1000529)?; // sub x9,x9,#1
         c.context_access(9, 19, 160, true, true)?;
+        if matches!(i.code(), Code::Lea_r32_m | Code::Lea_r64_m) {
+            let wide = i.code() == Code::Lea_r64_m;
+            memory_address(&mut c, i)?;
+            if !wide {
+                c.emit(0x2a0103e1)?;
+            } // mov w1,w1, zero-extend result
+            c.context_access(1, 19, register(i.op0_register(), wide)? * 8, true, true)?;
+            continue;
+        }
         if matches!(i.code(), Code::Push_r64 | Code::Pop_r64) {
             let push = i.code() == Code::Push_r64;
             let reg = register(i.op0_register(), true)?;

@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct LEA32/64 with 64-bit addressing now computes addresses without accessing
+memory. 92268 native cases pass. The raw homebrew entry probe now stops on a
+memory-operand CMP, after accepting PUSH and LEA during translation; the entry
+still has not executed. See
+[LEA evidence](../docs/status/TRANSLATOR_READINESS.md#direct-lea-address-calculation).
+
 Direct register PUSH/POP64 now uses guarded stack memory and preserves registers
 on faults. 1344 native cases and an automatically translated frame returning 42
 pass. A probe of the existing homebrew ELF moved its first translation blocker
