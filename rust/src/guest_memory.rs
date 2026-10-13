@@ -758,6 +758,51 @@ pub fn vector_cmpgtd256(
     vectors[destination as usize] = result;
     Ok(())
 }
+/// Permute all eight dwords using the low three bits of each index dword.
+pub fn vector_permd(
+    memory: &Memory<'_>,
+    vectors: &mut [[u8; 32]; 16],
+    address: u64,
+    destination: u64,
+    indices: u64,
+) -> Result<()> {
+    vector_operand(address, destination, 32, 0)?;
+    if indices >= 16 {
+        return Err("Invalid dword permutation index register".into());
+    }
+    let source = memory.read(address, 32)?;
+    let mut result = [0; 32];
+    for (output, index) in result
+        .chunks_exact_mut(4)
+        .zip(vectors[indices as usize].chunks_exact(4))
+    {
+        let start = usize::from(index[0] & 7) * 4;
+        output.copy_from_slice(&source[start..start + 4]);
+    }
+    vectors[destination as usize] = result;
+    Ok(())
+}
+/// Permute all four qwords using four two-bit immediate selectors.
+pub fn vector_permq(
+    memory: &Memory<'_>,
+    vectors: &mut [[u8; 32]; 16],
+    address: u64,
+    destination: u64,
+    immediate: u64,
+) -> Result<()> {
+    vector_operand(address, destination, 32, 0)?;
+    if immediate > 255 {
+        return Err("Invalid qword permutation immediate".into());
+    }
+    let source = memory.read(address, 32)?;
+    let mut result = [0; 32];
+    for (lane, output) in result.chunks_exact_mut(8).enumerate() {
+        let start = ((immediate >> (lane * 2)) & 3) as usize * 8;
+        output.copy_from_slice(&source[start..start + 8]);
+    }
+    vectors[destination as usize] = result;
+    Ok(())
+}
 /// Parameters for packed low/high interleaving within independent 128-bit halves.
 #[derive(Clone, Copy)]
 pub struct VectorUnpack {
@@ -1156,6 +1201,64 @@ pub mod ffi {
                 destination,
                 first,
                 size,
+            )
+            .is_ok()
+        {
+            return;
+        }
+        cpu.fault = 1;
+    }
+    /// # Safety
+    /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn native_ps5_module_vector_permd_v1(
+        cpu: *mut Cpu,
+        address: u64,
+        destination: u64,
+        indices: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if cpu.memory != 0
+            && vector_permd(
+                unsafe { &*(cpu.memory as *const Memory<'_>) },
+                &mut cpu.vectors,
+                address,
+                destination,
+                indices,
+            )
+            .is_ok()
+        {
+            return;
+        }
+        cpu.fault = 1;
+    }
+    /// # Safety
+    /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn native_ps5_module_vector_permq_v1(
+        cpu: *mut Cpu,
+        address: u64,
+        destination: u64,
+        immediate: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if cpu.memory != 0
+            && vector_permq(
+                unsafe { &*(cpu.memory as *const Memory<'_>) },
+                &mut cpu.vectors,
+                address,
+                destination,
+                immediate,
             )
             .is_ok()
         {
@@ -2016,6 +2119,130 @@ mod tests {
         assert_eq!(memory.read(0x1001, 16).unwrap(), &original[15][16..]);
         assert_eq!(cpu.vectors, original);
         assert_eq!(cpu.flags, u64::MAX);
+    }
+    #[test]
+    fn vector_permutations_cross_halves_and_ignore_index_high_bits() {
+        let mut data: [u8; 32] = std::array::from_fn(|i| (i + 1) as u8);
+        let source = data;
+        let mut memory = Memory::default();
+        memory.add(0x1_0000_0001, &mut data, false, false).unwrap();
+        for immediate in 0..=255 {
+            let mut vectors = [[0xa5; 32]; 16];
+            let mut expected = vectors;
+            let mut selectors = immediate;
+            for output in expected[15].chunks_exact_mut(8) {
+                let start = selectors % 4 * 8;
+                selectors /= 4;
+                output.copy_from_slice(&source[start..start + 8]);
+            }
+            vector_permq(&memory, &mut vectors, 0x1_0000_0001, 15, immediate as u64).unwrap();
+            assert_eq!(vectors, expected);
+        }
+        for destination in [3usize, 15] {
+            for rotation in 0..8u32 {
+                for poison in [0, 0xffff_fff8, 0x8000_0000, 0x5555_5550] {
+                    let mut vectors = [[0xa5; 32]; 16];
+                    for (lane, index) in vectors[15].chunks_exact_mut(4).enumerate() {
+                        index.copy_from_slice(
+                            &(poison | ((lane as u32 + rotation) % 8)).to_le_bytes(),
+                        );
+                    }
+                    let mut expected = vectors;
+                    for lane in 0..8 {
+                        let selected = ((lane as u32 + rotation) % 8) as usize;
+                        expected[destination][lane * 4..lane * 4 + 4]
+                            .copy_from_slice(&source[selected * 4..selected * 4 + 4]);
+                    }
+                    vector_permd(&memory, &mut vectors, 0x1_0000_0001, destination as u64, 15)
+                        .unwrap();
+                    assert_eq!(vectors, expected);
+                }
+            }
+        }
+    }
+    #[test]
+    fn vector_permutations_full_span_and_parameters_guard_commit() {
+        let original = [[0xa5; 32]; 16];
+        for length in 0..32 {
+            let mut data = vec![0; length];
+            let mut memory = Memory::default();
+            if length != 0 {
+                memory.add(0x1001, &mut data, false, false).unwrap();
+            }
+            let mut vectors = original;
+            assert!(vector_permd(&memory, &mut vectors, 0x1001, 0, 0).is_err());
+            assert_eq!(vectors, original);
+            assert!(vector_permq(&memory, &mut vectors, 0x1001, 0, 0).is_err());
+            assert_eq!(vectors, original);
+        }
+        let mut data = [0; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        for (destination, indices) in [(16, 0), (u64::MAX, 0), (0, 16), (0, u64::MAX)] {
+            let mut vectors = original;
+            assert!(vector_permd(&memory, &mut vectors, 0x1001, destination, indices).is_err());
+            assert_eq!(vectors, original);
+        }
+        for (destination, immediate) in [(16, 0), (u64::MAX, 0), (0, 256), (0, u64::MAX)] {
+            let mut vectors = original;
+            assert!(vector_permq(&memory, &mut vectors, 0x1001, destination, immediate).is_err());
+            assert_eq!(vectors, original);
+        }
+    }
+    #[test]
+    #[allow(unsafe_code)]
+    fn vector_permutation_ffi_faults_and_flags() {
+        use crate::legacy_cpu::Cpu;
+        unsafe {
+            ffi::native_ps5_module_vector_permd_v1(std::ptr::null_mut(), 0, 0, 0);
+            ffi::native_ps5_module_vector_permq_v1(std::ptr::null_mut(), 0, 0, 0);
+        }
+        for qword in [false, true] {
+            let mut cpu = Cpu {
+                vectors: [[0; 32]; 16],
+                flags: u64::MAX,
+                ..Cpu::default()
+            };
+            for fault in [0, 2, 13] {
+                cpu.fault = fault;
+                unsafe {
+                    if qword {
+                        ffi::native_ps5_module_vector_permq_v1(&mut cpu, 0x1001, 0, 0);
+                    } else {
+                        ffi::native_ps5_module_vector_permd_v1(&mut cpu, 0x1001, 0, 0);
+                    }
+                }
+                assert_eq!(cpu.fault, if fault == 0 { 1 } else { fault });
+                assert_eq!(cpu.vectors, [[0; 32]; 16]);
+                assert_eq!(cpu.flags, u64::MAX);
+            }
+            let mut data = [0xcc; 32];
+            let mut memory = Memory::default();
+            memory.add(0x1001, &mut data, false, false).unwrap();
+            cpu.memory = (&mut memory as *mut Memory<'_>) as u64;
+            cpu.fault = 0;
+            unsafe {
+                if qword {
+                    ffi::native_ps5_module_vector_permq_v1(&mut cpu, 0x1001, 0, 0);
+                } else {
+                    ffi::native_ps5_module_vector_permd_v1(&mut cpu, 0x1001, 0, 0);
+                }
+            }
+            assert_eq!(cpu.fault, 0);
+            assert_eq!(cpu.vectors[0], [0xcc; 32]);
+            assert_eq!(cpu.flags, u64::MAX);
+            let before = cpu.vectors;
+            unsafe {
+                if qword {
+                    ffi::native_ps5_module_vector_permq_v1(&mut cpu, 0x1001, 0, 256);
+                } else {
+                    ffi::native_ps5_module_vector_permd_v1(&mut cpu, 0x1001, 0, 16);
+                }
+            }
+            assert_eq!(cpu.fault, 1);
+            assert_eq!(cpu.vectors, before);
+            assert_eq!(cpu.flags, u64::MAX);
+        }
     }
     #[test]
     fn packed_unpack_interleaves_selected_halves_and_aliases() {

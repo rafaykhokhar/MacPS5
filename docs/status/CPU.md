@@ -1,5 +1,40 @@
 # CPU completion criteria
 
+## Full-width integer permutations
+
+VEX VPERMD and VPERMQ now select values across the complete 256-bit source.
+VPERMD masks each dword index to three bits before reading the corresponding
+source dword. VPERMQ uses the four immediate two-bit fields to select qwords.
+Register lowering builds both result halves before any destination store, so
+destination/index/source aliases are safe. Memory helpers guard all 32 bytes
+before committing. Flags/FP state remain unchanged. Only the exact VEX256
+forms are accepted; invalid W/L, reserved VPERMQ vvvv, legacy/EVEX and unsupported
+FS/GS/address32 forms remain rejected.
+
+Reference: AMD APM Volume 4 rev.3.24 pp.730–731 and 751–752
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)).
+Architectural alignment-control behavior and full exception delivery remain
+outside the current guard model.
+
+The matching build passes 651 library tests, three integration tests, strict
+Clippy and release compilation (`work/packed-permute-native/{tests,clippy,release}.log`,
+process 45033 exit 0). The [native verifier](../../rust/verification/packed_permute_native.rs)
+passes 66,192 independent full-width source-selection checks across 3,084 decoded
+fixtures: all qword immediates, all dword selectors in each output, each ignored
+index bit, mixed/reverse/rotate/broadcast/random indices, unused source poison,
+aliases/high registers, full readonly high/unaligned/RIP operands, every short
+span, flags/FP/fuel/prior faults (`work/packed-permute-native/native.log`, process
+41823 exit 0).
+
+Discovery reaches 56,984 instructions and 12,959 blocks with 162 unsupported
+sites: six former stops removed and five later stops exposed. These counts do
+not establish CPU coverage. The entry runner compiles with warnings denied;
+startup-only verification retains the missing `fscanf` boundary, ten accepted
+dependencies, 20,288 owned dependency bytes and pending cleanup. Game main has
+not executed (`work/packed-permute-native/entry.log`, process 43921 exit 0).
+No full GPU suite was run for this CPU change. Production readiness and retail
+gameplay remain unverified.
+
 ## Scalar fused multiply-add 231 ordering
 
 VEX VFMADD231SD now lowers through the existing exact fused binary64 helper,

@@ -85,6 +85,7 @@ mod packed_extend_native;
 mod packed_logical_native;
 mod packed_shuffle_native;
 mod packed_unpack_native;
+mod packed_permute_native;
 mod vector_extract128_native;
 mod strftime_native;
 mod strtof_native;
@@ -204,6 +205,7 @@ fn main() -> Result<(), String> {
         packed_logical_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-logical"))?;
         packed_shuffle_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-shuffle"))?;
         packed_unpack_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-unpack"))?;
+        packed_permute_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-permute"))?;
         vector_extract128_native::verify(Path::new(&archive), &Path::new(&directory).join("vector-extract128"))?;
         strftime_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strftime"))?;
         strtof_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtof"))?;

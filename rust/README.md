@@ -1,5 +1,12 @@
 # Rust migration
 
+VEX VPERMD/VPERMQ now support permutation across a full 256-bit source, including
+guarded memory operands. The matching build passes 651 library tests, three
+integration tests, strict Clippy and 66,192 native checks. Discovery reaches
+56,984 instructions; startup remains at missing `fscanf`, before game main.
+See [CPU evidence](../docs/status/CPU.md). Production readiness and retail
+gameplay remain unverified.
+
 VEX VFMADD231SD now uses the existing exact fused arithmetic helper with audited
 operand/NaN ordering. The matching build passes 647 library tests, three
 integration tests, strict Clippy, 14,202 native checks and the existing FMA213
