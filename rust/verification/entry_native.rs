@@ -80,6 +80,7 @@ mod packed_shift_native;
 mod packed_equal_native;
 mod packed_addsub_native;
 mod packed_test_native;
+mod packed_extend_native;
 mod strftime_native;
 mod strtof_native;
 mod strtold_native;
@@ -193,6 +194,7 @@ fn main() -> Result<(), String> {
         packed_equal_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-equal"))?;
         packed_addsub_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-addsub"))?;
         packed_test_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-test"))?;
+        packed_extend_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-extend"))?;
         strftime_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strftime"))?;
         strtof_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtof"))?;
         strtold_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtold"))?;

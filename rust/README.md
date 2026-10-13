@@ -1,5 +1,11 @@
 # Rust migration
 
+VEX packed sign/zero extension now covers all six widening pairs and XMM/YMM
+destinations. The matching build passes 626 library tests, three integration
+tests, strict Clippy and 50,340 native checks. Discovery reaches 56,149
+instructions; startup still stops at missing `fscanf`, before game main.
+See [CPU evidence](../docs/status/CPU.md).
+
 VEX VPTEST now computes full-width XMM/YMM bit-test flags with guarded memory
 reads. The matching build passes 622 library tests, three integration tests,
 strict Clippy and 19,800 native checks. Discovery reaches 56,022 instructions;

@@ -841,6 +841,50 @@ pub fn vector_test(
         | if intersection == 0 { 0x40 } else { 0 }
         | u64::from(complement_intersection == 0))
 }
+/// Parameters for packed integer widening from a shorter memory operand.
+#[derive(Clone, Copy)]
+pub struct VectorExtend {
+    pub destination: u64,
+    pub size: u64,
+    pub input_lane: u64,
+    pub output_lane: u64,
+    pub signed: u64,
+}
+pub fn vector_extend(
+    memory: &Memory<'_>,
+    vectors: &mut [[u8; 32]; 16],
+    address: u64,
+    operation: VectorExtend,
+) -> Result<()> {
+    let VectorExtend {
+        destination,
+        size,
+        input_lane,
+        output_lane,
+        signed,
+    } = operation;
+    vector_operand(address, destination, size, 0)?;
+    if ![(1, 2), (1, 4), (1, 8), (2, 4), (2, 8), (4, 8)].contains(&(input_lane, output_lane))
+        || signed > 1
+    {
+        return Err("Invalid packed integer extension operand".into());
+    }
+    let input_lane = input_lane as usize;
+    let output_lane = output_lane as usize;
+    let lanes = size as usize / output_lane;
+    let source = memory.read(address, lanes * input_lane)?;
+    let mut result = [0; 32];
+    for lane in 0..lanes {
+        let input = &source[lane * input_lane..(lane + 1) * input_lane];
+        let output = &mut result[lane * output_lane..(lane + 1) * output_lane];
+        if signed == 1 && input[input_lane - 1] & 0x80 != 0 {
+            output.fill(0xff);
+        }
+        output[..input_lane].copy_from_slice(input);
+    }
+    vectors[destination as usize] = result;
+    Ok(())
+}
 pub fn vector_xor(
     memory: &Memory<'_>,
     vectors: &mut [[u8; 32]; 16],
@@ -950,6 +994,43 @@ pub mod ffi {
                 destination,
                 first,
                 size,
+            )
+            .is_ok()
+        {
+            return;
+        }
+        cpu.fault = 1;
+    }
+    /// # Safety
+    /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn native_ps5_module_vector_extend_v1(
+        cpu: *mut Cpu,
+        address: u64,
+        destination: u64,
+        size: u64,
+        input_lane: u64,
+        output_lane: u64,
+        signed: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if cpu.memory != 0
+            && vector_extend(
+                unsafe { &*(cpu.memory as *const Memory<'_>) },
+                &mut cpu.vectors,
+                address,
+                VectorExtend {
+                    destination,
+                    size,
+                    input_lane,
+                    output_lane,
+                    signed,
+                },
             )
             .is_ok()
         {
@@ -1136,6 +1217,165 @@ pub mod ffi {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn packed_extension_all_pairs_and_sign_edges() {
+        for size in [16usize, 32] {
+            for (input_lane, output_lane) in
+                [(1usize, 2usize), (1, 4), (1, 8), (2, 4), (2, 8), (4, 8)]
+            {
+                let modulus = 1u64 << (input_lane * 8);
+                for signed in [0, 1] {
+                    for phase in 0..4 {
+                        let mut data = vec![0; size / output_lane * input_lane];
+                        let mut expected = [0; 32];
+                        for lane in 0..size / output_lane {
+                            let value =
+                                [0, modulus / 2 - 1, modulus / 2, modulus - 1][(lane + phase) % 4];
+                            data[lane * input_lane..(lane + 1) * input_lane]
+                                .copy_from_slice(&value.to_le_bytes()[..input_lane]);
+                            let extended = if signed == 1 && value >= modulus / 2 {
+                                (value as i64 - modulus as i64) as u64
+                            } else {
+                                value
+                            };
+                            expected[lane * output_lane..(lane + 1) * output_lane]
+                                .copy_from_slice(&extended.to_le_bytes()[..output_lane]);
+                        }
+                        let original_data = data.clone();
+                        let mut memory = Memory::default();
+                        memory.add(0x1_0000_0001, &mut data, false, false).unwrap();
+                        let mut vectors = [[0xa5; 32]; 16];
+                        let mut all_expected = vectors;
+                        all_expected[15] = expected;
+                        vector_extend(
+                            &memory,
+                            &mut vectors,
+                            0x1_0000_0001,
+                            VectorExtend {
+                                destination: 15,
+                                size: size as u64,
+                                input_lane: input_lane as u64,
+                                output_lane: output_lane as u64,
+                                signed,
+                            },
+                        )
+                        .unwrap();
+                        assert_eq!(vectors, all_expected);
+                        drop(memory);
+                        assert_eq!(data, original_data);
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn packed_extension_exact_span_and_parameter_guards() {
+        let original = [[0xa5; 32]; 16];
+        for size in [16u64, 32] {
+            for (input_lane, output_lane) in [(1, 2), (1, 4), (1, 8), (2, 4), (2, 8), (4, 8)] {
+                for signed in [0, 1] {
+                    for length in 0..(size / output_lane * input_lane) as usize {
+                        let mut data = vec![0xff; length];
+                        let mut memory = Memory::default();
+                        if length != 0 {
+                            memory.add(0x1001, &mut data, false, false).unwrap();
+                        }
+                        let mut vectors = original;
+                        assert!(
+                            vector_extend(
+                                &memory,
+                                &mut vectors,
+                                0x1001,
+                                VectorExtend {
+                                    destination: 0,
+                                    size,
+                                    input_lane,
+                                    output_lane,
+                                    signed,
+                                }
+                            )
+                            .is_err()
+                        );
+                        assert_eq!(vectors, original);
+                    }
+                }
+            }
+        }
+        let mut data = [0; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        for (destination, size, input_lane, output_lane, signed) in [
+            (16, 16, 1, 2, 0),
+            (u64::MAX, 16, 1, 2, 0),
+            (0, 0, 1, 2, 0),
+            (0, 8, 1, 2, 0),
+            (0, 64, 1, 2, 0),
+            (0, u64::MAX, 1, 2, 0),
+            (0, 16, 0, 2, 0),
+            (0, 16, 1, 0, 0),
+            (0, 16, 1, 1, 0),
+            (0, 16, 8, 4, 0),
+            (0, 16, 3, 8, 0),
+            (0, 16, 1, 16, 0),
+            (0, 16, u64::MAX, 2, 0),
+            (0, 16, 1, u64::MAX, 0),
+            (0, 16, 1, 2, 2),
+            (0, 16, 1, 2, u64::MAX),
+        ] {
+            let mut vectors = original;
+            assert!(
+                vector_extend(
+                    &memory,
+                    &mut vectors,
+                    0x1001,
+                    VectorExtend {
+                        destination,
+                        size,
+                        input_lane,
+                        output_lane,
+                        signed,
+                    }
+                )
+                .is_err()
+            );
+            assert_eq!(vectors, original);
+        }
+    }
+    #[test]
+    #[allow(unsafe_code)]
+    fn packed_extension_ffi_faults_and_success() {
+        use crate::legacy_cpu::Cpu;
+        let mut cpu = Cpu {
+            vectors: [[0xa5; 32]; 16],
+            ..Cpu::default()
+        };
+        for fault in [0, 2, 13] {
+            cpu.fault = fault;
+            unsafe { ffi::native_ps5_module_vector_extend_v1(&mut cpu, 0x1001, 0, 16, 1, 8, 1) };
+            assert_eq!(cpu.fault, if fault == 0 { 1 } else { fault });
+            assert_eq!(cpu.vectors, [[0xa5; 32]; 16]);
+        }
+        let mut data = [0xff, 0x80];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        cpu.memory = (&mut memory as *mut Memory<'_>) as u64;
+        cpu.fault = 0;
+        unsafe { ffi::native_ps5_module_vector_extend_v1(&mut cpu, 0x1001, 0, 16, 1, 8, 1) };
+        assert_eq!(cpu.fault, 0);
+        assert_eq!(&cpu.vectors[0][..8], &(-1i64).to_le_bytes());
+        assert_eq!(&cpu.vectors[0][8..16], &(-128i64).to_le_bytes());
+        assert_eq!(&cpu.vectors[0][16..], &[0; 16]);
+        let before = cpu.vectors;
+        for signed in [0, 2] {
+            cpu.fault = 0;
+            // signed0 is valid but the four-byte source span is incomplete.
+            unsafe {
+                ffi::native_ps5_module_vector_extend_v1(&mut cpu, 0x1001, 0, 32, 1, 8, signed)
+            };
+            assert_eq!(cpu.fault, 1);
+            assert_eq!(cpu.vectors, before);
+        }
+    }
     #[test]
     fn packed_test_flags_all_outcomes_and_operand_direction() {
         for size in [16u64, 32] {

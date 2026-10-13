@@ -37,6 +37,41 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn packed_widening_forms_and_guards() {
+        for base in [0x20, 0x30] {
+            for opcode in base..base + 6 {
+                for length in [0, 4] {
+                    for operand in [0xc0, 0xc1, 0x07] {
+                        let bytes = [0xc4, 0xe2, 0x79 | length, opcode, operand];
+                        assert!(super::translate_rust_memory_region(&bytes, 0, "extend").is_ok());
+                        let invalid = [0xc4, 0xe2, 0x71 | length, opcode, operand];
+                        assert!(
+                            super::translate_rust_memory_region(&invalid, 0, "reserved").is_err()
+                        );
+                    }
+                    for prefix in [0x64, 0x65, 0x67] {
+                        let bytes = [prefix, 0xc4, 0xe2, 0x79 | length, opcode, 0x07];
+                        assert!(super::translate_rust_memory_region(&bytes, 0, "address").is_err());
+                    }
+                    let bytes = [
+                        0x67,
+                        0xc4,
+                        0xe2,
+                        0x79 | length,
+                        opcode,
+                        0x04,
+                        0x25,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ];
+                    assert!(super::translate_rust_memory_region(&bytes, 0, "address").is_err());
+                }
+            }
+        }
+    }
+    #[test]
     fn packed_test_forms_and_guards() {
         for length in [0, 4] {
             for operand in [0xc0, 0xc1, 0x07] {
@@ -1026,6 +1061,86 @@ impl Emitter {
                     }
                     self.emit(format!(
                         "str q0, [x19, #{}]\nstr q2, [x19, #{}]",
+                        208 + dst * 32,
+                        224 + dst * 32
+                    ));
+                }
+            }
+            M::Vpmovsxbw
+            | M::Vpmovsxbd
+            | M::Vpmovsxbq
+            | M::Vpmovsxwd
+            | M::Vpmovsxwq
+            | M::Vpmovsxdq
+            | M::Vpmovzxbw
+            | M::Vpmovzxbd
+            | M::Vpmovzxbq
+            | M::Vpmovzxwd
+            | M::Vpmovzxwq
+            | M::Vpmovzxdq => {
+                use iced_x86::Code;
+                let (input_lane, output_lane, wide, signed) = match i.code() {
+                    Code::VEX_Vpmovsxbw_xmm_xmmm64 => (1, 2, false, true),
+                    Code::VEX_Vpmovsxbw_ymm_xmmm128 => (1, 2, true, true),
+                    Code::VEX_Vpmovsxbd_xmm_xmmm32 => (1, 4, false, true),
+                    Code::VEX_Vpmovsxbd_ymm_xmmm64 => (1, 4, true, true),
+                    Code::VEX_Vpmovsxbq_xmm_xmmm16 => (1, 8, false, true),
+                    Code::VEX_Vpmovsxbq_ymm_xmmm32 => (1, 8, true, true),
+                    Code::VEX_Vpmovsxwd_xmm_xmmm64 => (2, 4, false, true),
+                    Code::VEX_Vpmovsxwd_ymm_xmmm128 => (2, 4, true, true),
+                    Code::VEX_Vpmovsxwq_xmm_xmmm32 => (2, 8, false, true),
+                    Code::VEX_Vpmovsxwq_ymm_xmmm64 => (2, 8, true, true),
+                    Code::VEX_Vpmovsxdq_xmm_xmmm64 => (4, 8, false, true),
+                    Code::VEX_Vpmovsxdq_ymm_xmmm128 => (4, 8, true, true),
+                    Code::VEX_Vpmovzxbw_xmm_xmmm64 => (1, 2, false, false),
+                    Code::VEX_Vpmovzxbw_ymm_xmmm128 => (1, 2, true, false),
+                    Code::VEX_Vpmovzxbd_xmm_xmmm32 => (1, 4, false, false),
+                    Code::VEX_Vpmovzxbd_ymm_xmmm64 => (1, 4, true, false),
+                    Code::VEX_Vpmovzxbq_xmm_xmmm16 => (1, 8, false, false),
+                    Code::VEX_Vpmovzxbq_ymm_xmmm32 => (1, 8, true, false),
+                    Code::VEX_Vpmovzxwd_xmm_xmmm64 => (2, 4, false, false),
+                    Code::VEX_Vpmovzxwd_ymm_xmmm128 => (2, 4, true, false),
+                    Code::VEX_Vpmovzxwq_xmm_xmmm32 => (2, 8, false, false),
+                    Code::VEX_Vpmovzxwq_ymm_xmmm64 => (2, 8, true, false),
+                    Code::VEX_Vpmovzxdq_xmm_xmmm64 => (4, 8, false, false),
+                    Code::VEX_Vpmovzxdq_ymm_xmmm128 => (4, 8, true, false),
+                    _ => return Err("Only VEX packed integer widening is implemented".into()),
+                };
+                let dst = vector(i.op0_register())?;
+                if i.op1_kind() == OpKind::Memory {
+                    if i.memory_base() == R::None
+                        && i.memory_index() == R::None
+                        && i.memory_displ_size() != 8
+                    {
+                        return Err("32-bit absolute addressing is not implemented".into());
+                    }
+                    self.address(i)?;
+                    self.emit(format!("mov x0, x19\nmov x2, #{dst}\nmov x3, #{}\nmov x4, #{input_lane}\nmov x5, #{output_lane}\nmov x6, #{}\nbl _native_ps5_module_vector_extend_v1", if wide { 32 } else { 16 }, u8::from(signed)));
+                    self.fault();
+                } else {
+                    let source = vector(i.op1_register())?;
+                    self.emit(format!("ldr q0, [x19, #{}]", 208 + source * 32));
+                    let operation = if signed { "sshll" } else { "ushll" };
+                    let mut lane = input_lane;
+                    while lane < output_lane {
+                        let (result, low, full) = match lane {
+                            1 => ("8h", "8b", "16b"),
+                            2 => ("4s", "4h", "8h"),
+                            _ => ("2d", "2s", "4s"),
+                        };
+                        // Only the final widening step splits into two halves;
+                        // earlier steps consume the low lanes of the input XMM.
+                        if wide && lane * 2 == output_lane {
+                            self.emit(format!("{operation}2 v1.{result}, v0.{full}, #0"));
+                        }
+                        self.emit(format!("{operation} v0.{result}, v0.{low}, #0"));
+                        lane *= 2;
+                    }
+                    if !wide {
+                        self.emit("movi v1.16b, #0");
+                    }
+                    self.emit(format!(
+                        "str q0, [x19, #{}]\nstr q1, [x19, #{}]",
                         208 + dst * 32,
                         224 + dst * 32
                     ));

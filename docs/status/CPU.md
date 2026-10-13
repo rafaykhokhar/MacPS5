@@ -1,5 +1,36 @@
 # CPU completion criteria
 
+## Packed sign and zero extension
+
+VEX VPMOVSX/ZX now support BW/BD/BQ/WD/WQ/DQ widening for XMM and YMM
+destinations (24 forms). Register sources are always XMM and lower through
+staged ARM64 SSHLL/USHLL, splitting the final stage for 256-bit outputs.
+Memory reads use exactly `destination_bytes / output_lane * input_lane`,
+between 2 and 16 bytes. Failed reads preserve the whole destination. XMM
+outputs clear the upper YMM half; flags/FP state are unchanged. Reserved vvvv,
+legacy/EVEX and FS/GS/address32 remain rejected; WIG is supported.
+
+Reference: AMD APM Volume 4 rev.3.24 pp.394–417
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)).
+The matching build passes 626 library tests, three integration tests, strict
+Clippy and release compilation (`work/packed-extend-native/{tests,clippy,release}.log`,
+process 10442 exit 0). The [native verifier](../../rust/verification/packed_extend_native.rs)
+passes 50,340 byte/sign-fill reference checks over 192 decoded fixtures:
+all byte values, word/dword edge/random inputs, distinct lanes, ignored source
+bytes poisoned with zero/ones, high/self aliases, WIG, exact-end readonly
+high/unaligned/RIP input spans, every short span, flags/FP and execution guards.
+Helper unit tests also cover invalid widths/modes, numeric signed boundaries
+and atomic FFI failures (`work/packed-extend-native/native.log`, process
+10954 exit 0).
+
+Pinned discovery advances to 56,149 instructions in 12,782 blocks: twelve old
+boundaries disappear and seven new ones become reachable, leaving 187
+unsupported stops. The combined verifier compiles and startup-only execution
+retains the expected missing `fscanf` exit: ten named dependencies accepted,
+20,288 dependency bytes owned, cleanup pending and game main not executed
+(`work/packed-extend-native/entry.log`, process 10954 exit 0).
+No CPU completion percentage or retail-game compatibility is established.
+
 ## Packed vector bit tests
 
 VEX VPTEST supports XMM and YMM register or memory sources. ZF reports whether
