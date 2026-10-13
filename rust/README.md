@@ -1,5 +1,11 @@
 # Rust migration
 
+VEX packed immediate shifts now cover logical left/right W/D/Q and arithmetic
+right W/D for XMM/YMM destinations. The build passes 610 library tests, three
+integration tests, strict Clippy, 79,296 new native checks and 82,005 existing
+compare/shift regressions. See [CPU evidence](../docs/status/CPU.md) for counts,
+alias behavior and remaining unsupported forms.
+
 VEX packed scalar extraction supports B/W/D/Q, both word encodings, zero-extended
 GPR results and exact-width guarded stores. The build passes 609 library tests,
 three integration tests, strict Clippy and 33,072 native checks. Discovery reaches

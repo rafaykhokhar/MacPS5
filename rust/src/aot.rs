@@ -37,6 +37,22 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn packed_immediate_shift_forms() {
+        for opcode in [0x71, 0x72, 0x73] {
+            for operation in [2, 4, 6] {
+                if opcode == 0x73 && operation == 4 {
+                    continue;
+                }
+                for length in [0, 4] {
+                    for count in [0, 1, 15, 16, 31, 32, 63, 64, 255] {
+                        let bytes = [0xc5, 0xf9 | length, opcode, 0xc1 | (operation << 3), count];
+                        assert!(super::translate_rust_memory_region(&bytes, 0, "shift").is_ok());
+                    }
+                }
+            }
+        }
+    }
+    #[test]
     fn packed_extract_forms_and_guards() {
         for (map, opcode) in [(0xe3, 0x14), (0xe3, 0x15), (0xe3, 0x16), (0xe1, 0xc5)] {
             for w in [0, 0x80] {
@@ -284,7 +300,6 @@ mod rust_memory_tests {
         }
         for bytes in [
             &[0xc5, 0xf9, 0x66, 0xc1][..],
-            &[0xc5, 0xf9, 0x72, 0xd0, 0x1f],
             &[0xc5, 0xfd, 0xd2, 0xc1],
             &[0x66, 0x0f, 0x66, 0xc1],
             &[0x67, 0xc5, 0xfd, 0x66, 0x07],
@@ -873,26 +888,61 @@ impl Emitter {
                     self.emit(format!("ldr q0, [x19, #{}]\nldr q1, [x19, #{}]\nldr q2, [x19, #{}]\nldr q3, [x19, #{}]\ncmgt v0.4s, v0.4s, v1.4s\ncmgt v2.4s, v2.4s, v3.4s\nstr q0, [x19, #{}]\nstr q2, [x19, #{}]",208+first*32,208+second*32,224+first*32,224+second*32,208+dst*32,224+dst*32));
                 }
             }
-            M::Vpsrld => {
-                if i.code() != iced_x86::Code::VEX_Vpsrld_ymm_ymm_imm8 {
-                    return Err("Only VEX256 VPSRLD immediate is implemented".into());
-                }
+            M::Vpsllw
+            | M::Vpslld
+            | M::Vpsllq
+            | M::Vpsrlw
+            | M::Vpsrld
+            | M::Vpsrlq
+            | M::Vpsraw
+            | M::Vpsrad => {
+                use iced_x86::Code;
+                let (lane_bits, wide, operation) = match i.code() {
+                    Code::VEX_Vpsllw_xmm_xmm_imm8 => (16, false, "shl"),
+                    Code::VEX_Vpsllw_ymm_ymm_imm8 => (16, true, "shl"),
+                    Code::VEX_Vpslld_xmm_xmm_imm8 => (32, false, "shl"),
+                    Code::VEX_Vpslld_ymm_ymm_imm8 => (32, true, "shl"),
+                    Code::VEX_Vpsllq_xmm_xmm_imm8 => (64, false, "shl"),
+                    Code::VEX_Vpsllq_ymm_ymm_imm8 => (64, true, "shl"),
+                    Code::VEX_Vpsrlw_xmm_xmm_imm8 => (16, false, "ushr"),
+                    Code::VEX_Vpsrlw_ymm_ymm_imm8 => (16, true, "ushr"),
+                    Code::VEX_Vpsrld_xmm_xmm_imm8 => (32, false, "ushr"),
+                    Code::VEX_Vpsrld_ymm_ymm_imm8 => (32, true, "ushr"),
+                    Code::VEX_Vpsrlq_xmm_xmm_imm8 => (64, false, "ushr"),
+                    Code::VEX_Vpsrlq_ymm_ymm_imm8 => (64, true, "ushr"),
+                    Code::VEX_Vpsraw_xmm_xmm_imm8 => (16, false, "sshr"),
+                    Code::VEX_Vpsraw_ymm_ymm_imm8 => (16, true, "sshr"),
+                    Code::VEX_Vpsrad_xmm_xmm_imm8 => (32, false, "sshr"),
+                    Code::VEX_Vpsrad_ymm_ymm_imm8 => (32, true, "sshr"),
+                    _ => return Err("Only VEX packed immediate shifts are implemented".into()),
+                };
                 let dst = vector(i.op_register(0))?;
                 let src = vector(i.op_register(1))?;
                 let count = i.immediate8();
-                if count > 31 {
+                // Packed counts do not use scalar x86 count masking. Logical
+                // overshifts zero every lane; arithmetic overshifts sign-fill.
+                if count >= lane_bits && operation != "sshr" {
                     self.emit("movi v0.16b, #0\nmovi v1.16b, #0");
                 } else {
-                    self.emit(format!(
-                        "ldr q0, [x19, #{}]\nldr q1, [x19, #{}]",
-                        208 + src * 32,
-                        224 + src * 32
-                    ));
-                    if count != 0 {
-                        self.emit(format!(
-                            "ushr v0.4s, v0.4s, #{count}\nushr v1.4s, v1.4s, #{count}"
-                        ));
+                    self.emit(format!("ldr q0, [x19, #{}]", 208 + src * 32));
+                    if wide {
+                        self.emit(format!("ldr q1, [x19, #{}]", 224 + src * 32));
                     }
+                    if count != 0 {
+                        let count = count.min(lane_bits - 1);
+                        let lanes = match lane_bits {
+                            16 => "8h",
+                            32 => "4s",
+                            _ => "2d",
+                        };
+                        self.emit(format!("{operation} v0.{lanes}, v0.{lanes}, #{count}"));
+                        if wide {
+                            self.emit(format!("{operation} v1.{lanes}, v1.{lanes}, #{count}"));
+                        }
+                    }
+                }
+                if !wide {
+                    self.emit("movi v1.16b, #0");
                 }
                 self.emit(format!(
                     "str q0, [x19, #{}]\nstr q1, [x19, #{}]",

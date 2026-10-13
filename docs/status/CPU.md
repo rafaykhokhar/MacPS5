@@ -1,5 +1,44 @@
 # CPU completion criteria
 
+## Packed immediate shifts
+
+VEX immediate VPSLLW/D/Q, VPSRLW/D/Q and VPSRAW/D now support both XMM and
+YMM destinations (16 decoded instruction forms). Full imm8 counts are used
+without modulo masking. Oversized logical shifts zero each lane; arithmetic
+right shifts sign-fill. Zero counts copy the source, with XMM destinations
+still clearing the upper YMM half. Both source halves are captured before
+YMM destination writes. Variable-count forms, legacy and EVEX remain outside
+this increment.
+
+Reference: AMD APM Volume 4 rev.3.24 pp.453–479
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)).
+Its PSRAW threshold wording is inconsistent; Intel's
+[instruction reference update](https://cdrdv2-public.intel.com/851055/252046-079-sdm-change-document.pdf)
+confirms that word counts greater than 15 sign-fill the lane.
+
+The matching build passes 610 library tests, three integration tests, strict
+Clippy and release compilation (`work/packed-shift-native/{tests,clippy,release}.log`,
+process 20527 exit 0). The existing compare/shift suite passes 82,005 native
+checks, including the actual pinned broadcast/compare/shift/store byte sequence
+(`work/packed-shift-native/regression.log`, process 82223 exit 0).
+
+The [expanded native verifier](../../rust/verification/packed_shift_native.rs)
+passes 79,296 comparisons over 4,956 decoded fixtures. Widened per-lane
+multiply/divide references cover all immediate counts, sign/edge/random lane
+patterns, WIG=1, high/self aliases, zero-count upper clearing, overshifts and
+preserved CPU state (`work/packed-shift-native/native.log`).
+Pinned discovery passes eight former shift boundaries and exposes eight new
+ones, reaching 55,560 instructions in 12,667 blocks with 207 unsupported
+boundaries. This is instruction discovery evidence, not gameplay or a full
+CPU compatibility ratio.
+
+The combined entry verifier compiles and its startup-only run passes the
+unchanged `fscanf` exit boundary: ten named dependencies accepted, 20,288
+dependency bytes owned, cleanup pending and game main not executed
+(`work/packed-shift-native/entry.log`, process 52698 exit 0, including the
+new native suite above). Full GPU/integrated verification was not run for this
+CPU-only increment.
+
 ## Packed scalar extraction
 
 VEX VPEXTRB/W/D/Q now read the immediate-selected source lane into a GPR or
