@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct MOVBE now supports 16/32/64-bit guarded loads and stores with ARM64 byte
+reversal. 442368 native cases pass. Configured startup passes MOVBE and reaches
+ANDN32 at 0xcd2. See
+[MOVBE evidence](../docs/status/TRANSLATOR_READINESS.md#direct-movbe-byte-swapping-moves).
+
 Direct SHLX/SHRX/SARX now supports 32/64-bit registers and guarded memory sources
 with flag preservation and masked counts. 1975296 native cases and 1277952 BEXTR
 regression cases pass. Startup advances to MOVBE32 at 0xc90. See

@@ -5,6 +5,17 @@ use crate::{
     decode,
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
+fn movbe(i: &Instruction) -> bool {
+    matches!(
+        i.code(),
+        Code::Movbe_r16_m16
+            | Code::Movbe_r32_m32
+            | Code::Movbe_r64_m64
+            | Code::Movbe_m16_r16
+            | Code::Movbe_m32_r32
+            | Code::Movbe_m64_r64
+    )
+}
 fn bmi_shift(i: &Instruction) -> Option<u32> {
     match i.code() {
         Code::VEX_Shlx_r32_rm32_r32 | Code::VEX_Shlx_r64_rm64_r64 => Some(0x1ac12000),
@@ -336,6 +347,7 @@ pub(crate) fn translate_span(
                 if !i.has_lock_prefix() => {}
             Code::VEX_Bextr_r32_rm32_r32 | Code::VEX_Bextr_r64_rm64_r64 => {}
             _ if bmi_shift(&i).is_some() => {}
+            _ if movbe(&i) => {}
             _ => return Err(format!("Direct lowering unsupported: {:?}", i.code())),
         }
         offset += i.len();
@@ -513,6 +525,55 @@ pub(crate) fn translate_span(
                     c.load_u64(9, 0)?;
                     c.context_access(9, 19, 224 + dst * 32, true, true)?;
                     c.context_access(9, 19, 232 + dst * 32, true, true)?;
+                }
+            }
+            continue;
+        }
+        if movbe(i) {
+            let store = i.op0_kind() == OpKind::Memory;
+            let operand = i.op_register(if store { 1 } else { 0 });
+            let size = operand.size();
+            let reg = register(operand.full_register(), true)?;
+            let reverse = match size {
+                2 => 0x5ac00400,
+                4 => 0x5ac00800,
+                8 => 0xdac00c00,
+                _ => unreachable!(),
+            };
+            memory_address(&mut c, i)?;
+            c.emit(0xaa1303e0)?;
+            if store {
+                if size == 2 {
+                    c.emit(0x79400262 | ((reg as u32 * 4) << 10))?;
+                } else {
+                    c.context_access(2, 19, reg * 8, size == 8, false)?;
+                }
+                c.emit(reverse | 0x42)?; // rev16/rev w2/x2,w2/x2
+                c.load_u64(3, size as u64)?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_store_v1 as *const () as u64,
+                )?;
+            } else {
+                c.load_u64(2, size as u64)?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_load_v1 as *const () as u64,
+                )?;
+            }
+            c.context_access(9, 19, 152, true, false)?;
+            c.branch(
+                EXIT,
+                Branch::CompareZero {
+                    register: 9,
+                    wide: true,
+                    nonzero: true,
+                },
+            )?;
+            if !store {
+                c.emit(reverse)?; // rev16/rev w0/x0,w0/x0
+                if size == 2 {
+                    c.emit(0x79000260 | ((reg as u32 * 4) << 10))?;
+                } else {
+                    c.context_access(0, 19, reg * 8, true, true)?;
                 }
             }
             continue;

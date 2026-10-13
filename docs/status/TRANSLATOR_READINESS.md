@@ -1387,3 +1387,30 @@ Both standalone verifiers compile with warnings denied. Configured
 `/tmp/macps5-bmi-shift-{tests,clippy,build,startup}.log` and record the first real
 dlsym lookup. The next CPU gap is MOVBE byte-swapping memory moves. Bootstrap
 and PS5 gameplay remain incomplete; this startup-only run skips Metal presentation.
+
+## Direct MOVBE byte-swapping moves
+
+Direct lowering now accepts the six MOVBE memory/register forms at 16/32/64
+bits. ARM64 REV16/REV reverses the bytes before a guarded store or after a
+successful guarded load. Word destinations preserve their surrounding bits;
+dword destinations zero-extend. Addresses and source registers are captured
+before any destination write, including base/destination aliases. All guest
+flags remain unchanged. FS/GS, 32-bit addressing and LOCK prefixes are rejected.
+
+`rust/verification/direct_movbe_native.rs` checks all GPR/base combinations,
+all three widths and both directions, varied source patterns, unaligned and
+exact-end operands, short/unmapped spans, address overflow, read-only/writable
+mappings, prior faults and zero/one/two instruction budgets. Its oracle treats
+memory as big-endian bytes, independently of the emitted REV instructions, and
+compares every GPR, the full mapping, flags, RIP and fault/fuel/stop state.
+Reproduce with the standalone release rlib/dependency flags above using
+`direct_movbe_native.rs`.
+
+Validation passes: 442368 native MOVBE cases, 687 library tests, three integration
+tests, strict Clippy and release build. The standalone verifier compiles with
+warnings denied. Configured `--direct-startup` passes the former block at 0xc90
+and exits 1 at image-relative 0xcd2 with
+`Direct lowering unsupported: VEX_Andn_r32_r32_rm32`. Logs are
+`/tmp/macps5-movbe-{tests,clippy,build,startup}.log` and record the first real dlsym
+lookup. The next gap is BMI AND-NOT. Bootstrap and PS5 gameplay remain incomplete;
+this startup-only run skips Metal presentation.
