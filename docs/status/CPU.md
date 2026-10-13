@@ -1,5 +1,42 @@
 # CPU completion criteria
 
+## Packed wrapping arithmetic
+
+VEX VPADDB/W/D/Q and VPSUBB/W/D/Q now support XMM/YMM register and memory
+operands. Each lane wraps independently at its own width; subtraction computes
+first source minus second source, without cross-lane carry or borrow. Register
+forms use ARM64 vector ADD/SUB. Memory forms validate parameters and the entire
+16/32-byte source before publishing a complete result. XMM results clear upper
+YMM bits. Flags/FP state remain unchanged. Saturating, legacy and EVEX forms
+are not included; FS/GS/address32 remain rejected.
+
+Reference: AMD APM Volume 4 rev.3.24 ADD pp.267/269/271/281 and SUB
+pp.481/483/485/495 ([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)).
+Width-specific wrapping is also checked against
+[Intel's instruction reference](https://cdrdv2-public.intel.com/835781/325462-sdm-vol-1-2abcd-3abcd-4.pdf),
+avoiding the old AMD SUB prose typo that names eight bits for wider forms.
+
+The build passes 618 library tests, three integration tests, strict Clippy and
+release compilation (`work/packed-addsub-native/{tests,clippy,release}.log`,
+process 8737 exit 0). The [native verifier](../../rust/verification/packed_addsub_native.rs)
+passes 284,864 u128-modulo reference comparisons over 192 decoded fixtures:
+exhaustive byte pairs, edge/random wider lanes, carry/borrow isolation,
+subtraction order, aliases/high registers/WIG, exact-end readonly high/unaligned/
+RIP memory, every short span, state preservation and execution guards
+(`work/packed-addsub-native/native.log`). Unit tests also cover invalid helper
+parameters, FFI errors and prior-fault preservation.
+
+Pinned discovery advances by 259 instructions to 55,856 instructions and
+12,707 blocks. Fifteen previous stops disappear and seven new stops become
+reachable, leaving 198 unsupported boundaries. These counts describe discovered
+code, not CPU completion or game compatibility.
+
+The combined entry verifier compiles and its startup-only run passes the
+unchanged missing `fscanf` exit boundary: ten named dependencies accepted,
+20,288 dependency bytes owned, cleanup pending and game main not executed
+(`work/packed-addsub-native/entry.log`, process 41383 exit 0, including the
+native suite above). Full GPU/integrated verification was not run here.
+
 ## Packed integer equality
 
 VEX VPCMPEQB/W/D/Q now support XMM and YMM register or memory operands.

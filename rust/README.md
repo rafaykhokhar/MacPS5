@@ -1,5 +1,11 @@
 # Rust migration
 
+VEX packed wrapping add/sub supports B/W/D/Q lanes and XMM/YMM destinations,
+including guarded memory operands. The build passes 618 library tests, three
+integration tests, strict Clippy and 284,864 native checks. Discovery reaches
+55,856 instructions. See [CPU evidence](../docs/status/CPU.md); retail-game
+execution and production readiness remain unverified.
+
 VEX packed equality comparisons cover B/W/D/Q lanes for XMM/YMM, with guarded
 full-width memory reads and atomic destination updates. The matching build
 passes 614 library tests, three integration tests, strict Clippy and 20,088 native

@@ -773,6 +773,52 @@ pub fn vector_cmpeq(
     vectors[destination as usize] = result;
     Ok(())
 }
+/// Parameters for a guarded packed wrapping integer add/subtract operation.
+#[derive(Clone, Copy)]
+pub struct VectorAddSub {
+    pub destination: u64,
+    pub first: u64,
+    pub size: u64,
+    pub lane_size: u64,
+    pub subtract: u64,
+}
+pub fn vector_addsub(
+    memory: &Memory<'_>,
+    vectors: &mut [[u8; 32]; 16],
+    address: u64,
+    operation: VectorAddSub,
+) -> Result<()> {
+    let VectorAddSub {
+        destination,
+        first,
+        size,
+        lane_size,
+        subtract,
+    } = operation;
+    vector_operand(address, destination, size, 0)?;
+    if first >= 16 || ![1, 2, 4, 8].contains(&lane_size) || subtract > 1 {
+        return Err("Invalid packed add/subtract operand".into());
+    }
+    let source = memory.read(address, size as usize)?;
+    let mut result = [0; 32];
+    for start in (0..size as usize).step_by(lane_size as usize) {
+        let end = start + lane_size as usize;
+        let mut lhs = [0; 8];
+        let mut rhs = [0; 8];
+        lhs[..lane_size as usize].copy_from_slice(&vectors[first as usize][start..end]);
+        rhs[..lane_size as usize].copy_from_slice(&source[start..end]);
+        let lhs = u64::from_le_bytes(lhs);
+        let rhs = u64::from_le_bytes(rhs);
+        let value = if subtract == 1 {
+            lhs.wrapping_sub(rhs)
+        } else {
+            lhs.wrapping_add(rhs)
+        };
+        result[start..end].copy_from_slice(&value.to_le_bytes()[..lane_size as usize]);
+    }
+    vectors[destination as usize] = result;
+    Ok(())
+}
 pub fn vector_xor(
     memory: &Memory<'_>,
     vectors: &mut [[u8; 32]; 16],
@@ -892,6 +938,43 @@ pub mod ffi {
     /// # Safety
     /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
     #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn native_ps5_module_vector_addsub_v1(
+        cpu: *mut Cpu,
+        address: u64,
+        destination: u64,
+        first: u64,
+        size: u64,
+        lane_size: u64,
+        subtract: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if cpu.memory != 0
+            && vector_addsub(
+                unsafe { &*(cpu.memory as *const Memory<'_>) },
+                &mut cpu.vectors,
+                address,
+                VectorAddSub {
+                    destination,
+                    first,
+                    size,
+                    lane_size,
+                    subtract,
+                },
+            )
+            .is_ok()
+        {
+            return;
+        }
+        cpu.fault = 1;
+    }
+    /// # Safety
+    /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
+    #[unsafe(no_mangle)]
     pub unsafe extern "C" fn native_ps5_module_vector_cmpeq_v1(
         cpu: *mut Cpu,
         address: u64,
@@ -1001,6 +1084,164 @@ pub mod ffi {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn packed_addsub_wraps_each_lane_and_preserves_aliases() {
+        for size in [16usize, 32] {
+            for lane in [1usize, 2, 4, 8] {
+                let modulus = 1u128 << (lane * 8);
+                for subtract in [0, 1] {
+                    for destination in [3usize, 15] {
+                        for phase in 0..4 {
+                            let mut vectors = [[0xa5; 32]; 16];
+                            let mut data = [0; 32];
+                            let mut expected = [0; 32];
+                            for (index, start) in (0..size).step_by(lane).enumerate() {
+                                let (lhs, rhs) = match (index + phase) % 4 {
+                                    0 => (modulus - 1, 1),
+                                    1 => (0, 1),
+                                    2 => (modulus / 2, modulus / 2),
+                                    _ => (7, 3),
+                                };
+                                vectors[15][start..start + lane]
+                                    .copy_from_slice(&lhs.to_le_bytes()[..lane]);
+                                data[start..start + lane]
+                                    .copy_from_slice(&rhs.to_le_bytes()[..lane]);
+                                let value = if subtract == 0 {
+                                    (lhs + rhs) % modulus
+                                } else {
+                                    (lhs + modulus - rhs) % modulus
+                                };
+                                expected[start..start + lane]
+                                    .copy_from_slice(&value.to_le_bytes()[..lane]);
+                            }
+                            let original_data = data;
+                            let mut memory = Memory::default();
+                            memory
+                                .add(0x1_0000_0001, &mut data[..size], false, false)
+                                .unwrap();
+                            let mut all_expected = vectors;
+                            all_expected[destination] = expected;
+                            vector_addsub(
+                                &memory,
+                                &mut vectors,
+                                0x1_0000_0001,
+                                VectorAddSub {
+                                    destination: destination as u64,
+                                    first: 15,
+                                    size: size as u64,
+                                    lane_size: lane as u64,
+                                    subtract,
+                                },
+                            )
+                            .unwrap();
+                            assert_eq!(vectors, all_expected);
+                            drop(memory);
+                            assert_eq!(data, original_data);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn packed_addsub_invalid_operands_and_short_spans_are_atomic() {
+        let original = [[0xa5; 32]; 16];
+        for size in [16u64, 32] {
+            for lane_size in [1, 2, 4, 8] {
+                for subtract in [0, 1] {
+                    for length in 0..size as usize {
+                        let mut data = vec![1; length];
+                        let mut memory = Memory::default();
+                        if length != 0 {
+                            memory.add(0x1001, &mut data, false, false).unwrap();
+                        }
+                        let mut vectors = original;
+                        assert!(
+                            vector_addsub(
+                                &memory,
+                                &mut vectors,
+                                0x1001,
+                                VectorAddSub {
+                                    destination: 0,
+                                    first: 0,
+                                    size,
+                                    lane_size,
+                                    subtract,
+                                }
+                            )
+                            .is_err()
+                        );
+                        assert_eq!(vectors, original);
+                    }
+                }
+            }
+        }
+        let mut data = [1; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        for (destination, first, size, lane_size, subtract) in [
+            (16, 0, 16, 1, 0),
+            (0, 16, 16, 1, 0),
+            (u64::MAX, 0, 16, 1, 0),
+            (0, u64::MAX, 16, 1, 0),
+            (0, 0, 0, 1, 0),
+            (0, 0, 8, 1, 0),
+            (0, 0, 64, 1, 0),
+            (0, 0, u64::MAX, 1, 0),
+            (0, 0, 16, 0, 0),
+            (0, 0, 16, 3, 0),
+            (0, 0, 16, 16, 0),
+            (0, 0, 16, u64::MAX, 0),
+            (0, 0, 16, 1, 2),
+            (0, 0, 16, 1, u64::MAX),
+        ] {
+            let mut vectors = original;
+            assert!(
+                vector_addsub(
+                    &memory,
+                    &mut vectors,
+                    0x1001,
+                    VectorAddSub {
+                        destination,
+                        first,
+                        size,
+                        lane_size,
+                        subtract,
+                    }
+                )
+                .is_err()
+            );
+            assert_eq!(vectors, original);
+        }
+    }
+    #[test]
+    #[allow(unsafe_code)]
+    fn packed_addsub_ffi_faults_and_success() {
+        use crate::legacy_cpu::Cpu;
+        let mut cpu = Cpu {
+            vectors: [[0; 32]; 16],
+            ..Cpu::default()
+        };
+        for fault in [0, 2, 13] {
+            cpu.fault = fault;
+            unsafe { ffi::native_ps5_module_vector_addsub_v1(&mut cpu, 0x1000, 0, 0, 16, 1, 1) };
+            assert_eq!(cpu.fault, if fault == 0 { 1 } else { fault });
+            assert_eq!(cpu.vectors, [[0; 32]; 16]);
+        }
+        let mut data = [1; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut data, false, false).unwrap();
+        cpu.memory = (&mut memory as *mut Memory<'_>) as u64;
+        cpu.fault = 0;
+        unsafe { ffi::native_ps5_module_vector_addsub_v1(&mut cpu, 0x1000, 0, 0, 16, 1, 1) };
+        assert_eq!(cpu.fault, 0);
+        assert_eq!(&cpu.vectors[0][..16], &[255; 16]);
+        assert_eq!(&cpu.vectors[0][16..], &[0; 16]);
+        let before = cpu.vectors;
+        unsafe { ffi::native_ps5_module_vector_addsub_v1(&mut cpu, 0x1000, 0, 0, 16, 1, 2) };
+        assert_eq!(cpu.fault, 1);
+        assert_eq!(cpu.vectors, before);
+    }
     #[test]
     fn packed_equality_all_widths_and_aliases() {
         for size in [16usize, 32] {
