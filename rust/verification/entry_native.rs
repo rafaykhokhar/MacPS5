@@ -119,6 +119,7 @@ mod tiler_native;
 mod tiler_gpu_native;
 mod tls_native;
 mod truncate_native;
+mod truncate64_native;
 mod user_service_native;
 mod vmovsd_native;
 mod vmulsd_native;
@@ -217,6 +218,7 @@ fn main() -> Result<(), String> {
         worker_native::verify(Path::new(&archive), Path::new(&directory))?;
         quantum_native::verify(Path::new(&archive), Path::new(&directory))?;
         truncate_native::verify(Path::new(&archive), Path::new(&directory))?;
+        truncate64_native::verify(Path::new(&archive), &Path::new(&directory).join("truncate64"))?;
         scheduler_native::verify(Path::new(&archive), Path::new(&directory))?;
         vmulsd_native::verify(Path::new(&archive), Path::new(&directory))?;
         fma213_native::verify(Path::new(&archive), Path::new(&directory))?;

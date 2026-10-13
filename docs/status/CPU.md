@@ -1,5 +1,42 @@
 # CPU completion criteria
 
+## Signed64 truncating double conversion
+
+VEX VCVTTSD2SI now supports 64-bit GPR destinations as well as the existing
+32-bit form. The new integer-only helper handles binary64 significands and
+exponents without depending on host floating-point state. Negative 2^63 is
+valid; positive 2^63, larger magnitudes, infinities and NaNs raise invalid.
+Masked invalid returns the integer-indefinite bit pattern. Fractional truncation
+raises precision, RC is ignored, DAZ zeroes subnormal inputs and FTZ has no effect.
+Sticky MXCSR status is retained. Unmasked exceptions publish status and stop
+before the GPR write; full guest exception delivery remains unimplemented.
+The existing i32 helper is unchanged. Memory reads guard exactly eight bytes;
+unsupported addressing is rejected, including 32-bit absolute addressing.
+
+Reference: AMD APM Volume 4 rev.3.24 pp.117–119
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf));
+the encoding has ignored L, W selecting integer width and reserved vvvv.
+
+The matching build passes 642 library tests, three integration tests, strict
+Clippy and release compilation (`work/truncate64-native/{tests,clippy,release}.log`,
+process 37083 exit 0). The [native verifier](../../rust/verification/truncate64_native.rs)
+passes 2,160,068 independent binary-power reference checks over 12 decoded
+register/memory fixtures. It covers all exponents, random significands, both
+signs, boundary neighbors, NaNs/infinities/zeros/subnormals, all RC/DAZ/FTZ/IM/PM
+combinations with sticky status, L0/L1, high registers, exact-end readonly
+high/unaligned/RIP reads, every short span, fault precedence, reserved MXCSR,
+and preserved registers/vector/x87/flags/fuel. The existing signed32 native
+regression also passes (`work/truncate64-native/native.log`, process 54525 exit 0).
+
+Discovery reaches 56,589 instructions and 12,860 blocks with 167 unsupported
+sites; all eight former signed64 conversion stops are removed with no new stops.
+This is not a CPU coverage percentage. The integrated entry runner compiles
+with warnings denied and startup-only verification retains the expected missing
+`fscanf` boundary: ten dependencies accepted, 20,288 dependency bytes owned,
+cleanup pending and game main not executed (`work/truncate64-native/entry.log`,
+process 19235 exit 0). Full GPU checks were not run for this CPU change.
+Production readiness and retail gameplay remain unverified.
+
 ## 128-bit vector extraction
 
 VEXTRACTI128 and VEXTRACTF128 now extract either half of a YMM register into

@@ -5,13 +5,15 @@
 //! Chosen guest feature policy supports DAZ, therefore valid bits are0..15.
 use crate::legacy_cpu::Cpu;
 mod arithmetic;
-mod fma;
 mod convert_i64;
+mod fma;
 pub use convert_i64::convert_i64_binary64;
 pub use fma::fma213_binary64;
 mod truncate;
-pub use truncate::{TruncateError, TruncateResult, truncate_binary64_i32};
 pub use arithmetic::{FpResult, FpUnsupported, multiply_binary64};
+pub use truncate::{
+    Truncate64Result, TruncateError, TruncateResult, truncate_binary64_i32, truncate_binary64_i64,
+};
 pub const MXCSR_RESET: u32 = 0x1f80;
 pub const MXCSR_VALID: u32 = 0xffff;
 /// Prototype diagnostic for invalid reserved MXCSR bits, representing #GP.

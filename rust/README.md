@@ -1,5 +1,12 @@
 # Rust migration
 
+VEX truncating double-to-integer conversion now supports signed64 destinations,
+with explicit MXCSR status and guarded memory. The matching build passes 642
+library tests, three integration tests, strict Clippy, 2,160,068 native signed64
+checks and the existing signed32 regression. Discovery reaches 56,589 instructions;
+startup remains at missing `fscanf`, before game main. See [CPU evidence](../docs/status/CPU.md).
+Production readiness and retail gameplay remain unverified.
+
 VEXTRACTI128/F128 now support register destinations and guarded 16-byte stores.
 The matching build passes 638 library tests, three integration tests, strict
 Clippy and 78,336 native checks. Discovery reaches 56,566 instructions and removes

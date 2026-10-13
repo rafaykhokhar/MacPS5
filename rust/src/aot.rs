@@ -1004,19 +1004,33 @@ impl Emitter {
                 ));
             }
             M::Vcvttsd2si => {
-                if i.code() != iced_x86::Code::VEX_Vcvttsd2si_r32_xmmm64 {
-                    return Err("Only signed32 VEX VCVTTSD2SI is implemented".into());
-                }
+                let width = match i.code() {
+                    iced_x86::Code::VEX_Vcvttsd2si_r32_xmmm64 => 32,
+                    iced_x86::Code::VEX_Vcvttsd2si_r64_xmmm64 => 64,
+                    _ => return Err("Only signed32/64 VEX VCVTTSD2SI is implemented".into()),
+                };
                 if i.op_kind(1) == OpKind::Register {
                     let source = vector(i.op_register(1))?;
                     self.emit(format!("ldr x20, [x19, #{}]", 208 + source * 32));
                 } else {
+                    if i.memory_base() == R::None
+                        && i.memory_index() == R::None
+                        && i.memory_displ_size() != 8
+                    {
+                        return Err("32-bit absolute addressing is not implemented".into());
+                    }
                     self.read(i, 1, 64, 20)?;
                 }
-                self.emit("mov x0, x19\nmov x1, x20\nbl _native_ps5_truncate_i32_v1");
+                self.emit(format!(
+                    "mov x0, x19\nmov x1, x20\nbl _native_ps5_truncate_i{width}_v1"
+                ));
                 self.fault();
-                self.emit("mov w20, w0");
-                self.write(i, 0, 32, 20)?;
+                self.emit(if width == 64 {
+                    "mov x20, x0"
+                } else {
+                    "mov w20, w0"
+                });
+                self.write(i, 0, width, 20)?;
             }
             M::Vcvtsi2sd => {
                 let source_width = match i.code() {
@@ -2421,11 +2435,23 @@ mod truncate_tests {
             );
             assert!(supported(&instruction).is_ok());
         }
-        for bytes in [
-            &[0xf2, 0x0f, 0x2c, 0xc0][..],
-            &[0xc4, 0xe1, 0xfb, 0x2c, 0xc0][..],
-        ] {
-            assert!(translate_rust_memory_region(bytes, 0, "unsupported_truncate").is_err());
+        assert!(
+            translate_rust_memory_region(&[0xf2, 0x0f, 0x2c, 0xc0], 0, "unsupported_truncate")
+                .is_err()
+        );
+    }
+    #[test]
+    fn truncate64_exact_form_and_absolute_address_guard() {
+        let bytes = [0xc4, 0xe1, 0xfb, 0x2c, 0xc0];
+        let instruction = decode::instruction(&bytes, 0).unwrap();
+        assert_eq!(
+            instruction.code(),
+            iced_x86::Code::VEX_Vcvttsd2si_r64_xmmm64
+        );
+        assert!(supported(&instruction).is_ok());
+        for control in [0x7b, 0xfb] {
+            let bytes = [0x67, 0xc4, 0xe1, control, 0x2c, 0x04, 0x25, 0, 0, 0, 0];
+            assert!(translate_rust_memory_region(&bytes, 0, "address").is_err());
         }
     }
 }
