@@ -1,12 +1,22 @@
 # Rust migration
 
+Guest `Strncpy` now handles bounded copying, exact NUL padding, truncation, and
+full-width count/return values, with atomic memory and return-frame guards.
+The matching build passes 567 library tests, three integration tests and strict
+Clippy; 90 native direct/pinned-call cases and existing narrow-string regressions
+pass. The operation retains an explicit 64 KiB runtime limit. See
+[strncpy evidence](../docs/status/STRNCPY.md).
+Startup-only import/ownership assertions pass with strncpy bound; the next
+missing import is `sscanf`, with 20,064 retained dependency bytes. Game main
+has not executed.
+
 Guest `Rename` now prepares atomic namespace replacements, preserving source
 inodes and open destination descriptors. Directory moves preserve subtrees and
 update the pathname-based cwd together with namespace publication. The matching
 build passes 565 library tests, three integration tests and strict Clippy; native
 M_rename and remove regressions pass. Retained cwd-directory handles and broader
 filesystem features remain incomplete. See [rename status](../docs/status/RENAME.md).
-Startup-only import/ownership assertions pass at missing `strncpy`, with rename
+The preceding startup-only import/ownership assertions passed at missing `strncpy`, with rename
 bound and 20,016 retained dependency bytes (`rename-entry-verified.log`).
 
 Guest `Remove` now deletes file names and empty directories from the owned

@@ -1064,6 +1064,7 @@ pub enum Service {
     Wcscoll,
     Wcsncmp,
     Strlcpy,
+    Strncpy,
     Strlcat,
     Strchr,
     Strrchr,
@@ -1270,6 +1271,7 @@ impl Service {
             | Self::Wcscoll
             | Self::Wcsncmp
             | Self::Strlcpy
+            | Self::Strncpy
             | Self::Strlcat
             | Self::Strchr
             | Self::Strrchr
@@ -5918,14 +5920,16 @@ impl NativeExecutor {
                         }
                         // SysV long double returns in ST(0), float/double in XMM0.
                         cpu.registers[0]
-                    } else if matches!(service, Service::Strlcpy | Service::Strlcat) {
-                        let plan = crate::narrow_strings::copy_plan(
+                    } else if matches!(service, Service::Strlcpy | Service::Strlcat | Service::Strncpy) {
+                        let plan = if matches!(service, Service::Strncpy) {
+                            crate::narrow_strings::strncpy_plan(&memory, cpu.registers[7], cpu.registers[6], cpu.registers[2])?
+                        } else { crate::narrow_strings::copy_plan(
                             &memory,
                             cpu.registers[7],
                             cpu.registers[6],
                             cpu.registers[2],
                             matches!(service, Service::Strlcat),
-                        )?;
+                        )? };
                         if !plan.bytes.is_empty() {
                             validate_net_output(
                                 &memory,

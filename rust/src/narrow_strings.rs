@@ -35,6 +35,55 @@ impl CopyPlan {
         Ok(self.result)
     }
 }
+/// FreeBSD11.4 strncpy: copy/pad exactly count bytes, return destination, and
+/// never append a terminator when the input occupies the entire count.
+/// Preflight makes guest faults atomic in this runtime; it does not reproduce
+/// libc's partial stores on an invalid address. Overlap is undefined by C and
+/// rejected explicitly here. No source bytes after the first NUL are read.
+pub fn strncpy_plan(
+    memory: &Memory<'_>,
+    destination: u64,
+    source: u64,
+    count: u64,
+) -> Result<CopyPlan> {
+    if count == 0 {
+        return Ok(CopyPlan {
+            destination,
+            bytes: Vec::new(),
+            result: destination,
+        });
+    }
+    if count > LIMIT as u64 {
+        return Err("Guest strncpy exceeds64KiB copy limit".into());
+    }
+    let end = destination
+        .checked_add(count)
+        .ok_or("Strncpy destination overflow")?;
+    memory.validate_write(destination, count as usize)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(count as usize)
+        .map_err(|_| "Cannot allocate strncpy snapshot")?;
+    for index in 0..count as usize {
+        let value = byte(memory, source, index)?;
+        bytes.push(value);
+        if value == 0 {
+            break;
+        }
+    }
+    let source_end = source
+        .checked_add(bytes.len() as u64)
+        .ok_or("Strncpy source overflow")?;
+    if destination < source_end && source < end {
+        return Err("Overlapping strncpy input/output is unsupported".into());
+    }
+    bytes.resize(count as usize, 0);
+    Ok(CopyPlan {
+        destination,
+        bytes,
+        result: destination,
+    })
+}
 /// Prepares exactly the bytes which will change, so dispatcher can guard the
 /// actual output against its return frame before any write. size_t stays u64.
 pub fn copy_plan(
@@ -149,6 +198,50 @@ pub fn strstr(memory: &Memory<'_>, haystack: u64, needle: u64) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn strncpy_padding_truncation_and_mapping_end_reads() {
+        for (source, count, expected) in [
+            (b"ab\0".as_slice(), 6, b"ab\0\0\0\0".as_slice()),
+            (b"abcd".as_slice(), 4, b"abcd".as_slice()),
+            (b"\0".as_slice(), 3, b"\0\0\0".as_slice()),
+        ] {
+            let mut src = source.to_vec();
+            let mut dst = [0xaa; 8];
+            let mut memory = Memory::default();
+            memory.add(0x1000, &mut src, false, false).unwrap();
+            memory.add(0x1_2000_0001, &mut dst, true, false).unwrap();
+            let plan = strncpy_plan(&memory, 0x1_2000_0001, 0x1000, count).unwrap();
+            assert_eq!(plan.commit(&mut memory).unwrap(), 0x1_2000_0001);
+            assert_eq!(
+                memory.read(0x1_2000_0001, count as usize).unwrap(),
+                expected
+            );
+            assert_eq!(memory.load(0x1_2000_0001 + count, 1).unwrap(), 0xaa);
+        }
+    }
+    #[test]
+    fn strncpy_zero_count_and_failed_plans_do_not_modify_memory() {
+        let mut data = *b"ab\0xxxxx";
+        let mut memory = Memory::default();
+        assert_eq!(
+            strncpy_plan(&memory, u64::MAX, 0, 0)
+                .unwrap()
+                .commit(&mut memory)
+                .unwrap(),
+            u64::MAX
+        );
+        memory.add(0x1000, &mut data, true, false).unwrap();
+        for (dst, src, count) in [
+            (0x1001, 0x1000, 4),
+            (0x1004, 0x1007, 2),
+            (0x1004, 0x1000, 5),
+            (u64::MAX, 0x1000, 2),
+            (0x1004, 0x1000, 0x1_0000_0001),
+        ] {
+            assert!(strncpy_plan(&memory, dst, src, count).is_err());
+            assert_eq!(memory.read(0x1000, 8).unwrap(), b"ab\0xxxxx");
+        }
+    }
     #[test]
     fn repeated_prefix_search_and_scan_budget() {
         let mut hay = b"aaaaaaaab\0".to_vec();
