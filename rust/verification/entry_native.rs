@@ -140,10 +140,12 @@ mod vmovsd_native;
 mod vmulsd_native;
 mod worker_native;
 fn main() -> Result<(), String> {
+    let direct_startup = std::env::args_os().nth(2).is_some_and(|value| value == "--direct-startup");
     let startup_only = match std::env::args_os().nth(2).as_deref() {
         None => false,
         Some(value) if value == "--startup-only" => true,
-        Some(_) => return Err("Expected optional --startup-only".into()),
+        Some(value) if value == "--direct-startup" => true,
+        Some(_) => return Err("Expected optional --startup-only or --direct-startup".into()),
     };
     let file = std::fs::read(
         std::env::args_os()
@@ -667,28 +669,45 @@ fn main() -> Result<(), String> {
         native.register_service(address, service)?;
         libc_exports.push((name, address));
     }
-    // SAFETY: local archive is this exact runtime build, supplied by the developer.
-    let manifest = unsafe {
-        native.set_automatic_translation(true);
-        native.compile_image(
-            &file,
-            bias,
-            // Address-taken and jump-table targets are compiled only when
-            // encountered during actual execution, preserving suspended state.
-            BTreeSet::from([0x40]),
-            65_536,
-            Path::new(&archive),
-            Path::new(&directory),
-        )?
-    };
-    if manifest.sha256 != "308fbb17946974f0c2e888988d4f16f98681ea91a8a957a314b3518e5e45a567" {
+    if image.source_sha256() != "308fbb17946974f0c2e888988d4f16f98681ea91a8a957a314b3518e5e45a567" {
         return Err("Real-entry probe addresses require the pinned Crispy Doom ELF".into());
     }
-    println!(
-        "Initially compiled {} instructions; {} unsupported boundaries",
-        manifest.instruction_count,
-        manifest.untranslated.len()
-    );
+    // SAFETY: local archive is this exact runtime build, supplied by the developer.
+    // Direct mode runs on the current host thread while generated code is quiescent.
+    let direct_arena = if direct_startup {
+        Some(std::rc::Rc::new(unsafe {
+            native_ps5::jit_memory::JitArena::new(64 * 1024 * 1024)?
+        }))
+    } else {
+        None
+    };
+    unsafe {
+        native.set_automatic_translation(true);
+    }
+    if let Some(arena) = &direct_arena {
+        unsafe {
+            native.register_direct_source(&image, 65_536, arena.clone())?;
+        }
+        println!("DIRECT STARTUP: immutable source registered; observed-target translation enabled; same bootstrap setup and assertions");
+    } else {
+        let manifest = unsafe {
+            native.compile_image(
+                &file,
+                bias,
+                // Address-taken and jump-table targets are compiled only when
+                // encountered during actual execution, preserving suspended state.
+                BTreeSet::from([0x40]),
+                65_536,
+                Path::new(&archive),
+                Path::new(&directory),
+            )?
+        };
+        println!(
+            "Initially compiled {} instructions; {} unsupported boundaries",
+            manifest.instruction_count,
+            manifest.untranslated.len()
+        );
+    }
     let begin = bias + 0x58f780;
     let end = bias + 0x80b2c0;
     let bss = image

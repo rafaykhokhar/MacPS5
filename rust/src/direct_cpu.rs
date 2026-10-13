@@ -86,7 +86,12 @@ pub(crate) fn translate_span(
             .ok_or("Direct PC overflow")?;
         let i = decode::instruction(&bytes[offset..], pc)?;
         match i.code() {
-            Code::Nopd | Code::Nopq | Code::Retnq => {}
+            Code::Nopd
+            | Code::Nopq
+            | Code::Nop_rm16
+            | Code::Nop_rm32
+            | Code::Nop_rm64
+            | Code::Retnq => {}
             Code::Push_r64 | Code::Pop_r64 => {}
             Code::Lea_r32_m | Code::Lea_r64_m => {}
             Code::Mov_r32_imm32 | Code::Mov_r64_imm64 => {}
@@ -395,7 +400,7 @@ pub(crate) fn translate_span(
             continue;
         }
         match i.code() {
-            Code::Nopd | Code::Nopq => {}
+            Code::Nopd | Code::Nopq | Code::Nop_rm16 | Code::Nop_rm32 | Code::Nop_rm64 => {}
             Code::Retnq => {
                 c.load_u64(9, 3)?;
                 c.context_access(9, 19, 168, true, true)?;

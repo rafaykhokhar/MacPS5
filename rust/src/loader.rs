@@ -47,6 +47,11 @@ fn u32_at(bytes: &[u8], offset: usize) -> Result<u32> {
     ))
 }
 impl Image {
+    /// SHA-256 of the retained ELF file, excluding relocated/live segment bytes.
+    pub fn source_sha256(&self) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(&self.file))
+    }
     pub fn load(file: &[u8], bias: u64, budget: usize) -> Result<Self> {
         if file.len() > budget {
             return Err("ELF file exceeds loader budget".into());

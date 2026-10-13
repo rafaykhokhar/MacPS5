@@ -1,5 +1,11 @@
 # Rust migration
 
+The existing configured startup harness now accepts `--direct-startup`, selecting
+on-demand direct translation for the root ELF with the normal arguments, callback
+table and services. Multi-byte NOPs pass 120 native checks; the configured probe
+now stops on byte-immediate MOV. See
+[configured direct startup](../docs/status/TRANSLATOR_READINESS.md#configured-direct-startup-and-multi-byte-nops).
+
 Direct C7 immediate MOV32/64 now handles register and guarded memory destinations.
 23042 native cases pass. The raw homebrew probe advances to a guarded indirect
 call read fault at 0x3c1, with 3212 JIT bytes; it lacks startup arguments and a

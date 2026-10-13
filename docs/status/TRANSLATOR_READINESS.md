@@ -815,3 +815,41 @@ default arguments and supplies no startup callback table, imports or process
 setup. This fault is therefore a runtime-setup boundary to investigate with the
 configured startup path, not evidence that another instruction must be stubbed.
 Homebrew initialization and PS5 gameplay remain unverified on this backend.
+
+## Configured direct startup and multi-byte NOPs
+
+`entry_native.rs --direct-startup` now selects an immutable direct source for
+the root ELF and enables observed-target translation in the existing configured
+startup harness. It preserves process arguments, callback table, kernel mappings,
+service exports and startup assertions. This mode skips component/Metal checks,
+as `--startup-only` does. The normal dylib backend remains the default. The pinned
+ELF check now uses `Image::source_sha256` before either backend is selected;
+the digest covers retained file bytes rather than relocated/live segments.
+
+The first configured run stopped translating the span at 0x61 on `Nop_rm32`,
+after passing the raw probe's missing-callback boundary. Direct NOP r/m16/32/64
+now consumes fuel without reading its encoded register/memory operand. The
+strict-warning `direct_nop_native.rs` verifier passes 120 cases with null memory,
+invalid-looking addresses, segment/address/operand prefixes, registers, fuel and
+prior faults. All registers and flags are preserved.
+
+687 library tests, three integration tests, strict Clippy, release build and the
+NOP verifier pass. The full configured startup harness compiles with strict
+warnings, then exits 1 on the next explicit unsupported instruction:
+`Translation miss at 0x10000061 (bias 0x10000000): Direct lowering unsupported: Mov_rm8_imm8`.
+This is process 38123; the startup log is `/tmp/macps5-direct-startup2.log`.
+No successful startup or Metal/gameplay result is claimed from this run.
+
+After a release build, compile `rust/verification/entry_native.rs` using the
+release rlib/dependency flags above. Run the resulting executable with:
+
+```sh
+NATIVE_PS5_RUNTIME_ARCHIVE="$PWD/rust/target/release/libnative_ps5.a" \
+NATIVE_PS5_AOT_DIRECTORY=/tmp/macps5-direct-startup-artifacts \
+  /tmp/macps5-direct-startup /path/to/crispy-doom.elf --direct-startup
+```
+
+The archive/directory remain required by the shared harness and potential module
+loading paths. The root direct source has no unsupported-instruction fallback to
+the dylib compiler. The next CPU boundary is byte-immediate MOV, rather than a
+fabricated callback or successful stub for the raw probe's missing environment.
