@@ -1,5 +1,15 @@
 # Allocating printf implementation audit
 
+## Wide conversion increment
+
+The registered service now supports `%lc` and `%ls` under the audited C-byte/wchar16 policy. Encoding failures publish NULL and EILSEQ after preserving already consumed arguments. Source-required temporary allocations are owned and explicitly freed; a scratch cleanup failure no longer skips cleanup of the independent output allocation. Successful large-precision sizing can set errno as the source does, with guarded writes.
+
+The matching release passes 441 library tests, three integration tests and strict Clippy (`wide-strcoll-build.log`). The actual `asprintf_l` wrapper passes low16 character narrowing, high bytes, embedded NUL, EILSEQ, string precision 0/2/127/128, repeated temporary cleanup, source sizing beyond NUL, successful sizing errno side effects, and readonly/unmapped errno rejection (`work/vasprintf-wide-native/native.log`, 62755). Existing integer cases also pass. A subsequent dispatcher regression verifies NULL/EILSEQ publication, consumed arguments and released output ownership (`wide-service-model.log`). Native allocator exhaustion and floating conversion remain unverified.
+
+The decimal FP-effects module is registered for independent testing, not enabled in guest formatting. Three focused checks and integrated strict Clippy pass (`printf-effects-integrated.log`); the source-operation model matched 98,304 upstream x86 oracle cases. Internal dtoa allocation behavior, runtime effect publication and source-piece emission still require integration. This evidence does not establish console compiler equivalence.
+
+## Earlier integer/text checkpoint
+
 Status: integer/text service registered and independently exercised through the pinned `asprintf_l` wrapper. Matching release: 432 library tests, three integration tests and strict Clippy (`vasprintf-build.log`). Native cases cover GP spill transition, empty and embedded-NUL output, allocation growth/free, integer modifiers, `%n` widths and aliases, and guarded publication (`work/vasprintf-native/native.log`). Native allocation-failure and floating paths are not verified. Startup binds this service and stops at missing `strcoll` with 19,280 dependency bytes (`vasprintf-entry-integrated.log`); its overall result still fails Metal presentation. Wide, floating, positional and extended80 output remain outside this registered checkpoint. Source policy comes from FreeBSD 11.4 and the pinned executable, not measurements of console libc. This is not complete printf compatibility.
 
 The output queue keeps guest spans deferred until flush, batches eight vectors and splits padding into sixteen-byte chunks. A failed sink call permanently prevents replay. The buffer distinguishes logical capacity from allocator rounding, frees old storage on growth allocation failure, validates private-storage aliases, publishes NUL before the final pointer and does not touch errno on success. Its poisoned state prevents swallowed append errors from turning into success.

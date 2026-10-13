@@ -7,6 +7,8 @@ use crate::{guest_memory::Memory, libc_memory};
 #[derive(Debug, PartialEq, Eq)]
 pub enum Kind {
     Allocation(u32),
+    /// Source-defined libc failure such as EILSEQ; not a runtime limitation.
+    Libc(u32),
     Runtime(String),
     OutputLimit,
     PrivateStorageAlias,
@@ -22,12 +24,16 @@ pub struct CleanupFault {
 pub struct Error {
     pub kind: Kind,
     pub cleanup: Option<CleanupFault>,
+    /// A second retained allocation when scratch cleanup and output cleanup
+    /// both fail. Neither owned address is discarded from the diagnostic.
+    pub output_cleanup: Option<CleanupFault>,
 }
 impl From<Kind> for Error {
     fn from(kind: Kind) -> Self {
         Self {
             kind,
             cleanup: None,
+            output_cleanup: None,
         }
     }
 }
@@ -170,10 +176,20 @@ impl<'a> Buffer<'_, 'a> {
         Ok(())
     }
     fn cleanup_error(&mut self, error: &mut Error) {
-        if error.cleanup.is_none() {
-            error.cleanup = self
-                .cleanup_with(|memory, address| memory.free(address))
-                .err();
+        // An earlier reallocf failure may already record this exact output.
+        // A different scratch allocation's failure must not skip output free.
+        if self.address.is_some_and(|address| {
+            error.cleanup.as_ref().is_some_and(|fault| fault.address == address)
+                || error.output_cleanup.as_ref().is_some_and(|fault| fault.address == address)
+        }) {
+            return;
+        }
+        if let Err(fault) = self.cleanup_with(|memory, address| memory.free(address)) {
+            if error.cleanup.is_none() {
+                error.cleanup = Some(fault);
+            } else {
+                error.output_cleanup = Some(fault);
+            }
         }
     }
 }
@@ -407,6 +423,32 @@ mod tests {
             -1
         );
         assert_eq!(m.load(SLOT, 8).unwrap(), 12u64 << 32);
+    }
+    #[test]
+    fn scratch_cleanup_failure_does_not_skip_output_cleanup() {
+        let mut owner = OwnedMappings::default();
+        let mut slot = [0xa5; 16];
+        let mut m = Memory::default();
+        m.add(SLOT, &mut slot, true, false).unwrap();
+        m.attach_owned(&mut owner).unwrap();
+        let mut output = 0;
+        let mut scratch = 0;
+        let error = run(&mut m, SLOT, 128, guard, |buffer| {
+            output = buffer.private_span()?.0;
+            scratch = buffer.memory().malloc(32).unwrap();
+            // Model a scratch deallocator failure, retaining its real mapping.
+            let mut error = Error::from(Kind::Runtime("scratch conversion fault".into()));
+            error.cleanup = Some(CleanupFault { address: scratch, message: "injected scratch cleanup failure".into() });
+            Err(error)
+        }).unwrap_err();
+        assert_eq!(error.cleanup.unwrap().address, scratch);
+        assert!(error.output_cleanup.is_none());
+        assert!(m.heap_allocation_size(output).is_err());
+        assert_eq!(m.heap_allocation_size(scratch).unwrap(), 32);
+        assert_eq!(m.read(SLOT, 8).unwrap(), [0xa5; 8]);
+        m.free(scratch).unwrap();
+        drop(m);
+        assert_eq!(owner.bytes_allocated(), 0);
     }
     #[test]
     fn cleanup_failure_retains_exact_allocation_metadata_for_retry() {

@@ -182,6 +182,25 @@ mod vasprintf_dispatch_tests {
         assert_eq!(memory.load(SP, 8).unwrap(), RET);
     }
     #[test]
+    fn wide_encoding_failure_publishes_null_and_eilseq_after_consuming_argument() {
+        let mut data = bytes(b"%lc\0");
+        data[0x300..0x308].copy_from_slice(&256u64.to_le_bytes());
+        let mut owner = crate::guest_memory::OwnedMappings::default();
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut data, true, false).unwrap();
+        memory.attach_owned(&mut owner).unwrap();
+        assert_eq!(
+            vasprintf_service(&mut memory, [OUT, 0x1100, 0x1200], Some(OUT + 8), SP, RET).unwrap(),
+            u32::MAX as u64
+        );
+        assert_eq!(memory.load(OUT, 8).unwrap(), 0);
+        assert_eq!(memory.load(OUT + 8, 4).unwrap(), 86);
+        assert_eq!(memory.load(0x1200, 4).unwrap(), 8);
+        assert_eq!(memory.load(SP, 8).unwrap(), RET);
+        drop(memory);
+        assert_eq!(owner.bytes_allocated(), 0);
+    }
+    #[test]
     fn unsupported_format_frees_private_buffer_without_fabricating_errno() {
         let mut data = bytes(b"%f\0");
         let mut owner = crate::guest_memory::OwnedMappings::default();
@@ -231,17 +250,21 @@ fn vasprintf_service(
             buffer,
             format,
             va,
-            crate::printf_render::Options::default(),
+            crate::printf_render::Options {
+                errno_address: errno,
+                ..crate::printf_render::Options::default()
+            },
             guard,
         )
     });
     match result {
         Ok(length) => Ok(length as u32 as u64),
         Err(error) => {
-            if error.cleanup.is_none() {
-                if let crate::printf_buffer::Kind::Allocation(code) = error.kind {
+            if error.cleanup.is_none() && error.output_cleanup.is_none() {
+                if let crate::printf_buffer::Kind::Allocation(code)
+                | crate::printf_buffer::Kind::Libc(code) = error.kind {
                     let errno =
-                        errno.ok_or("Missing vasprintf allocation-failure errno context")?;
+                        errno.ok_or("Missing vasprintf failure errno context")?;
                     let value =
                         crate::printf_buffer::publish_failure(memory, strp, errno, code, guard)?;
                     return Ok(value as u32 as u64);
@@ -1046,6 +1069,7 @@ pub enum Service {
     Strcpy,
     Strcat,
     Strcmp,
+    Strcoll,
     Strncmp,
     Strlen,
     Ctype(crate::c_locale::Ctype),
@@ -1206,6 +1230,7 @@ impl Service {
             | Self::Snprintf
             | Self::Vsnprintf
             | Self::Vasprintf
+            | Self::Strcoll
             | Self::Errno
             | Self::Getpid
             | Self::Syscall
@@ -6112,6 +6137,13 @@ impl NativeExecutor {
                         text.push('\0');
                         memory.update_service_data(ERROR_TEXT, text.as_bytes())?;
                         ERROR_TEXT
+                    } else if matches!(service, Service::Strcoll) {
+                        crate::guest_strcoll::compare_c(
+                            &mut memory,
+                            cpu.registers[7],
+                            cpu.registers[6],
+                        )
+                        .map_err(|fault| format!("Guest C/POSIX strcoll fault {fault:?}"))?
                     } else if matches!(service, Service::Errno) {
                         let address = self
                             .kernel

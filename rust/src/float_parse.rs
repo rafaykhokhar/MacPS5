@@ -2,7 +2,7 @@
 //! Pure conversion engine; guest fenv/errno service integration remains separate.
 mod big;
 mod binary32;
-mod decimal_arithmetic;
+pub(crate) mod decimal_arithmetic;
 mod decimal_big;
 mod decimal_effects;
 mod decimal_refinement;

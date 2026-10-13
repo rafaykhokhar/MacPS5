@@ -1,5 +1,5 @@
 //! Execute the pinned asprintf_l wrapper with AL=0, real GP saves and stack args.
-//! Integer/text/count surface only; no floating/positional/full-printf claim.
+//! Integer/text/count and C/wchar16 wide surface; no floating/positional/full-printf claim.
 use native_ps5::{
     guest_memory::DataRegion,
     kernel::Kernel,
@@ -290,6 +290,152 @@ pub fn verify(file: &[u8], archive: &Path, directory: &Path) -> Result<(), Strin
         b"alias",
         None,
     )?;
+    // C/wchar16 %lc: full high bytes, embedded NUL and low16 narrowing through
+    // the actual asprintf_l GP-save path. Success must ignore read-only errno.
+    for unit in [0u64, 65, 128, 255, 0xdead_beef_0000_00ff] {
+        data.fill(0xa5);
+        data[64..68].copy_from_slice(b"%lc\0");
+        errno = 77u32.to_le_bytes();
+        success(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            &mut data,
+            DATA,
+            DATA + 64,
+            &[unit],
+            &[unit as u8],
+            Some((&mut errno, false)),
+        )?;
+        assert_eq!(errno, 77u32.to_le_bytes());
+    }
+    // An actual libc encoding failure returns int -1 (zero-extended EAX),
+    // publishes NULL and EILSEQ, and frees all unpublished allocations.
+    for unit in [256u64, 0xd800, 0xffff] {
+        data.fill(0xa5);
+        data[64..68].copy_from_slice(b"%lc\0");
+        errno = 77u32.to_le_bytes();
+        let before = n.bytes_allocated();
+        let result = invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            format_args(DATA, DATA + 64, &[unit]),
+            &mut data,
+            true,
+            Some((&mut errno, true)),
+        )?;
+        assert_eq!(result.result, u32::MAX as u64);
+        assert_eq!(result.gp, 32);
+        assert_eq!(result.fp, 48);
+        assert_eq!(&data[..8], &[0; 8]);
+        assert_eq!(errno, 86u32.to_le_bytes());
+        assert_eq!(n.bytes_allocated(), before);
+    }
+    // Zero precision never accesses its invalid source. Repeated wide strings
+    // exercise allocation/replacement of conversion buffers and final cleanup.
+    for format in [
+        b"%.0ls|%.2ls|%ls|%.3ls\0".as_slice(),
+        b"%.0ls|%.127ls|%ls|%.3ls\0",
+    ] {
+        data.fill(0xa5);
+        data[64..64 + format.len()].copy_from_slice(format);
+        data[256..262].copy_from_slice(&[65, 0, 255, 0, 0, 0]);
+        success(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            &mut data,
+            DATA,
+            DATA + 64,
+            &[u64::MAX, DATA + 256, DATA + 256, 0],
+            b"|A\xff|A\xff|(nu",
+            None,
+        )?;
+    }
+    // Large precision uses the source wcrtomb sizing loop: reads one unit past
+    // the capacity check, and does not treat NUL's one-byte encoding as a stop.
+    // An invalid unit sets errno even when the bounded second pass succeeds.
+    for prefix in [0usize, 1, 128] {
+        data.fill(0xa5);
+        data[64..72].copy_from_slice(b"%.128ls\0");
+        for index in 0..prefix {
+            data[256 + index * 2..258 + index * 2].copy_from_slice(&65u16.to_le_bytes());
+        }
+        if prefix == 0 {
+            data[256..258].copy_from_slice(&0u16.to_le_bytes());
+        }
+        let bad = if prefix == 0 { 1 } else { prefix };
+        data[256 + bad * 2..258 + bad * 2].copy_from_slice(&256u16.to_le_bytes());
+        errno = 77u32.to_le_bytes();
+        success(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            &mut data,
+            DATA,
+            DATA + 64,
+            &[DATA + 256],
+            &vec![b'A'; prefix],
+            Some((&mut errno, true)),
+        )?;
+        assert_eq!(errno, 86u32.to_le_bytes());
+    }
+    // Unbounded sizing and short-precision copying fail differently internally,
+    // but both expose EILSEQ and release the private output/temporary allocations.
+    for format in [b"%ls\0".as_slice(), b"%.2ls\0"] {
+        data.fill(0xa5);
+        data[64..64 + format.len()].copy_from_slice(format);
+        data[256..260].copy_from_slice(&[65, 0, 0, 1]);
+        errno = 77u32.to_le_bytes();
+        let before = n.bytes_allocated();
+        let result = invoke(
+            &mut n,
+            &mut adapter,
+            &mut real,
+            format_args(DATA, DATA + 64, &[DATA + 256]),
+            &mut data,
+            true,
+            Some((&mut errno, true)),
+        )?;
+        assert_eq!(result.result, u32::MAX as u64);
+        assert_eq!(&data[..8], &[0; 8]);
+        assert_eq!(errno, 86u32.to_le_bytes());
+        assert_eq!(n.bytes_allocated(), before);
+    }
+    // Read-only or absent errno rejects both an EILSEQ failure publication and
+    // a large-precision success-side errno write, without publishing the result.
+    for format in [b"%lc\0".as_slice(), b"%.128ls\0"] {
+        for mapped in [false, true] {
+            data.fill(0xa5);
+            data[64..64 + format.len()].copy_from_slice(format);
+            data[256..258].copy_from_slice(&256u16.to_le_bytes());
+            errno = 77u32.to_le_bytes();
+            let arg = if format == b"%lc\0" { 256 } else { DATA + 256 };
+            let before = n.bytes_allocated();
+            let original = data.clone();
+            let errno_region = if mapped {
+                Some((errno.as_mut_slice(), false))
+            } else {
+                None
+            };
+            assert!(
+                invoke(
+                    &mut n,
+                    &mut adapter,
+                    &mut real,
+                    format_args(DATA, DATA + 64, &[arg]),
+                    &mut data,
+                    true,
+                    errno_region
+                )
+                .is_err()
+            );
+            assert_eq!(data, original);
+            assert_eq!(errno, 77u32.to_le_bytes());
+            assert_eq!(n.bytes_allocated(), before);
+        }
+    }
     // Guard failure stays an explicit runtime error and does not leak output.
     data.fill(0xa5);
     data[64..69].copy_from_slice(b"safe\0");
@@ -311,7 +457,7 @@ pub fn verify(file: &[u8], archive: &Path, directory: &Path) -> Result<(), Strin
     assert_eq!(data, original);
     assert_eq!(n.bytes_allocated(), before);
     println!(
-        "PASS: actual asprintf_l wrapper AL0 GP/overflow va_list advancement, integer/text/star/length formatting, embeddedNUL, allocated output/growth/free, %n widths and deferred-literal alias, finalpointer/format alias, readonly/unmapped errno success and readonly output guard; allocationfailure and floating paths not nativeverified"
+        "PASS: actual asprintf_l wrapper AL0 GP/overflow va_list advancement, integer/text/star/length formatting, embeddedNUL, allocated output/growth/free, %n widths and deferred-literal alias, finalpointer/format alias, readonly/unmapped errno success and readonly output guard; C/wchar16 lc narrowing/EILSEQ and ls precision0/127/128, temporary cleanup, source sizing errno sideeffects and errno guards; allocationfailure and floating paths not nativeverified"
     );
     Ok(())
 }

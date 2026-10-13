@@ -1,7 +1,7 @@
 //! Single-pass sequential printf rendering into the private allocating sink.
 //! Literal vectors stay deferred across %n; ordinary conversions flush before
 //! scanning the next field. Errors do not flush queued source vectors.
-//! Positional, wide, extended80, locale grouping and %m remain explicit faults.
+//! Positional, extended80, locale grouping and %m remain explicit faults.
 //! NumericOnly FP opts into byte rendering, not audited fenv/allocation timing.
 use crate::{
     guest_memory::Memory,
@@ -23,6 +23,8 @@ pub struct Options {
     pub argument_limit: usize,
     pub string_limit: usize,
     pub parser: printf_spec::Limits,
+    /// Used only by source-required successful wide sizing side effects.
+    pub errno_address: Option<u64>,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -32,6 +34,7 @@ impl Default for Options {
             argument_limit: 4096,
             string_limit: 65536,
             parser: printf_spec::Limits::default(),
+            errno_address: None,
         }
     }
 }
@@ -81,10 +84,20 @@ struct Context<'b, 'm, 'a, G> {
     buffer: &'b mut Buffer<'m, 'a>,
     cursor: Cursor,
     guard: &'b mut G,
+    wide: Option<u64>,
 }
 impl<G: FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>> Context<'_, '_, '_, G> {
     fn fetch(&mut self, class: Class) -> Result<Value, Error> {
         let (base, length) = self.buffer.private_span()?;
+        let wide = self
+            .wide
+            .map(|base| {
+                self.buffer
+                    .memory()
+                    .heap_allocation_size(base)
+                    .map(|length| (base, length))
+            })
+            .transpose()?;
         let guard = &mut self.guard;
         self.cursor
             .fetch(self.buffer.memory(), class, |memory, address, count| {
@@ -94,9 +107,129 @@ impl<G: FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>> Context<'_, '_, '_,
                 if address < base + length as u64 && base < end {
                     return Err("Printf cursor aliases private output storage".into());
                 }
+                if wide.is_some_and(|(base, length)| address < base + length as u64 && base < end) {
+                    return Err("Printf cursor aliases private wide conversion storage".into());
+                }
                 guard(memory, address, count)
             })
             .map_err(|e| fault(format!("Printf argument fault: {e:?}")))
+    }
+
+    fn external_write(&mut self, address: u64, length: usize) -> Result<(), Error> {
+        self.buffer.validate_external_write(address, length)?;
+        if let Some(base) = self.wide {
+            let size = self.buffer.memory().heap_allocation_size(base)?;
+            let end = address
+                .checked_add(length as u64)
+                .ok_or_else(|| fault("Printf wide guard overflow"))?;
+            if length != 0 && address < base + size as u64 && base < end {
+                return Err(Kind::PrivateStorageAlias.into());
+            }
+        }
+        (self.guard)(self.buffer.memory(), address, length)?;
+        Ok(())
+    }
+    fn release_wide(&mut self) -> Result<(), Error> {
+        if let Some(address) = self.wide {
+            if let Err(message) = self.buffer.memory().free(address) {
+                let mut error = fault("Printf wide temporary cleanup failed");
+                error.cleanup = Some(crate::printf_buffer::CleanupFault { address, message });
+                return Err(error);
+            }
+            self.wide = None;
+        }
+        Ok(())
+    }
+    fn wide_unit(&mut self, source: u64, index: usize, budget: usize) -> Result<u16, Error> {
+        if index >= budget {
+            return Err(fault("Printf wide read budget"));
+        }
+        let address = index
+            .checked_mul(2)
+            .and_then(|offset| source.checked_add(offset as u64))
+            .ok_or_else(|| fault("Printf wide source overflow"))?;
+        if let Some(base) = self.wide {
+            let size = self.buffer.memory().heap_allocation_size(base)?;
+            let end = address
+                .checked_add(2)
+                .ok_or_else(|| fault("Printf wide source overflow"))?;
+            if address < base + size as u64 && base < end {
+                return Err(Kind::PrivateStorageAlias.into());
+            }
+        }
+        Ok(self.buffer.memory().load(address, 2)? as u16)
+    }
+    fn wide_string(
+        &mut self,
+        source: u64,
+        precision: Option<usize>,
+        options: Options,
+    ) -> Result<Vector, Error> {
+        if source == 0 {
+            return owned(&b"(null)"[..precision.unwrap_or(6).min(6)]);
+        }
+        let capacity = match precision {
+            Some(n) if n < 128 => n,
+            None => {
+                let mut n = 0;
+                loop {
+                    let unit = self.wide_unit(source, n, options.string_limit)?;
+                    if unit > 255 {
+                        return Err(Kind::Libc(86).into());
+                    }
+                    if unit == 0 {
+                        break;
+                    }
+                    n += 1;
+                }
+                n
+            }
+            Some(precision) => {
+                let mut n = 0;
+                loop {
+                    // Source calls wcrtomb before the capacity check. NUL is a
+                    // one-byte conversion here, so this prepass does not stop
+                    // at NUL. The subsequent wcsrtombs copy does stop there.
+                    let unit = self.wide_unit(source, n, options.string_limit)?;
+                    if unit > 255 {
+                        let errno = options
+                            .errno_address
+                            .ok_or_else(|| fault("Printf wide sizing requires errno context"))?;
+                        self.external_write(errno, 4)?;
+                        self.buffer.memory().store(errno, 86, 4)?;
+                        break;
+                    }
+                    if n == precision {
+                        break;
+                    }
+                    n += 1;
+                }
+                n
+            }
+        };
+        let count = capacity.checked_add(1).ok_or(Kind::OutputLimit)?;
+        let address = self
+            .buffer
+            .memory()
+            .malloc(count as u64)
+            .map_err(Kind::Allocation)?;
+        self.wide = Some(address);
+        let mut length = 0;
+        while length < capacity {
+            let unit = self.wide_unit(source, length, options.string_limit)?;
+            if unit > 255 {
+                return Err(Kind::Libc(86).into());
+            }
+            self.buffer
+                .memory()
+                .store(address + length as u64, unit.into(), 1)?;
+            if unit == 0 {
+                break;
+            }
+            length += 1;
+        }
+        self.buffer.memory().store(address + length as u64, 0, 1)?;
+        Ok(Vector::Guest { address, length })
     }
     fn gp(&mut self) -> Result<u64, Error> {
         match self.fetch(Class::Gp)? {
@@ -246,130 +379,158 @@ pub fn render(
         buffer,
         cursor: Cursor::new(va, options.argument_limit),
         guard: &mut guard,
+        wide: None,
     };
-    while let Some(item) = parser.next(&mut context).map_err(|e| match e {
-        printf_spec::Error::Guest(e) => e,
-        other => fault(format!("Printf parser fault: {other:?}")),
-    })? {
-        let spec = match item {
-            Item::Literal(span) => {
-                print(
-                    &mut output,
-                    context.buffer,
-                    Vector::Guest {
-                        address: span.address,
-                        length: span.len,
-                    },
-                )?;
-                continue;
-            }
-            Item::Conversion(spec) => spec,
-        };
-        if spec.flags.grouping {
-            return Err(fault("Printf locale grouping unsupported"));
-        }
-        if spec.length == Length::LongDouble {
-            return Err(fault("Printf extended80 rendering unsupported"));
-        }
-        if spec.conversion == b'n' {
-            let width = (bits(spec.length)? / 8) as usize;
-            let address = context.gp()?;
-            context.buffer.validate_external_write(address, width)?;
-            (context.guard)(context.buffer.memory(), address, width)?;
-            context
-                .buffer
-                .memory()
-                .store(address, output.total() as u64, width as u64)?;
-            continue; // Source %n bypasses ordinary conversion flush.
-        }
-        let field = if b"diuoxXp".contains(&spec.conversion) {
-            integer(spec, context.gp()?)?
-        } else if b"fFeEgGaA".contains(&spec.conversion) {
-            let FloatPolicy::NumericOnly(rounding) = options.floats else {
-                return Err(fault(
-                    "Printf floating effects require explicit numeric-only policy; target fenv pending",
-                ));
-            };
-            if !matches!(spec.length, Length::Default | Length::Long) {
-                return Err(fault("Printf floating length unsupported"));
-            }
-            let Value::Binary64(bits) = context.fetch(Class::Binary64)? else {
-                unreachable!("requested binary64")
-            };
-            let f = printf_float::format(
-                bits,
-                spec.conversion,
-                spec.precision,
-                spec.flags.alternate,
-                rounding,
-            )
-            .map_err(|e| fault(format!("Printf floating output fault: {e:?}")))?;
-            let sign = if f.suppress_sign {
-                None
-            } else if f.negative {
-                Some(b'-')
-            } else if spec.flags.plus {
-                Some(b'+')
-            } else if spec.flags.space {
-                Some(b' ')
-            } else {
-                None
-            };
-            // Numerical-only path: full dtoa vector segmentation remains an
-            // explicit policy boundary until source pieces are available.
-            Field {
-                prefix: owned(&f.body[..f.prefix_len])?,
-                body: owned(&f.body[f.prefix_len..])?,
-                sign,
-                precision_zeros: 0,
-                zero: spec.flags.zero && !f.special,
-            }
-        } else if matches!(spec.conversion, b'c' | b's' | b'%') {
-            if spec.length != Length::Default {
-                return Err(fault("Printf wide or modified text conversion unsupported"));
-            }
-            let body = match spec.conversion {
-                b'%' => owned(b"%")?,
-                b'c' => owned(&[context.gp()? as u8])?,
-                _ => {
-                    let address = context.gp()?;
-                    if address == 0 {
-                        owned(&b"(null)"[..spec.precision.unwrap_or(6).min(6)])?
-                    } else {
-                        let maximum = spec
-                            .precision
-                            .unwrap_or(options.string_limit)
-                            .min(options.string_limit);
-                        let mut length = 0;
-                        while length < maximum {
-                            let at = address
-                                .checked_add(length as u64)
-                                .ok_or_else(|| fault("Printf string address overflow"))?;
-                            if context.read_byte(at)? == 0 {
-                                break;
-                            }
-                            length += 1;
-                        }
-                        if length == maximum && spec.precision.is_none_or(|p| p > maximum) {
-                            return Err(fault("Printf string read budget"));
-                        }
-                        Vector::Guest { address, length }
-                    }
+    let result = (|| {
+        while let Some(item) = parser.next(&mut context).map_err(|e| match e {
+            printf_spec::Error::Guest(e) => e,
+            other => fault(format!("Printf parser fault: {other:?}")),
+        })? {
+            let spec = match item {
+                Item::Literal(span) => {
+                    print(
+                        &mut output,
+                        context.buffer,
+                        Vector::Guest {
+                            address: span.address,
+                            length: span.len,
+                        },
+                    )?;
+                    continue;
                 }
+                Item::Conversion(spec) => spec,
             };
-            Field {
-                body,
-                sign: None,
-                prefix: owned(b"")?,
-                precision_zeros: 0,
-                zero: spec.flags.zero,
+            if spec.flags.grouping {
+                return Err(fault("Printf locale grouping unsupported"));
             }
-        } else {
-            return Err(fault("Printf conversion unsupported in renderer"));
-        };
-        emit(&mut output, context.buffer, spec, field)?;
+            if spec.length == Length::LongDouble {
+                return Err(fault("Printf extended80 rendering unsupported"));
+            }
+            if spec.conversion == b'n' {
+                let width = (bits(spec.length)? / 8) as usize;
+                let address = context.gp()?;
+                context.external_write(address, width)?;
+                context
+                    .buffer
+                    .memory()
+                    .store(address, output.total() as u64, width as u64)?;
+                continue; // Source %n bypasses ordinary conversion flush.
+            }
+            let field = if b"diuoxXp".contains(&spec.conversion) {
+                integer(spec, context.gp()?)?
+            } else if b"fFeEgGaA".contains(&spec.conversion) {
+                let FloatPolicy::NumericOnly(rounding) = options.floats else {
+                    return Err(fault(
+                        "Printf floating effects require explicit numeric-only policy; target fenv pending",
+                    ));
+                };
+                if !matches!(spec.length, Length::Default | Length::Long) {
+                    return Err(fault("Printf floating length unsupported"));
+                }
+                let Value::Binary64(bits) = context.fetch(Class::Binary64)? else {
+                    unreachable!("requested binary64")
+                };
+                let f = printf_float::format(
+                    bits,
+                    spec.conversion,
+                    spec.precision,
+                    spec.flags.alternate,
+                    rounding,
+                )
+                .map_err(|e| fault(format!("Printf floating output fault: {e:?}")))?;
+                let sign = if f.suppress_sign {
+                    None
+                } else if f.negative {
+                    Some(b'-')
+                } else if spec.flags.plus {
+                    Some(b'+')
+                } else if spec.flags.space {
+                    Some(b' ')
+                } else {
+                    None
+                };
+                // Numerical-only path: full dtoa vector segmentation remains an
+                // explicit policy boundary until source pieces are available.
+                Field {
+                    prefix: owned(&f.body[..f.prefix_len])?,
+                    body: owned(&f.body[f.prefix_len..])?,
+                    sign,
+                    precision_zeros: 0,
+                    zero: spec.flags.zero && !f.special,
+                }
+            } else if matches!(spec.conversion, b'c' | b's' | b'%') {
+                if !matches!(spec.length, Length::Default | Length::Long)
+                    || (spec.conversion == b'%' && spec.length != Length::Default)
+                {
+                    return Err(fault("Printf modified text conversion unsupported"));
+                }
+                let body = match spec.conversion {
+                    b'c' if spec.length == Length::Long => {
+                        let unit = context.gp()? as u16;
+                        if unit > 255 {
+                            return Err(Kind::Libc(86).into());
+                        }
+                        owned(&[unit as u8])?
+                    }
+                    b's' if spec.length == Length::Long => {
+                        // Source releases the preceding wide buffer before fetching
+                        // even a NULL new argument; other conversions retain it.
+                        context.release_wide()?;
+                        let source = context.gp()?;
+                        context.wide_string(source, spec.precision, options)?
+                    }
+                    b'%' => owned(b"%")?,
+                    b'c' => owned(&[context.gp()? as u8])?,
+                    _ => {
+                        let address = context.gp()?;
+                        if address == 0 {
+                            owned(&b"(null)"[..spec.precision.unwrap_or(6).min(6)])?
+                        } else {
+                            let maximum = spec
+                                .precision
+                                .unwrap_or(options.string_limit)
+                                .min(options.string_limit);
+                            let mut length = 0;
+                            while length < maximum {
+                                let at = address
+                                    .checked_add(length as u64)
+                                    .ok_or_else(|| fault("Printf string address overflow"))?;
+                                if context.read_byte(at)? == 0 {
+                                    break;
+                                }
+                                length += 1;
+                            }
+                            if length == maximum && spec.precision.is_none_or(|p| p > maximum) {
+                                return Err(fault("Printf string read budget"));
+                            }
+                            Vector::Guest { address, length }
+                        }
+                    }
+                };
+                Field {
+                    body,
+                    sign: None,
+                    prefix: owned(b"")?,
+                    precision_zeros: 0,
+                    zero: spec.flags.zero,
+                }
+            } else {
+                return Err(fault("Printf conversion unsupported in renderer"));
+            };
+            emit(&mut output, context.buffer, spec, field)?;
+        }
+        flush(&mut output, context.buffer)
+    })();
+    match context.release_wide() {
+        Ok(()) => result,
+        Err(cleanup) => match result {
+            Ok(()) => Err(cleanup),
+            Err(mut error) => {
+                error.cleanup = cleanup.cleanup;
+                Err(error)
+            }
+        },
     }
-    flush(&mut output, context.buffer)
 }
 
 #[cfg(test)]
@@ -506,8 +667,8 @@ mod tests {
         assert_eq!(owner.bytes_allocated(), 0);
     }
     #[test]
-    fn float_effects_and_wide_formats_are_explicit_boundaries() {
-        for format in [b"%f\0".as_slice(), b"%ls\0", b"%Lf\0", b"%1$d\0", b"%'d\0"] {
+    fn float_effects_and_other_unfinished_formats_are_explicit_boundaries() {
+        for format in [b"%f\0".as_slice(), b"%Lf\0", b"%1$d\0", b"%'d\0"] {
             let mut data = setup(format, &[DATA], &[1.0f64.to_bits()]);
             let mut owner = OwnedMappings::default();
             let mut m = Memory::default();
@@ -588,5 +749,182 @@ mod tests {
             drop(m);
             assert_eq!(owner.bytes_allocated(), 0);
         }
+    }
+    #[test]
+    fn wide_character_low16_policy_covers_all_c_bytes() {
+        for unit in 0..=255u64 {
+            let mut data = setup(b"%lc\0", &[0xdead_beef_0000 | unit], &[]);
+            let mut owner = OwnedMappings::default();
+            let mut m = Memory::default();
+            m.add(SLOT, &mut data, true, false).unwrap();
+            m.attach_owned(&mut owner).unwrap();
+            assert_eq!(
+                printf_buffer::run(&mut m, SLOT, 100, guard, |b| render(
+                    b,
+                    FMT,
+                    VA,
+                    Options::default(),
+                    guard
+                ))
+                .unwrap(),
+                1
+            );
+            let p = m.load(SLOT, 8).unwrap();
+            assert_eq!(m.read(p, 2).unwrap(), [unit as u8, 0]);
+            m.free(p).unwrap();
+            drop(m);
+            assert_eq!(owner.bytes_allocated(), 0);
+        }
+        let mut data = setup(b"%lc\0", &[256], &[]);
+        let mut owner = OwnedMappings::default();
+        let mut m = Memory::default();
+        m.add(SLOT, &mut data, true, false).unwrap();
+        m.attach_owned(&mut owner).unwrap();
+        let e = printf_buffer::run(&mut m, SLOT, 100, guard, |b| {
+            render(b, FMT, VA, Options::default(), guard)
+        })
+        .unwrap_err();
+        assert_eq!(e.kind, Kind::Libc(86));
+        assert_eq!(m.load(VA, 4).unwrap(), 8);
+        drop(m);
+        assert_eq!(owner.bytes_allocated(), 0);
+    }
+    #[test]
+    fn wide_small_precision_zero_work_null_and_repeated_temporary_cleanup() {
+        let mut data = setup(
+            b"%.0ls|%.127ls|%.3ls|%ls\0",
+            &[u64::MAX, DATA, 0, DATA],
+            &[],
+        );
+        data[0x500..0x508].copy_from_slice(&[65, 0, 255, 0, 0, 0, 0, 1]);
+        let mut owner = OwnedMappings::default();
+        let mut m = Memory::default();
+        m.add(SLOT, &mut data, true, false).unwrap();
+        m.attach_owned(&mut owner).unwrap();
+        let n = printf_buffer::run(&mut m, SLOT, 100, guard, |b| {
+            render(b, FMT, VA, Options::default(), guard)
+        })
+        .unwrap();
+        let p = m.load(SLOT, 8).unwrap();
+        assert_eq!(m.read(p, n as usize + 1).unwrap(), b"|A\xff|(nu|A\xff\0");
+        m.free(p).unwrap();
+        drop(m);
+        assert_eq!(owner.bytes_allocated(), 0);
+    }
+    #[test]
+    fn wide_large_sizing_can_set_errno_then_succeed_on_prefix() {
+        for units in [[0u16, 256], [65u16, 256]] {
+            let mut data = setup(b"%.128ls\0", &[DATA], &[]);
+            for (i, unit) in units.into_iter().enumerate() {
+                data[0x500 + i * 2..0x502 + i * 2].copy_from_slice(&unit.to_le_bytes());
+            }
+            let mut owner = OwnedMappings::default();
+            let mut m = Memory::default();
+            m.add(SLOT, &mut data, true, false).unwrap();
+            m.attach_owned(&mut owner).unwrap();
+            m.store(SLOT + 8, 99, 4).unwrap();
+            let options = Options {
+                errno_address: Some(SLOT + 8),
+                ..Options::default()
+            };
+            let n = printf_buffer::run(&mut m, SLOT, 100, guard, |b| {
+                render(b, FMT, VA, options, guard)
+            })
+            .unwrap();
+            assert_eq!(n, i32::from(units[0] != 0));
+            assert_eq!(m.load(SLOT + 8, 4).unwrap(), 86);
+            let p = m.load(SLOT, 8).unwrap();
+            if n != 0 {
+                assert_eq!(m.load(p, 1).unwrap(), 65);
+            }
+            assert_eq!(m.load(p + n as u64, 1).unwrap(), 0);
+            m.free(p).unwrap();
+            drop(m);
+            assert_eq!(owner.bytes_allocated(), 0);
+        }
+    }
+    #[test]
+    fn wide_sizing_beyond_nul_and_capacity_check_order_are_observable() {
+        let mut data = setup(b"%.128ls\0", &[DATA], &[]);
+        data[0x500..0x600].fill(0);
+        data[0x600..0x602].copy_from_slice(&256u16.to_le_bytes());
+        let mut owner = OwnedMappings::default();
+        let mut m = Memory::default();
+        m.add(SLOT, &mut data, true, false).unwrap();
+        m.attach_owned(&mut owner).unwrap();
+        let options = Options {
+            errno_address: Some(SLOT + 8),
+            ..Options::default()
+        };
+        assert_eq!(
+            printf_buffer::run(&mut m, SLOT, 100, guard, |b| render(
+                b, FMT, VA, options, guard
+            ))
+            .unwrap(),
+            0
+        );
+        assert_eq!(m.load(SLOT + 8, 4).unwrap(), 86);
+        let p = m.load(SLOT, 8).unwrap();
+        m.free(p).unwrap();
+        // Source accesses unit129 even with precision128. A bounded slice ending
+        // immediately after a NUL therefore faults in the large sizing branch.
+        drop(m);
+        let mut data = setup(b"%.128ls\0", &[0x9000], &[]);
+        let mut terminator = [0u8; 2];
+        let mut m = Memory::default();
+        m.add(SLOT, &mut data, true, false).unwrap();
+        m.add(0x9000, &mut terminator, false, false).unwrap();
+        m.attach_owned(&mut owner).unwrap();
+        let e = printf_buffer::run(&mut m, SLOT, 100, guard, |b| {
+            render(b, FMT, VA, Options::default(), guard)
+        })
+        .unwrap_err();
+        assert!(matches!(e.kind, Kind::Runtime(_)));
+        drop(m);
+        assert_eq!(owner.bytes_allocated(), 0);
+    }
+    #[test]
+    fn wide_copy_encoding_failure_and_success_errno_guard_are_distinct() {
+        for format in [b"%ls\0".as_slice(), b"%.2ls\0"] {
+            let mut data = setup(format, &[DATA], &[]);
+            data[0x500..0x504].copy_from_slice(&[65, 0, 0, 1]);
+            let mut owner = OwnedMappings::default();
+            let mut m = Memory::default();
+            m.add(SLOT, &mut data, true, false).unwrap();
+            m.attach_owned(&mut owner).unwrap();
+            let e = printf_buffer::run(&mut m, SLOT, 100, guard, |b| {
+                render(b, FMT, VA, Options::default(), guard)
+            })
+            .unwrap_err();
+            assert_eq!(e.kind, Kind::Libc(86));
+            drop(m);
+            assert_eq!(owner.bytes_allocated(), 0);
+        }
+        let mut data = setup(b"%.128ls\0", &[DATA], &[]);
+        data[0x500..0x502].copy_from_slice(&256u16.to_le_bytes());
+        let mut owner = OwnedMappings::default();
+        let mut m = Memory::default();
+        m.add(SLOT, &mut data, true, false).unwrap();
+        m.attach_owned(&mut owner).unwrap();
+        m.store(SLOT + 8, 99, 4).unwrap();
+        let options = Options {
+            errno_address: Some(SLOT + 8),
+            ..Options::default()
+        };
+        let e = printf_buffer::run(&mut m, SLOT, 100, guard, |b| {
+            render(b, FMT, VA, options, |_, address, _| {
+                if address == SLOT + 8 {
+                    Err("protected errno".into())
+                } else {
+                    Ok(())
+                }
+            })
+        })
+        .unwrap_err();
+        assert!(matches!(e.kind, Kind::Runtime(_)));
+        assert_eq!(m.load(SLOT + 8, 4).unwrap(), 99);
+        assert_eq!(m.load(SLOT, 8).unwrap(), 0);
+        drop(m);
+        assert_eq!(owner.bytes_allocated(), 0);
     }
 }
