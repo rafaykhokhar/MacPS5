@@ -48,6 +48,7 @@ mod abort_native;
 mod movdqu_native;
 mod vasprintf_native;
 mod vasprintf_hex_native;
+mod printf_stdout_native;
 mod strcoll_native;
 mod strxfrm_native;
 mod wcscoll_native;
@@ -140,6 +141,7 @@ fn main() -> Result<(), String> {
         movdqu_native::verify(Path::new(&archive), &Path::new(&directory).join("movdqu"))?;
         vasprintf_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("vasprintf"))?;
         vasprintf_hex_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("vasprintf-hex"))?;
+        printf_stdout_native::verify(Path::new(&archive), &Path::new(&directory).join("printf-stdout"))?;
         strcoll_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strcoll"))?;
         strxfrm_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strxfrm"))?;
         wcscoll_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("wcscoll"))?;
@@ -565,6 +567,8 @@ fn main() -> Result<(), String> {
         ("__swbuf", Service::Swbuf),
         ("fputc", Service::Fputc),
         ("putchar", Service::Putchar),
+        ("printf", Service::Printf),
+        ("vprintf", Service::Vprintf),
     ]
     .into_iter()
     .enumerate()
@@ -1529,6 +1533,10 @@ fn main() -> Result<(), String> {
                 (1136, "mbtowc"),
                 (1144, "__mb_cur_max"),
                 (1152, "strtok_r"),
+                (1160, "printf"),
+                (1168, "__stdoutp"),
+                (1176, "putc"),
+                (1184, "__swbuf"),
             ] {
                 let expected = libc_exports.iter().find(|(symbol, _)| *symbol == name)
                     .ok_or("Missing registered libc service")?.1;
@@ -1557,13 +1565,12 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 152 libc exports: (152+1)*24=3672 symbol bytes (rounded3680)
-                // and 1+152*12=1825 NID bytes (rounded1840).
-                // Five stdout exports add192bytes to19664; printf is still missing.
-                || native.bytes_allocated() != 19856
+                // 154 libc exports: 155*24=3720 symbol bytes (rounded3728)
+                // and 1+154*12=1849 NID bytes (rounded1856).
+                || native.bytes_allocated() != 19920
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve 'printf'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'vfprintf'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1573,7 +1580,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; strtok_r import bound; unresolved printf causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; printf/stdout/putc/swbuf imports bound; unresolved vfprintf causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1635,7 +1642,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved printf triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved vfprintf triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     if let Some(result) = presentation_result {

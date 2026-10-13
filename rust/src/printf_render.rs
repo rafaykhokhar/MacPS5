@@ -509,6 +509,25 @@ pub(crate) fn render_target<'a>(
     format: u64,
     va: u64,
     options: Options,
+    hex: Option<HexContext<'_>>,
+    guard: impl FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>,
+) -> Result<usize, Error> {
+    render_target_with_cursor(
+        buffer,
+        format,
+        Cursor::new(va, options.argument_limit),
+        options,
+        hex,
+        guard,
+    )
+}
+/// The supplied cursor owns its argument budget. Direct-call cursors keep ABI
+/// bookkeeping outside guest address space; va_list cursors retain guest writes.
+pub(crate) fn render_target_with_cursor<'a>(
+    buffer: &mut impl Target<'a>,
+    format: u64,
+    cursor: Cursor,
+    options: Options,
     mut hex: Option<HexContext<'_>>,
     mut guard: impl FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>,
 ) -> Result<usize, Error> {
@@ -522,7 +541,7 @@ pub(crate) fn render_target<'a>(
     let mut output = Output::new(options.output_limit.min(i32::MAX as usize));
     let mut context = Context {
         buffer,
-        cursor: Cursor::new(va, options.argument_limit),
+        cursor,
         guard: &mut guard,
         wide: None,
         gdtoa_ranges: initial_ranges,

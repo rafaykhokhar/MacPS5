@@ -1,5 +1,38 @@
 # Stdout integration gaps
 
+## Native printf and vprintf services
+
+The executor now connects `Printf` and `Vprintf` to the stream renderer and owned
+stdout. Direct printf arguments use host-owned state: five GP values, eight
+binary64 register values, and live overflow-stack reads. No synthetic guest
+descriptor or argument allocation is introduced. Nonzero valid AL enables the
+saved vector slots; AL0 floating-register reads and AL greater than8 are explicit
+ABI diagnostics. Caller-owned vprintf descriptors retain their existing writes.
+
+FILE byte orientation is established before rendering, including empty formats.
+Formatting cannot overwrite the active FILE, pointer cell, or live return frame.
+Capture-policy faults remain runtime diagnostics; buffered tails are discarded
+on render failure while already emitted chunks remain observable.
+
+The matching build passes 550 library tests, three integration tests, strict
+all-target Clippy, and release compilation (`work/printf-call-{tests,clippy,release}.log`).
+Native checks pass GP/FP register and stack arguments, caller cursor updates,
+count/alias effects, empty orientation, protected writes, redirection rejection,
+and partial-output failures (`work/printf-stdout-native/native.log`,15710 exit0).
+Existing native integer/wide and hex vasprintf regressions also pass
+(`work/printf-call-vasprintf-regression.log`,34554 exit0).
+
+The supported profile remains bounded C integer/text/wchar16 and binary64 hex
+formatting. Decimal/extended formatting, positional arguments, grouping, general
+streams, and FILE locking remain incomplete. These checks do not establish game
+compatibility or complete libc behavior.
+
+Startup-only verification now binds printf, __stdoutp, putc and __swbuf and stops
+at missing `vfprintf`, retaining 19,920 dependency bytes
+(`work/arm64-prototype/printf-call-entry.log`,37381 exit0). Vprintf is exported
+and component-tested but occurs after that unresolved import. Binding does not
+prove guest calls ran during startup; game main and exit cleanup remain pending.
+
 ## Registered stream rendering adapter
 
 `printf_stream::run` connects the typed renderer to the fixed temporary buffer.
@@ -12,9 +45,8 @@ does not invent errno. The caller still owns FILE preparation and error flags.
 The integrated debug suite passes 544 library tests and three integration tests
 (`work/printf-stream-integrated-tests.log`). Five adapter tests cover deferred
 aliases, buffer boundaries, partial failures, and wide/hex temporary cleanup.
-This registration does not enable guest `printf` or `vprintf`: their executor
-dispatch, FILE transitions, and native ABI checks remain to be connected.
-The existing release archive predates this adapter registration.
+At that registration checkpoint guest dispatch remained unconnected; the newer
+native service checkpoint above supersedes that limitation and release build.
 
 ## Rendering target and fixed temporary buffer
 
@@ -85,9 +117,9 @@ or new Metal presentation result is established by this checkpoint.
 
 ## Remaining formatted-stream integration
 
-Startup currently encounters the missing `printf` import. Existing captured
-stdout and stderr-only formatting do not yet provide the complete stdout FILE
-ABI needed by the pinned executable.
+Startup now encounters missing `vfprintf`. The printf/vprintf checkpoint above
+does not yet connect general FILE arguments; stderr-only legacy Fprintf also
+still needs migration to the typed argument/stream machinery.
 
 The `__stdoutp` import at GOT `0x26fb30` is a pointer cell containing a guest
 FILE address. `I_PrintBanner` performs the extra dereference at `0x1174b1`, then

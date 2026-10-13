@@ -358,6 +358,58 @@ fn stdout_flush(model: &crate::stdout_file::StdoutFile, memory: &Memory<'_>) -> 
     model.validate_flush(&file, &pointer).map_err(|e| format!("Stdout flush: {e:?}"))
 }
 #[allow(clippy::too_many_arguments)]
+fn printf_stdout_service(
+    model: &mut crate::stdout_file::StdoutFile,
+    capture: &mut crate::captured_stdout::CapturedStdout,
+    memory: &mut Memory<'_>,
+    format: u64,
+    cursor: crate::printf_args::Cursor,
+    errno: Option<u64>,
+    sp: u64,
+    ret: u64,
+    hex: crate::printf_render::HexContext<'_>,
+) -> Result<u64> {
+    let (file, pointer) = stdout_snapshot(memory)?;
+    let plan = model.prepare_bulk(&file, &pointer, 0, crate::stdout_file::Delivery::Success)
+        .map_err(|e| format!("Printf stdout preparation: {e:?}"))?;
+    // Establish byte orientation even for empty output or later format failure.
+    stdout_commit(model, capture, memory, &pointer, plan, &[], sp, ret)?;
+    let guard = |memory: &Memory<'_>, address: u64, length: usize| {
+        validate_net_output(memory, address, length, sp, ret)?;
+        let end = address.checked_add(length as u64).ok_or("Printf output overflow")?;
+        for (base, size) in [(crate::stdout_file::FILE_ADDR, crate::stdout_file::FILE_SIZE),
+                             (crate::stdout_file::STDOUT_PTR_ADDR, 8)] {
+            if address < base + size as u64 && base < end {
+                return Err("Printf write aliases active stdout state".into());
+            }
+        }
+        Ok(())
+    };
+    let result = crate::printf_stream::run_with_cursor(
+        memory, format, cursor,
+        crate::printf_render::Options { errno_address: errno, ..Default::default() },
+        Some(hex), guard,
+        |bytes| {
+            capture.write_bytes(bytes).map_err(crate::printf_stream::WriteError::Policy)?;
+            Ok(bytes.len())
+        },
+    );
+    match result {
+        Ok(count) => Ok(count as u64),
+        Err(error) => {
+            if error.cleanup.is_none() && error.output_cleanup.is_none() {
+                if let crate::printf_buffer::Kind::Allocation(code) | crate::printf_buffer::Kind::Libc(code) = error.kind {
+                    let errno = errno.ok_or("Missing printf failure errno context")?;
+                    guard(memory, errno, 4)?;
+                    memory.store(errno, code.into(), 4)?;
+                    return Ok(u32::MAX.into());
+                }
+            }
+            Err(format!("Guest printf fault: {error:?}"))
+        }
+    }
+}
+#[allow(clippy::too_many_arguments)]
 fn stdout_commit(
     model: &mut crate::stdout_file::StdoutFile,
     capture: &mut crate::captured_stdout::CapturedStdout,
@@ -1087,6 +1139,8 @@ pub enum Service {
     Snprintf,
     Vsnprintf,
     Vasprintf,
+    Printf,
+    Vprintf,
     Errno,
     Getpid,
     Syscall,
@@ -1317,6 +1371,8 @@ impl Service {
             | Self::Snprintf
             | Self::Vsnprintf
             | Self::Vasprintf
+            | Self::Printf
+            | Self::Vprintf
             | Self::Strcoll
             | Self::Strxfrm
             | Self::Wcsxfrm
@@ -2483,7 +2539,7 @@ impl NativeExecutor {
                 writable: region.writable,
             })
             .collect::<Vec<_>>();
-        if self.services.values().any(|service| matches!(service, Service::Vasprintf)) {
+        if self.services.values().any(|service| matches!(service, Service::Vasprintf | Service::Printf | Service::Vprintf)) {
             let (pool, _) = self.gdtoa.split_mut();
             mapped_data.push(DataRegion { address: GDTOA_POOL, bytes: pool, writable: false });
         }
@@ -3589,7 +3645,7 @@ impl NativeExecutor {
             memory.add(region.address, region.bytes, region.writable, false)?;
         }
         memory.attach_owned(&mut self.allocations)?;
-        if self.services.values().any(|service| matches!(service, Service::Vasprintf)) {
+        if self.services.values().any(|service| matches!(service, Service::Vasprintf | Service::Printf | Service::Vprintf)) {
             memory.add_runtime_data(GDTOA_POOL, gdtoa_pool, gdtoa_state.runtime_owner())?;
         }
 
@@ -5176,6 +5232,23 @@ impl NativeExecutor {
                             self.kernel.as_ref().map(|kernel| kernel.errno_address()),
                             sp,
                             ret,
+                        )?
+                    } else if matches!(service, Service::Printf | Service::Vprintf) {
+                        let cursor = if matches!(service, Service::Vprintf) {
+                            crate::printf_args::Cursor::new(cpu.registers[6], 4096)
+                        } else {
+                            let gp = [cpu.registers[6], cpu.registers[2], cpu.registers[1], cpu.registers[8], cpu.registers[9]];
+                            let fp = std::array::from_fn(|i| u64::from_le_bytes(cpu.vectors[i][..8].try_into().unwrap()));
+                            crate::printf_args::Cursor::from_call(gp, fp, cpu.registers[0] as u8,
+                                sp.checked_add(8).ok_or("Printf stack argument overflow")?, 4096)
+                                .map_err(|e| format!("Printf call ABI: {e:?}"))?
+                        };
+                        let mut retained = crate::guest_gdtoa::Retained::default();
+                        printf_stdout_service(
+                            &mut self.stdout_file, &mut self.stdout, &mut memory,
+                            cpu.registers[7], cursor,
+                            self.kernel.as_ref().map(|kernel| kernel.errno_address()), sp, ret,
+                            crate::printf_render::HexContext { state: gdtoa_state, retained: &mut retained, mxcsr: &mut cpu.mxcsr },
                         )?
                     } else if matches!(service, Service::Vasprintf) {
                         let mut retained = crate::guest_gdtoa::Retained::default();

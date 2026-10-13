@@ -33,6 +33,7 @@ pub enum Malformed {
     FpOffset,
     StackAlignment,
     AddressOverflow,
+    VectorCount,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error<E> {
@@ -41,6 +42,8 @@ pub enum Error<E> {
     Guard(E),
     Malformed(Malformed),
     UnsupportedDescriptorAlias,
+    /// AL was zero: the direct-call prologue did not save SIMD registers.
+    UnavailableVectorRegisters,
     Budget,
 }
 /// Adapter reads and writes an entire requested span or fails. A failing write
@@ -55,22 +58,108 @@ pub trait Memory {
 }
 #[derive(Debug)]
 pub struct Cursor {
-    descriptor: u64,
+    source: Source,
     remaining: usize,
+}
+#[derive(Debug)]
+enum Source {
+    Guest(u64),
+    Direct(Direct),
+}
+#[derive(Debug)]
+struct Direct {
+    gp: [u64; 5],
+    fp: [u64; 8],
+    gp_index: usize,
+    fp_index: usize,
+    vectors_saved: bool,
+    overflow: u64,
+}
+impl Direct {
+    fn fetch<M: Memory>(&mut self, memory: &M, class: Class) -> Result<Value, Error<M::Error>> {
+        match class {
+            Class::Gp if self.gp_index < self.gp.len() => {
+                let value = self.gp[self.gp_index];
+                self.gp_index += 1;
+                return Ok(Value::Gp(value));
+            }
+            Class::Binary64 if self.fp_index < self.fp.len() => {
+                if !self.vectors_saved {
+                    return Err(Error::UnavailableVectorRegisters);
+                }
+                let value = self.fp[self.fp_index];
+                self.fp_index += 1;
+                return Ok(Value::Binary64(value));
+            }
+            _ => (),
+        }
+        if self.overflow & 7 != 0 {
+            return Err(Error::Malformed(Malformed::StackAlignment));
+        }
+        let source = if class == Class::Extended80 {
+            add(self.overflow, 15)? & !15
+        } else {
+            self.overflow
+        };
+        let next = add(source, if class == Class::Extended80 { 16 } else { 8 })?;
+        let value = match class {
+            Class::Gp => Value::Gp(u64::from_le_bytes(read::<8, M>(memory, source)?)),
+            Class::Binary64 => Value::Binary64(u64::from_le_bytes(read::<8, M>(memory, source)?)),
+            Class::Extended80 => Value::Extended80(read::<10, M>(memory, source)?),
+        };
+        // No host cursor state changes until the complete requested guest value
+        // has been read successfully. No guest descriptor exists to write/guard.
+        self.overflow = next;
+        Ok(value)
+    }
 }
 impl Cursor {
     /// No descriptor access occurs until an argument is actually requested.
     pub fn new(descriptor: u64, argument_budget: usize) -> Self {
         Self {
-            descriptor,
+            source: Source::Guest(descriptor),
             remaining: argument_budget,
         }
+    }
+    /// Owned argument snapshot for printf(format, ...). GP values are RSI,
+    /// RDX, RCX, R8, R9; FP values are the low binary64 bits of XMM0..XMM7.
+    /// overflow is the checked service-entry RSP+8, not the pre-call RSP+8.
+    /// SysV AL is an upper bound in 0..=8, not an exact saved-register count:
+    /// the ordinary prologue saves all eight XMM slots whenever AL is nonzero.
+    /// Zero AL leaves FP slots unavailable; do not fabricate deterministic zeros
+    /// for an invalid call that subsequently requests a register FP argument.
+    /// No guest heap, scratch mapping, descriptor writes, or FP arithmetic.
+    pub fn from_call(
+        gp: [u64; 5],
+        fp: [u64; 8],
+        al: u8,
+        overflow: u64,
+        argument_budget: usize,
+    ) -> Result<Self, Malformed> {
+        if al > 8 {
+            return Err(Malformed::VectorCount);
+        }
+        Ok(Self {
+            source: Source::Direct(Direct {
+                gp,
+                fp,
+                gp_index: 0,
+                fp_index: 0,
+                vectors_saved: al != 0,
+                overflow,
+            }),
+            remaining: argument_budget,
+        })
     }
     pub fn remaining(&self) -> usize {
         self.remaining
     }
-    pub fn descriptor(&self) -> u64 {
-        self.descriptor
+    /// Direct-call snapshots have no guest-visible descriptor address.
+    pub fn descriptor(&self) -> Option<u64> {
+        match self.source {
+            Source::Guest(address) => Some(address),
+            Source::Direct(_) => None,
+        }
     }
 
     /// Failed preflight/read/write leaves the descriptor and budget unchanged.
@@ -85,13 +174,21 @@ impl Cursor {
         if self.remaining == 0 {
             return Err(Error::Budget);
         }
-        let descriptor_end = add(self.descriptor, 24)?;
+        let descriptor = match &mut self.source {
+            Source::Guest(address) => *address,
+            Source::Direct(arguments) => {
+                let value = arguments.fetch(memory, class)?;
+                self.remaining -= 1;
+                return Ok(value);
+            }
+        };
+        let descriptor_end = add(descriptor, 24)?;
         let (source, field, next, width) = match class {
             Class::Gp | Class::Binary64 => {
                 let (offset_at, limit, step) = if class == Class::Gp {
-                    (self.descriptor, 48u32, 8u32)
+                    (descriptor, 48u32, 8u32)
                 } else {
-                    (add(self.descriptor, 4)?, 176, 16)
+                    (add(descriptor, 4)?, 176, 16)
                 };
                 let offset = u32::from_le_bytes(read::<4, M>(memory, offset_at)?);
                 if class == Class::Gp && (offset > 48 || offset % 8 != 0) {
@@ -103,7 +200,7 @@ impl Cursor {
                     return Err(Error::Malformed(Malformed::FpOffset));
                 }
                 if offset < limit {
-                    let save = u64::from_le_bytes(read::<8, M>(memory, add(self.descriptor, 16)?)?);
+                    let save = u64::from_le_bytes(read::<8, M>(memory, add(descriptor, 16)?)?);
                     (
                         add(save, offset.into())?,
                         offset_at,
@@ -111,14 +208,14 @@ impl Cursor {
                         4,
                     )
                 } else {
-                    self.stack(memory, false)?
+                    Self::stack(descriptor, memory, false)?
                 }
             }
-            Class::Extended80 => self.stack(memory, true)?,
+            Class::Extended80 => Self::stack(descriptor, memory, true)?,
         };
         let length = if class == Class::Extended80 { 10 } else { 8 };
         let source_end = add(source, length)?;
-        if source < descriptor_end && self.descriptor < source_end {
+        if source < descriptor_end && descriptor < source_end {
             return Err(Error::UnsupportedDescriptorAlias);
         }
         memory.validate_write(field, width).map_err(Error::Write)?;
@@ -137,11 +234,11 @@ impl Cursor {
         Ok(value)
     }
     fn stack<M: Memory>(
-        &self,
+        descriptor: u64,
         memory: &M,
         extended: bool,
     ) -> Result<(u64, u64, u64, usize), Error<M::Error>> {
-        let field = add(self.descriptor, 8)?;
+        let field = add(descriptor, 8)?;
         let stack = u64::from_le_bytes(read::<8, M>(memory, field)?);
         if stack % 8 != 0 {
             return Err(Error::Malformed(Malformed::StackAlignment));
@@ -267,6 +364,150 @@ mod tests {
     }
     fn fetch(c: &mut Cursor, m: &mut Mem, class: Class) -> Result<Value, Error<&'static str>> {
         c.fetch(m, class, |_, _, _| Ok(()))
+    }
+    #[test]
+    fn direct_register_classes_share_only_the_overflow_cursor_and_never_write_guest() {
+        let mut m = memory();
+        m.readonly = Some((0, m.bytes.len()));
+        m.fail_write = true;
+        let before = m.bytes.clone();
+        let gp = [u64::MAX, 0, 0x8000_0000_0000_0000, 17, 99];
+        let fp = std::array::from_fn(|i| 0x7ff0_0000_0000_0001 + i as u64);
+        let mut c = Cursor::from_call(gp, fp, 1, STACK, 15).unwrap();
+        assert_eq!(c.descriptor(), None);
+        assert_eq!(Cursor::new(VA, 1).descriptor(), Some(VA));
+        for i in 0..8 {
+            assert_eq!(
+                c.fetch(&mut m, Class::Binary64, |_, _, _| panic!(
+                    "no guest descriptor"
+                )),
+                Ok(Value::Binary64(fp[i]))
+            );
+            if i < 5 {
+                assert_eq!(
+                    c.fetch(&mut m, Class::Gp, |_, _, _| panic!("no guest descriptor")),
+                    Ok(Value::Gp(gp[i]))
+                );
+            }
+        }
+        assert!(m.trace.borrow().is_empty());
+        assert_eq!(
+            fetch(&mut c, &mut m, Class::Gp),
+            Ok(Value::Gp(0x7ff0_0000_0000_0001))
+        );
+        m.put(STACK + 8, &77u64.to_le_bytes()); // later stack reads stay live
+        assert_eq!(
+            fetch(&mut c, &mut m, Class::Binary64),
+            Ok(Value::Binary64(77))
+        );
+        assert_eq!(c.remaining(), 0);
+        assert_eq!(*m.trace.borrow(), [('r', STACK, 8), ('r', STACK + 8, 8)]);
+        m.put(
+            STACK + 8,
+            &before[(STACK + 8) as usize..(STACK + 16) as usize],
+        );
+        assert_eq!(m.bytes, before);
+        assert_eq!(fetch(&mut c, &mut m, Class::Gp), Err(Error::Budget));
+    }
+    #[test]
+    fn direct_al_is_a_save_gate_not_an_exact_register_count() {
+        for al in 1..=8 {
+            let mut c = Cursor::from_call([0; 5], [u64::MAX; 8], al, u64::MAX, 8).unwrap();
+            let mut m = memory();
+            for _ in 0..8 {
+                assert_eq!(
+                    fetch(&mut c, &mut m, Class::Binary64),
+                    Ok(Value::Binary64(u64::MAX))
+                );
+            }
+            assert!(m.trace.borrow().is_empty());
+        }
+        for al in 9..=255 {
+            assert!(matches!(
+                Cursor::from_call([0; 5], [0; 8], al, 0, 0),
+                Err(Malformed::VectorCount)
+            ));
+        }
+        let mut c = Cursor::from_call([11, 22, 33, 44, 55], [123; 8], 0, STACK, 3).unwrap();
+        let mut m = memory();
+        assert_eq!(fetch(&mut c, &mut m, Class::Gp), Ok(Value::Gp(11)));
+        assert_eq!(
+            fetch(&mut c, &mut m, Class::Binary64),
+            Err(Error::UnavailableVectorRegisters)
+        );
+        assert_eq!(c.remaining(), 2);
+        assert_eq!(fetch(&mut c, &mut m, Class::Gp), Ok(Value::Gp(22)));
+        assert!(m.trace.borrow().is_empty());
+    }
+    #[test]
+    fn direct_stack_read_failure_is_retryable_without_cursor_or_budget_advance() {
+        let mut c = Cursor::from_call([0; 5], [0; 8], 0, STACK, 7).unwrap();
+        let mut m = memory();
+        for _ in 0..5 {
+            fetch(&mut c, &mut m, Class::Gp).unwrap();
+        }
+        m.denied_read = Some((STACK + 7, 1));
+        assert_eq!(fetch(&mut c, &mut m, Class::Gp), Err(Error::Read("read")));
+        assert_eq!(c.remaining(), 2);
+        m.denied_read = None;
+        assert_eq!(
+            fetch(&mut c, &mut m, Class::Gp),
+            Ok(Value::Gp(0x7ff0_0000_0000_0001))
+        );
+        assert_eq!(
+            fetch(&mut c, &mut m, Class::Gp),
+            Ok(Value::Gp(0xaabb_ccdd_eeff_0011))
+        );
+        assert_eq!(c.remaining(), 0);
+        assert_eq!(
+            *m.trace.borrow(),
+            [('r', STACK, 8), ('r', STACK, 8), ('r', STACK + 8, 8)]
+        );
+    }
+    #[test]
+    fn direct_extended_payload_alignment_ignores_padding_and_preserves_register_slots() {
+        let mut m = memory();
+        let payload = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        m.put(416, &payload);
+        m.put(432, &1234u64.to_le_bytes());
+        m.denied_read = Some((426, 6));
+        let mut c = Cursor::from_call([7; 5], [8; 8], 1, 408, 15).unwrap();
+        assert_eq!(
+            fetch(&mut c, &mut m, Class::Extended80),
+            Ok(Value::Extended80(payload))
+        );
+        for _ in 0..5 {
+            assert_eq!(fetch(&mut c, &mut m, Class::Gp), Ok(Value::Gp(7)));
+        }
+        for _ in 0..8 {
+            assert_eq!(
+                fetch(&mut c, &mut m, Class::Binary64),
+                Ok(Value::Binary64(8))
+            );
+        }
+        assert_eq!(
+            fetch(&mut c, &mut m, Class::Binary64),
+            Ok(Value::Binary64(1234))
+        );
+        assert_eq!(*m.trace.borrow(), [('r', 416, 10), ('r', 432, 8)]);
+    }
+    #[test]
+    fn direct_stack_alignment_overflow_and_budget_fail_before_guest_access() {
+        for (address, class, wanted) in [
+            (401, Class::Extended80, Malformed::StackAlignment),
+            (u64::MAX - 7, Class::Extended80, Malformed::AddressOverflow),
+            (u64::MAX - 15, Class::Extended80, Malformed::AddressOverflow),
+        ] {
+            let mut m = memory();
+            let mut c = Cursor::from_call([0; 5], [0; 8], 0, address, 2).unwrap();
+            assert_eq!(fetch(&mut c, &mut m, class), Err(Error::Malformed(wanted)));
+            assert_eq!(c.remaining(), 2);
+            assert!(m.trace.borrow().is_empty());
+        }
+        let mut m = memory();
+        let mut c = Cursor::from_call([0; 5], [0; 8], 0, u64::MAX, 0).unwrap();
+        assert_eq!(fetch(&mut c, &mut m, Class::Gp), Err(Error::Budget));
+        assert!(m.trace.borrow().is_empty());
     }
     #[test]
     fn mixed_register_classes_and_shared_overflow_are_ordered() {

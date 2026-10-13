@@ -1,4 +1,17 @@
-# Current presentation failure
+# Presentation verification
+
+On 2026-10-13, after the user confirmed the desktop was unlocked, the unchanged
+standalone presentation path passed on Apple M5 Pro (session70872 exit0).
+It presented a host-generated 640×129 RGBA image on attempt1 with finite positive
+`presentedTime=62229.494376625014`; the success path also requires completed
+command status4. Logs: `work/presentation-diagnostics/unlocked-presentation.log`
+and `unlocked-session.log`. The session probe reported onConsole/loginDone true
+and no screenLockedUndocumented key. The success log does not expose callback
+counts. This resolves the focused presentation check, not guest GPU execution,
+gameplay, or the full integrated runner. The lock state is a plausible explanation
+for the earlier failures, not a proven causal diagnosis.
+
+## Earlier failed checks
 
 The mkdir integration runs repeatedly failed to confirm drawable presentation. Startup independently reaches missing `pthread_cond_init`; that does not turn the integrated run into a pass.
 

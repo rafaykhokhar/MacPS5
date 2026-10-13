@@ -87,6 +87,27 @@ pub fn run(
     options: Options,
     hex: Option<HexContext<'_>>,
     guard: impl FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>,
+    backend: impl FnMut(&[u8]) -> Result<usize, WriteError>,
+) -> Result<usize, Error> {
+    run_with_cursor(
+        memory,
+        format,
+        crate::printf_args::Cursor::new(va, options.argument_limit),
+        options,
+        hex,
+        guard,
+        backend,
+    )
+}
+/// Render with explicit argument state. The cursor supplies its own budget;
+/// Options::argument_limit is used only by the va_list convenience entry point.
+pub fn run_with_cursor(
+    memory: &mut Memory<'_>,
+    format: u64,
+    cursor: crate::printf_args::Cursor,
+    options: Options,
+    hex: Option<HexContext<'_>>,
+    guard: impl FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>,
     mut backend: impl FnMut(&[u8]) -> Result<usize, WriteError>,
 ) -> Result<usize, Error> {
     let mut target = StreamTarget {
@@ -94,7 +115,8 @@ pub fn run(
         buffer: StreamBuffer::new(),
         backend: &mut backend,
     };
-    match printf_render::render_target(&mut target, format, va, options, hex, guard) {
+    match printf_render::render_target_with_cursor(&mut target, format, cursor, options, hex, guard)
+    {
         Ok(count) => {
             target.buffer.finish(target.backend).map_err(write_error)?;
             Ok(count)
@@ -131,6 +153,35 @@ mod tests {
     }
     fn guard(_: &Memory<'_>, _: u64, _: usize) -> crate::Result<()> {
         Ok(())
+    }
+    #[test]
+    fn direct_call_uses_register_snapshot_and_live_stack_without_guest_descriptor() {
+        let mut data = setup(b"%u,%u,%u,%u,%u,%u%n\0", &[], &[]);
+        let mut memory = Memory::default();
+        memory.add(BASE, &mut data, true, false).unwrap();
+        memory.store(DATA, 6, 8).unwrap();
+        memory.store(DATA + 8, DATA + 32, 8).unwrap();
+        let before = memory.read(VA, 24).unwrap().to_vec();
+        let cursor =
+            crate::printf_args::Cursor::from_call([1, 2, 3, 4, 5], [0; 8], 0, DATA, 7).unwrap();
+        let mut output = Vec::new();
+        let count = run_with_cursor(
+            &mut memory,
+            FMT,
+            cursor,
+            Options::default(),
+            None,
+            guard,
+            |bytes| {
+                output.extend_from_slice(bytes);
+                Ok(bytes.len())
+            },
+        )
+        .unwrap();
+        assert_eq!(output, b"1,2,3,4,5,6");
+        assert_eq!(count, 11);
+        assert_eq!(memory.load(DATA + 32, 4).unwrap(), 11);
+        assert_eq!(memory.read(VA, 24).unwrap(), before);
     }
     #[test]
     fn count_is_logical_and_count_alias_changes_deferred_text_before_final_flush() {
