@@ -1,5 +1,13 @@
 # Rust migration
 
+VEX VBROADCASTSS/SD now support six scalar register/memory forms through the
+existing bit-copy broadcast path. The matching build passes 672 library tests,
+three integration tests, strict Clippy, 34,632 new native checks and 25,074
+integer-broadcast regression checks. Discovery reaches 57,795 instructions
+with 145 unsupported sites. Startup remains at missing `fscanf`, before game
+main. See [CPU evidence](../docs/status/CPU.md). Production readiness and
+retail gameplay remain unverified.
+
 VEX saturating integer packing now supports eight XMM/YMM forms, with signed
 input interpretation and correct packing within each 128-bit half. The matching
 build passes 671 library tests, three integration tests, strict Clippy and

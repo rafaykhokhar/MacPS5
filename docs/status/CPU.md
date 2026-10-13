@@ -1,5 +1,38 @@
 # CPU completion criteria
 
+## Scalar floating-point broadcasts
+
+VEX VBROADCASTSS (XMM/YMM) and VBROADCASTSD (YMM) now support register and
+memory sources through the existing scalar broadcast path. The six exact
+decoded forms copy the low 32/64 source bits, preserving NaN payloads,
+subnormals, signed zero and infinities without floating-point arithmetic.
+Memory sources read exactly four/eight guarded bytes. Register aliases are
+safe, and XMM results clear the upper half. W1, reserved vvvv, SD128,
+legacy/EVEX and unsupported FS/GS/address32 forms remain rejected.
+
+Reference: AMD APM Volume 4 rev.3.24 pp.599–602
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)).
+Architectural fault delivery remains outside the current guard model.
+
+The matching build passes 672 library tests, three integration tests, strict
+Clippy and release compilation (`work/scalar-broadcast-native/{tests,clippy,release}.log`,
+process 40530 exit 0). The [native verifier](../../rust/verification/scalar_broadcast_native.rs)
+passes 34,632 checks across 27 decoded fixtures, including raw FP special
+values, walking bits/random patterns, unused source poison, aliases/high
+registers, exact readonly high/unaligned/RIP scalar loads, every short span,
+flags/FP/fuel/prior faults. The existing packed integer broadcast verifier
+passes 25,074 regression checks (`work/scalar-broadcast-native/{native,regression}.log`,
+process 8224 exit 0).
+
+Discovery reaches 57,795 instructions and 13,096 blocks with 145 unsupported
+sites: five former stops removed and two later stops exposed. These counts
+do not establish CPU completion. The entry runner compiles with warnings
+denied; startup-only verification passes at the existing missing `fscanf`
+boundary, with ten accepted dependencies, 20,288 owned dependency bytes and
+pending cleanup. Game main has not executed (`work/scalar-broadcast-native/entry.log`,
+process 21175 exit 0). No full GPU suite was run for this CPU change.
+Production readiness and retail gameplay remain unverified.
+
 ## Saturating integer packing
 
 VEX VPACKSSWB/SSDW/USWB/USDW now support eight XMM/YMM forms. Inputs are

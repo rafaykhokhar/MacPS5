@@ -37,6 +37,25 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn scalar_broadcast_absolute_address_guard() {
+        for (opcode, length) in [(0x18, 0), (0x18, 4), (0x19, 4)] {
+            let bytes = [
+                0x67,
+                0xc4,
+                0xe2,
+                0x79 | length,
+                opcode,
+                0x04,
+                0x25,
+                0,
+                0,
+                0,
+                0,
+            ];
+            assert!(super::translate_rust_memory_region(&bytes, 0, "address").is_err());
+        }
+    }
+    #[test]
     fn packed_pack_absolute_address_guard() {
         for (map, opcode) in [(1, 0x63), (1, 0x6b), (1, 0x67), (2, 0x2b)] {
             for length in [0, 4] {
@@ -2278,7 +2297,12 @@ impl Emitter {
                     dst + 16, dst + 24
                 ));
             }
-            M::Vpbroadcastb | M::Vpbroadcastw | M::Vpbroadcastd | M::Vpbroadcastq => {
+            M::Vpbroadcastb
+            | M::Vpbroadcastw
+            | M::Vpbroadcastd
+            | M::Vpbroadcastq
+            | M::Vbroadcastss
+            | M::Vbroadcastsd => {
                 use iced_x86::Code;
                 let (scalar_width, wide) = match i.code() {
                     Code::VEX_Vpbroadcastb_xmm_xmmm8 => (8, false),
@@ -2289,7 +2313,10 @@ impl Emitter {
                     Code::VEX_Vpbroadcastd_ymm_xmmm32 => (32, true),
                     Code::VEX_Vpbroadcastq_xmm_xmmm64 => (64, false),
                     Code::VEX_Vpbroadcastq_ymm_xmmm64 => (64, true),
-                    _ => return Err("Only VEX packed integer broadcasts are implemented".into()),
+                    Code::VEX_Vbroadcastss_xmm_m32 | Code::VEX_Vbroadcastss_xmm_xmm => (32, false),
+                    Code::VEX_Vbroadcastss_ymm_m32 | Code::VEX_Vbroadcastss_ymm_xmm => (32, true),
+                    Code::VEX_Vbroadcastsd_ymm_m64 | Code::VEX_Vbroadcastsd_ymm_xmm => (64, true),
+                    _ => return Err("Only VEX scalar broadcasts are implemented".into()),
                 };
                 if i.op1_kind() == OpKind::Memory
                     && i.memory_base() == R::None
