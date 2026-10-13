@@ -572,3 +572,28 @@ immediate arithmetic, memory and register regression verifiers pass against the
 same runtime (process 16274 exit 0). Reproduce the new standalone verifier using
 the preceding release rlib/dependency flags; no arguments required. Calls,
 indirect branches and automatic direct translation remain unfinished.
+
+## Direct relative calls
+
+Direct `CALL rel32` now publishes the image-biased target, image-relative return
+PC and call stop reason to the existing executor. The executor validates the
+destination and performs guarded guest stack push/pop. CALL must be the last
+instruction of a submitted span; its return continuation must be registered
+separately. Instructions after CALL in the same span are explicitly rejected.
+
+`rust/verification/direct_call_native.rs` passes 108 native state checks across
+positive/negative displacements, image biases, fuel and pre-existing faults.
+Twenty nested executor runs return 42 and verify stack restoration. Additional
+executor cases reject a missing callee, missing return continuation and an
+unmapped return stack. These are synthetic checks, not game compatibility proof.
+
+Validation on the local Apple Silicon host: 687 library tests, three integration
+tests, strict Clippy, release build and the strict-warning standalone CALL
+verifier all passed (process 74532, exit 0; logs under the original workspace's
+`work/direct-call/`). Build the standalone verifier with the release rlib and
+dependency flags shown above; it takes no arguments. Indirect calls, automatic
+direct translation and production readiness remain unproved.
+
+Existing direct cross-block, internal-branch, immediate-arithmetic, memory-MOV
+and register-MOV native verifiers also pass against this runtime (process
+92757, exit 0; logs in the same directory).

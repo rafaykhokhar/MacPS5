@@ -79,6 +79,7 @@ pub fn translate(bytes: &[u8], address: u64, instruction_limit: usize) -> Result
             Code::Mov_r32_imm32 | Code::Mov_r64_imm64 => {}
             Code::Mov_r32_rm32 | Code::Mov_rm32_r32 | Code::Mov_r64_rm64 | Code::Mov_rm64_r64 => {}
             _ if i.is_jcc_short_or_near() || i.is_jmp_short_or_near() => {}
+            Code::Call_rel32_64 => {}
             _ if register_arithmetic(&i) => {}
             _ => return Err(format!("Direct lowering unsupported: {:?}", i.code())),
         }
@@ -86,12 +87,21 @@ pub fn translate(bytes: &[u8], address: u64, instruction_limit: usize) -> Result
         if i.code() == Code::Retnq && offset != bytes.len() {
             return Err("Direct block bytes continue after RET".into());
         }
+        if i.code() == Code::Call_rel32_64 && offset != bytes.len() {
+            return Err(
+                "Direct CALL must end its registered span; register the continuation separately"
+                    .into(),
+            );
+        }
         decoded.push(i);
     }
     if decoded.last().is_none_or(|i| {
-        i.code() != Code::Retnq && !i.is_jmp_short_or_near() && !i.is_jcc_short_or_near()
+        i.code() != Code::Retnq
+            && i.code() != Code::Call_rel32_64
+            && !i.is_jmp_short_or_near()
+            && !i.is_jcc_short_or_near()
     }) {
-        return Err("Direct block must end in RET64 or a supported branch".into());
+        return Err("Direct block must end in RET64, CALL64 or a supported branch".into());
     }
     const EXIT: u32 = u32::MAX;
     const FUEL: u32 = u32::MAX - 1;
@@ -167,6 +177,19 @@ pub fn translate(bytes: &[u8], address: u64, instruction_limit: usize) -> Result
         )?;
         c.emit(0xd1000529)?; // sub x9,x9,#1
         c.context_access(9, 19, 160, true, true)?;
+        if i.code() == Code::Call_rel32_64 {
+            // The dispatcher owns guarded stack push/pop and target validation.
+            c.load_u64(9, i.next_ip())?;
+            c.context_access(9, 19, 192, true, true)?;
+            c.load_u64(9, i.near_branch_target())?;
+            c.context_access(10, 19, 144, true, false)?;
+            c.emit(0x8b0a0129)?; // add x9,x9,x10 (image bias)
+            c.context_access(9, 19, 176, true, true)?;
+            c.load_u64(9, 1)?;
+            c.context_access(9, 19, 168, true, true)?;
+            c.branch(EXIT, Branch::Jump)?;
+            continue;
+        }
         if i.is_jmp_short_or_near() {
             c.branch(boundaries[&i.near_branch_target()], Branch::Jump)?;
             continue;

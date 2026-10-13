@@ -1,5 +1,12 @@
 # Rust migration
 
+Direct relative CALL64 now transfers through the executor's guarded guest stack
+handling. Native checks cover call state, nested calls with restored stacks,
+missing callees/continuations and invalid return stacks. CALL must end its
+registered span, with a separately registered continuation. Indirect calls and
+automatic direct translation remain unfinished. See
+[call evidence](../docs/status/TRANSLATOR_READINESS.md#direct-relative-calls).
+
 Direct JMP/Jcc can now hand off to separately registered blocks through the
 executor, including conditional fallthrough. 1024 external-branch state checks,
 taken/fallthrough results, missing-target rejection and a fuel-bounded two-block
@@ -24,7 +31,7 @@ for remaining form and backend limits.
 Direct guest JMP/Jcc now resolve instruction-boundary targets and preserve
 fuel limits through loops. 5120 condition/fuel cases and an actual executor
 branch program pass, alongside direct register/memory regressions. Cross-block
-targets remain unsupported. See [control-flow evidence](../docs/status/TRANSLATOR_READINESS.md#direct-guest-control-flow).
+support is described above. See [control-flow evidence](../docs/status/TRANSLATOR_READINESS.md#direct-guest-control-flow).
 
 Direct translation now handles guarded memory MOV32/MOV64, including indexed
 and RIP-relative addresses. 10260 native cases and an actual executor image
