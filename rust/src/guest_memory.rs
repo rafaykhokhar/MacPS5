@@ -2053,6 +2053,42 @@ pub mod ffi {
         }
         cpu.fault = 1;
     }
+    /// Legacy SSE logical operations require 16-byte alignment and preserve YMM upper bits.
+    /// # Safety
+    /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
+    pub unsafe extern "C" fn native_legacy_vector_logical(
+        cpu: *mut Cpu,
+        address: u64,
+        destination: u64,
+        operation: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if destination >= 16 || address & 15 != 0 || cpu.memory == 0 {
+            cpu.fault = 1;
+            return;
+        }
+        let upper: [u8; 16] = cpu.vectors[destination as usize][16..].try_into().unwrap();
+        if vector_logical(
+            unsafe { &*(cpu.memory as *const Memory<'_>) },
+            &mut cpu.vectors,
+            address,
+            destination,
+            destination,
+            16,
+            operation,
+        )
+        .is_err()
+        {
+            cpu.fault = 1;
+            return;
+        }
+        cpu.vectors[destination as usize][16..].copy_from_slice(&upper);
+    }
     /// # Safety
     /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
     #[unsafe(no_mangle)]

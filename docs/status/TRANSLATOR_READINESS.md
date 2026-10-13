@@ -2205,3 +2205,35 @@ The accompanying source audit found no implemented CPUID path or complete
 versioned target-feature profile. This remains a release requirement; added
 instruction support must not be treated as a complete advertised CPU contract.
 Architectural fault delivery and PS5 gameplay also remain unverified.
+
+## Direct packed vector logic
+
+The direct backend supports AND/AND-NOT/OR/XOR in legacy SSE128 and VEX128/256
+forms: ANDPS/ANDPD/PAND, ANDNPS/ANDNPD/PANDN, ORPS/ORPD/POR, XORPS/XORPD/PXOR
+and their V-prefixed equivalents. MMX and EVEX forms remain outside this path.
+Register operands emit ARM64 logical operations; memory operands use the
+existing full-span guarded vector helper. A legacy wrapper enforces 16-byte
+memory alignment and preserves the destination's upper YMM half. VEX128 clears
+that half; VEX256 writes the full modeled vector. AND-NOT negates the first
+source. Guest flags and MXCSR are unchanged, and faults preserve all vectors.
+Upper-lane behavior follows the
+[Intel instruction reference](https://cdrdv2-public.intel.com/868140/253666-089-sdm-vol-2a.pdf).
+
+`rust/verification/direct_vector_logic_native.rs` computes expected values
+with Boolean truth tables per bit. It covers every VEX destination/source
+triple and legacy destination/source pair, both register and memory operands,
+all four operations and three opcode families, both VEX widths, aliases and
+nonzero upper lanes. Memory cases include aligned and unaligned addresses,
+last-valid spans, short/unmapped reads and overflowing addresses. Checks
+compare all modeled vectors and GPRs, flags, MXCSR, memory, RIP and
+fault/fuel/stop state.
+
+Validation passes: 811008 native cases plus all 98308 existing vector-XOR
+regression cases (including prior-fault and zero-budget guards), 687 library
+tests, three integration tests, strict Clippy and release build. Both standalone
+verifiers compile with warnings denied. Reproduce using the release rlib and
+dependency flags above with `direct_vector_logic_native.rs` and
+`direct_vector_xor_native.rs`. Logs are
+`/tmp/macps5-vector-logic-{tests,clippy,build}.log`. Alignment failures are modeled
+guard faults, not delivered architectural exceptions. This adds CPU vector
+coverage without establishing complete SIMD, GPU, or PS5 game support.

@@ -233,12 +233,43 @@ fn vector_move(i: &Instruction) -> Option<(u64, bool)> {
         _ => None,
     }
 }
-fn vector_xor(i: &Instruction) -> Option<u64> {
-    match i.code() {
-        Code::VEX_Vxorps_xmm_xmm_xmmm128 | Code::VEX_Vxorpd_xmm_xmm_xmmm128 => Some(16),
-        Code::VEX_Vxorps_ymm_ymm_ymmm256 | Code::VEX_Vxorpd_ymm_ymm_ymmm256 => Some(32),
-        _ => None,
+fn vector_logic(i: &Instruction) -> Option<(u64, u64, bool)> {
+    let legacy = i.encoding() == iced_x86::EncodingKind::Legacy;
+    if !legacy && i.encoding() != iced_x86::EncodingKind::VEX {
+        return None;
     }
+    let size = i.op0_register().size() as u64;
+    if !(size == 16 || (!legacy && size == 32)) {
+        return None;
+    }
+    let operation = match i.mnemonic() {
+        Mnemonic::Andps
+        | Mnemonic::Andpd
+        | Mnemonic::Pand
+        | Mnemonic::Vandps
+        | Mnemonic::Vandpd
+        | Mnemonic::Vpand => 0,
+        Mnemonic::Andnps
+        | Mnemonic::Andnpd
+        | Mnemonic::Pandn
+        | Mnemonic::Vandnps
+        | Mnemonic::Vandnpd
+        | Mnemonic::Vpandn => 1,
+        Mnemonic::Orps
+        | Mnemonic::Orpd
+        | Mnemonic::Por
+        | Mnemonic::Vorps
+        | Mnemonic::Vorpd
+        | Mnemonic::Vpor => 2,
+        Mnemonic::Xorps
+        | Mnemonic::Xorpd
+        | Mnemonic::Pxor
+        | Mnemonic::Vxorps
+        | Mnemonic::Vxorpd
+        | Mnemonic::Vpxor => 3,
+        _ => return None,
+    };
+    Some((size, operation, legacy))
 }
 fn vector_register(r: Register, size: u64) -> Result<usize> {
     let base = if size == 16 {
@@ -490,7 +521,7 @@ pub(crate) fn translate_span(
             _ if arithmetic_supported(&i) => {}
             _ if byte_arithmetic(&i) => {}
             _ if register_shift(&i) => {}
-            _ if vector_xor(&i).is_some() => {}
+            _ if vector_logic(&i).is_some() => {}
             _ if vector_move(&i).is_some() => {}
             Code::VEX_Vzeroupper | Code::VEX_Vzeroall => {}
             _ if conditional_move(&i) => {}
@@ -678,20 +709,32 @@ pub(crate) fn translate_span(
             }
             continue;
         }
-        if let Some(size) = vector_xor(i) {
+        if let Some((size, operation, legacy)) = vector_logic(i) {
             let dst = vector_register(i.op0_register(), size)?;
-            let first = vector_register(i.op1_register(), size)?;
-            if i.op2_kind() == OpKind::Memory {
+            let first = if legacy {
+                dst
+            } else {
+                vector_register(i.op1_register(), size)?
+            };
+            let second_operand = if legacy { 1 } else { 2 };
+            if i.op_kind(second_operand) == OpKind::Memory {
                 memory_address(&mut c, i)?;
                 c.emit(0xaa1303e0)?; // mov x0,x19
                 c.load_u64(2, dst as u64)?;
                 c.load_u64(3, first as u64)?;
                 c.load_u64(4, size)?;
-                c.load_u64(5, 3)?; // XOR, full guarded operand before commit
-                c.call_absolute(
-                    crate::guest_memory::ffi::native_ps5_module_vector_logical_v1 as *const ()
-                        as u64,
-                )?;
+                c.load_u64(5, operation)?; // full guarded operand before commit
+                if legacy {
+                    c.load_u64(3, operation)?;
+                    c.call_absolute(
+                        crate::guest_memory::ffi::native_legacy_vector_logical as *const () as u64,
+                    )?;
+                } else {
+                    c.call_absolute(
+                        crate::guest_memory::ffi::native_ps5_module_vector_logical_v1 as *const ()
+                            as u64,
+                    )?;
+                }
                 c.context_access(9, 19, 152, true, false)?;
                 c.branch(
                     EXIT,
@@ -702,15 +745,20 @@ pub(crate) fn translate_span(
                     },
                 )?;
             } else {
-                let second = vector_register(i.op2_register(), size)?;
+                let second = vector_register(i.op_register(second_operand), size)?;
                 // Each 64-bit piece is independent, including when dst aliases a source.
                 for offset in (0..size as usize).step_by(8) {
                     c.context_access(9, 19, 208 + first * 32 + offset, true, false)?;
                     c.context_access(10, 19, 208 + second * 32 + offset, true, false)?;
-                    c.emit(0xca0a0129)?; // eor x9,x9,x10
+                    c.emit(match operation {
+                        0 => 0x8a0a0129, // and x9,x9,x10
+                        1 => 0x8a290149, // bic x9,x10,x9: ~first & second
+                        2 => 0xaa0a0129, // orr x9,x9,x10
+                        _ => 0xca0a0129, // eor x9,x9,x10
+                    })?;
                     c.context_access(9, 19, 208 + dst * 32 + offset, true, true)?;
                 }
-                if size == 16 {
+                if size == 16 && !legacy {
                     c.load_u64(9, 0)?;
                     c.context_access(9, 19, 224 + dst * 32, true, true)?;
                     c.context_access(9, 19, 232 + dst * 32, true, true)?;

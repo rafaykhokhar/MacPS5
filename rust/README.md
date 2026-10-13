@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct packed AND/AND-NOT/OR/XOR now covers legacy SSE128 and VEX128/256,
+including integer encodings, guarded memory and upper-lane rules. 811008
+native checks plus 98308 existing XOR regression cases pass, along with
+library/integration tests and strict Clippy. See
+[vector-logic evidence](../docs/status/TRANSLATOR_READINESS.md#direct-packed-vector-logic).
+
 Direct LOOP/LOOPE/LOOPNE and JRCXZ/JECXZ now use native ARM64 counter branches,
 including internal and external targets. 92160 native checks and an executor
 loop returning 42 pass, alongside existing branch regressions, library tests
