@@ -465,6 +465,7 @@ pub(crate) fn translate_span(
             Code::Neg_rm8 | Code::Neg_rm16 | Code::Neg_rm32 | Code::Neg_rm64
                 if !i.has_lock_prefix() => {}
             Code::VEX_Bextr_r32_rm32_r32 | Code::VEX_Bextr_r64_rm64_r64 => {}
+            Code::VEX_Bzhi_r32_rm32_r32 | Code::VEX_Bzhi_r64_rm64_r64 => {}
             _ if bmi_shift(&i).is_some() => {}
             _ if movbe(&i) => {}
             _ if carry_arithmetic(&i) => {}
@@ -778,6 +779,8 @@ pub(crate) fn translate_span(
             i.code(),
             Code::VEX_Bextr_r32_rm32_r32
                 | Code::VEX_Bextr_r64_rm64_r64
+                | Code::VEX_Bzhi_r32_rm32_r32
+                | Code::VEX_Bzhi_r64_rm64_r64
                 | Code::VEX_Andn_r32_r32_rm32
                 | Code::VEX_Andn_r64_r64_rm64
                 | Code::VEX_Rorx_r32_rm32_imm8
@@ -844,6 +847,30 @@ pub(crate) fn translate_span(
                 wide,
                 false,
             )?;
+            if i.mnemonic() == Mnemonic::Bzhi {
+                c.emit(0xd3401c29)?; // ubfx x9,x1,#0,#8: only low index byte
+                c.load_u64(10, 1)?;
+                c.emit(0x9ac9214a)?; // lslv x10,x10,x9
+                c.emit(0xd100054a)?; // sub x10,x10,#1
+                c.load_u64(11, if wide { 64 } else { 32 })?;
+                c.emit(0xeb0b013f)?; // cmp x9,x11
+                c.emit(0x9a9f37ec)?; // cset x12,hs: out-of-range index
+                c.load_u64(11, u64::MAX)?;
+                c.emit(0x9a8b314a)?; // csel x10,x10,x11,lo
+                c.emit(0x8a0a0000)?; // and x0,x0,x10
+                c.context_access(0, 19, dst * 8, true, true)?;
+                c.context_access(9, 19, 136, true, false)?;
+                c.load_u64(10, 0x8c1)?;
+                c.emit(0x8a2a0129)?; // clear CF/ZF/SF/OF, preserve undefined AF/PF
+                c.emit(0xaa0c0129)?; // orr x9,x9,x12: CF
+                c.emit(0xf100001f)?;
+                c.emit(0x9a9f17ea)?; // cset x10,eq
+                c.emit(0xaa0a1929)?; // ZF
+                c.emit(if wide { 0xd37ffc0a } else { 0xd35f7c0a })?;
+                c.emit(0xaa0a1d29)?; // SF
+                c.context_access(9, 19, 136, true, true)?;
+                continue;
+            }
             if andn {
                 c.emit(if wide { 0x8a210000 } else { 0x0a210000 })?; // bic x0/w0,x0/w0,x1/w1
                 c.context_access(0, 19, dst * 8, true, true)?;

@@ -2033,3 +2033,31 @@ dependency flags using `direct_bit_scan_native.rs`. Build/test logs are
 `/tmp/macps5-bls-{tests,clippy,build}.log`. This is additional CPU instruction
 coverage; complete translation, production readiness and gameplay remain
 unverified.
+
+## Direct BZHI
+
+Direct BZHI supports 32/64-bit register and guarded-memory sources with native
+ARM64 masking and flag updates. Only the low eight index bits are used. An
+index at or above operand width preserves the source and sets CF; a smaller
+index clears bits starting at that index. Dword results zero-extend. SF/ZF
+reflect the result, OF is cleared, and undefined AF/PF are preserved. Sources
+are captured before destination writes, so aliases are supported. Read faults
+leave the destination and flags unchanged. Semantics follow the Operation and
+Flags Affected sections of the
+[Intel BZHI reference](https://cdrdv2-public.intel.com/671110/325383-sdm-vol-2abcd.pdf).
+
+`rust/verification/direct_bzhi_native.rs` uses independent per-bit selection
+as its expected-result oracle. It covers every destination/source/index
+register triple, including memory-base aliases; both widths; index boundaries;
+zero and patterned values; and unaligned, short and overflowing memory reads.
+A fixed-register sweep covers all 65536 low-word index values against six
+source patterns, ensuring the high index byte is ignored. Initial arithmetic
+flags vary between set and clear states. Full GPR, flags, RIP, memory and
+fault/fuel/stop state are checked.
+
+Validation passes: 1605632 native cases, 687 library tests, three integration
+tests, strict Clippy and release build. The standalone verifier compiles with
+warnings denied; reproduce using the release rlib/dependency flags above and
+`direct_bzhi_native.rs`. Logs are `/tmp/macps5-bzhi-{tests,clippy,build}.log`.
+This extends the direct CPU backend; it does not establish complete instruction
+coverage, production readiness, or PS5 gameplay.

@@ -1,5 +1,9 @@
 # Rust migration
 
+Direct BZHI32/64 now emits ARM64 masking and flag updates with guarded memory
+sources. All 1605632 native state checks, library/integration tests and strict
+Clippy pass. See [BZHI evidence](../docs/status/TRANSLATOR_READINESS.md#direct-bzhi).
+
 Direct BMI1 BLSI/BLSMSK/BLSR now supports 32/64-bit register and guarded-memory
 sources. The combined bit-operation verifier passes 2193408 native cases and
 six helper guard checks. Library/integration tests and strict Clippy also pass.
