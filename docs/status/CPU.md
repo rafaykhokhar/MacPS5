@@ -2,6 +2,8 @@
 
 **CPU completion is unproven. No overall CPU percentage is available.** The existing progress graphic tracks selected checkpoints, not the complete instruction set. Instruction discovery counts from one executable are not a compatibility denominator, and discovered instructions are not necessarily executed instructions.
 
+The [initial form inventory](CPU_INVENTORY.md) now maps implemented families to focused verification evidence and groups the pinned executable's observed static lowering boundaries. It records exact source/artifact hashes. It remains a starting audit, not an exhaustive target ISA inventory.
+
 ## Required evidence
 
 A completion claim requires a versioned target CPU feature profile and an inventory of its instruction forms and architectural behavior. The profile must come from target evidence; unsupported features cannot be removed merely to make the inventory green. Deliberately excluded features require a documented target-based reason. That exhaustive inventory has not yet been established.
