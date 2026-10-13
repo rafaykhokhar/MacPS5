@@ -877,3 +877,28 @@ Reproduce the standalone verifier with the release rlib/dependency flags above
 and no arguments. The preceding `--direct-startup` command reproduces the real
 startup boundary. Byte register-to-register/load/store MOV forms, word forms and
 INC remain unfinished in the direct backend; no game compatibility is claimed.
+
+## Direct register INC/DEC
+
+Direct INC/DEC32/64 now supports register operands, using flag-helper operations
+3/5 to preserve CF while computing OF/SF/ZF/AF/PF. A 32-bit result zero-extends
+the containing register. Memory operands and byte/word forms remain explicitly
+unsupported. Inspection of the configured startup gap identifies `INC RCX` at
+0x74 in the BSS-clearing loop.
+
+`direct_incdec_native.rs` passes 12288 native cases: both operations and widths,
+all registers, selected wraparound/nibble/sign boundaries, both carry values,
+fuel and prior faults. Its result/flag oracle uses widened signed arithmetic
+and nibble comparisons rather than the runtime helper. 687 library tests, three
+integration tests, strict Clippy, release build and the strict-warning verifier
+pass. Register/immediate arithmetic native regressions also pass (75159, exit 0).
+
+The configured startup harness now prints:
+`Real entry reached dlsym: handle=0x1 symbol="sceKernelDlsym" output=0x201fffa0`.
+It subsequently exits 1 on
+`Translation miss at 0x100003d9 (bias 0x10000000): Direct lowering unsupported: Cmp_rm64_r64`.
+This is process 82183, with `/tmp/macps5-inc-startup.log` as its log. Reaching
+the first real symbol lookup is verified progress; complete bootstrap, dependency
+initialization, game main and gameplay have not succeeded on this backend.
+Use the preceding standalone verifier build flags and configured startup command
+to reproduce these boundaries.

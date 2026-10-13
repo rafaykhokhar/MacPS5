@@ -6,6 +6,12 @@ use crate::{
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
 fn register_arithmetic(i: &Instruction) -> bool {
+    if matches!(
+        i.code(),
+        Code::Inc_rm32 | Code::Inc_rm64 | Code::Dec_rm32 | Code::Dec_rm64
+    ) {
+        return i.op0_kind() == OpKind::Register;
+    }
     matches!(
         i.mnemonic(),
         Mnemonic::Add
@@ -377,7 +383,9 @@ pub(crate) fn translate_span(
         if register_arithmetic(i) {
             let wide = i.op0_register().size() == 8;
             let destination = register(i.op0_register(), wide)?;
-            if i.op1_kind() == OpKind::Memory {
+            if matches!(i.mnemonic(), Mnemonic::Inc | Mnemonic::Dec) {
+                c.load_u64(2, 1)?;
+            } else if i.op1_kind() == OpKind::Memory {
                 memory_address(&mut c, i)?;
                 c.emit(0xaa1303e0)?; // mov x0,x19
                 c.load_u64(2, if wide { 8 } else { 4 })?;
@@ -409,6 +417,8 @@ pub(crate) fn translate_span(
             c.context_access(1, 19, destination * 8, wide, false)?;
             let (opcode, operation) = match i.mnemonic() {
                 Mnemonic::Add => (0x0b020023, 1),
+                Mnemonic::Inc => (0x0b020023, 3),
+                Mnemonic::Dec => (0x4b020023, 5),
                 Mnemonic::Sub | Mnemonic::Cmp => (0x4b020023, 0),
                 Mnemonic::And | Mnemonic::Test => (0x0a020023, 2),
                 Mnemonic::Or => (0x2a020023, 2),
