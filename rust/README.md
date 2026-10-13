@@ -1,5 +1,16 @@
 # Rust migration
 
+`__mb_cur_max` is now a writable four-byte guest data export, with persistent
+per-executor storage and C/POSIX character-locale transition behavior. Native
+checks execute both real accessors, test writes, isolation and memory bounds.
+The matching build passes 511 library tests, three integration tests and strict
+Clippy. Startup discovery resolves the data import and reaches `strtok_r`,
+retaining 19,632 dependency bytes (`work/arm64-prototype/mb-cur-max-entry.log`).
+Updated startup-only data-slot and ownership assertions pass
+(`work/arm64-prototype/mb-cur-max-verified.log`, 42691 exit0).
+See [multibyte data evidence](../docs/status/MULTIBYTE.md). Game main remains
+unexecuted; these checks do not establish GPU presentation or gameplay.
+
 The matching release passes 82,005 native VEX256 packed comparison/shift checks,
 including the pinned broadcast/compare/shift/store sequence, and 8,216 direct
 and actual-wrapper `mbtowc` value cases plus memory/errno guards. The integrated

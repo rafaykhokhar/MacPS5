@@ -55,6 +55,7 @@ mod lzcnt_native;
 mod wcsxfrm_native;
 mod mbrlen_native;
 mod mbtowc_native;
+mod mb_cur_max_native;
 mod packed_compare_shift_native;
 mod vpbroadcastd_native;
 mod strftime_native;
@@ -144,6 +145,7 @@ fn main() -> Result<(), String> {
         wcsxfrm_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("wcsxfrm"))?;
         mbrlen_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("mbrlen"))?;
         mbtowc_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("mbtowc"))?;
+        mb_cur_max_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("mb-cur-max"))?;
         packed_compare_shift_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-compare-shift"))?;
         vpbroadcastd_native::verify(Path::new(&archive), &Path::new(&directory).join("vpbroadcastd"))?;
         strftime_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strftime"))?;
@@ -408,6 +410,7 @@ fn main() -> Result<(), String> {
         ("__isthreaded", 0x30003000),
         ("__stderrp", native_ps5::guest_stdio::STDERR_PTR_ADDR),
         ("__stdinp", native_ps5::stdio_file::STDIN_PTR_ADDR),
+        ("__mb_cur_max", native_ps5::guest_locale::MB_CUR_MAX_ADDR),
     ];
     for (index, (name, service)) in [
         ("strcpy", Service::Strcpy),
@@ -671,10 +674,12 @@ fn main() -> Result<(), String> {
     let mut isthreaded = [0u8; 4];
     let mut stderr_pointer = native_ps5::guest_stdio::stderr_pointer_bytes();
     let mut stdin_pointer = native_ps5::stdio_file::stdin_pointer_bytes();
+    let mut mb_cur_max = 1i32.to_le_bytes();
     let libc = {
         use native_ps5::kernel_module::{Export, Kind};
         let mut user = native_ps5::guest_memory::Memory::default();
         user.add(0x30003000, &mut isthreaded, true, false)?;
+        user.add(native_ps5::guest_locale::MB_CUR_MAX_ADDR, &mut mb_cur_max, true, false)?;
         user.add(
             native_ps5::guest_stdio::STDERR_PTR_ADDR,
             &mut stderr_pointer,
@@ -688,7 +693,7 @@ fn main() -> Result<(), String> {
             .map(|(nid, address)| Export {
                 nid,
                 address: *address,
-                kind: if *address == 0x30003000 {
+                kind: if *address == 0x30003000 || *address == native_ps5::guest_locale::MB_CUR_MAX_ADDR {
                     Kind::Object {
                         size: 4,
                         writable: true,
@@ -713,6 +718,7 @@ fn main() -> Result<(), String> {
             &user,
             |address| {
                 address != 0x30003000
+                    && address != native_ps5::guest_locale::MB_CUR_MAX_ADDR
                     && address != native_ps5::guest_stdio::STDERR_PTR_ADDR
                     && address != native_ps5::stdio_file::STDIN_PTR_ADDR
                     && libc_exports.iter().any(|(_, target)| *target == address)
@@ -1357,7 +1363,7 @@ fn main() -> Result<(), String> {
                 .iter()
                 .find(|s| {
                     locale_slot >= s.address
-                        && locale_slot + 1144 <= s.address + s.bytes.len() as u64
+                        && locale_slot + 1152 <= s.address + s.bytes.len() as u64
                 })
                 .ok_or("Missing locale import slot")?;
             let locale_offset = (locale_slot - locale_segment.address) as usize;
@@ -1506,6 +1512,7 @@ fn main() -> Result<(), String> {
                 (1120, "wcsxfrm"),
                 (1128, "mbrlen"),
                 (1136, "mbtowc"),
+                (1144, "__mb_cur_max"),
             ] {
                 let expected = libc_exports.iter().find(|(symbol, _)| *symbol == name)
                     .ok_or("Missing registered libc service")?.1;
@@ -1534,13 +1541,13 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 145 libc exports: (145+1)*24=3504 symbol bytes
-                // and 1+145*12=1741 NID bytes (rounded1744).
-                // Mbtowc adds16bytes to19568.
-                || native.bytes_allocated() != 19584
+                // 146 libc exports: (146+1)*24=3528 symbol bytes (rounded3536)
+                // and 1+146*12=1753 NID bytes (rounded1760).
+                // __mb_cur_max adds48bytes to19584.
+                || native.bytes_allocated() != 19632
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
-                    != [b"<118>[crispy-doom.elf] Unable to resolve '__mb_cur_max'\n".to_vec()]
+                    != [b"<118>[crispy-doom.elf] Unable to resolve 'strtok_r'\n".to_vec()]
             {
                 return Err(format!(
                     "Startup state: sysmodule slot {:#x}, allocated {}, logs {:?}",
@@ -1550,7 +1557,7 @@ fn main() -> Result<(), String> {
                 ));
             }
             println!(
-                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; mbtowc import bound; unresolved __mb_cur_max causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
+                "NEXT RUST ENTRY: all ten named DT_NEEDED providers accepted; __mb_cur_max data import bound; unresolved strtok_r causes a captured exit request; {} guest dependency bytes remain owned; cleanup pending and game main has not executed",
                 native.bytes_allocated()
             );
         }
@@ -1612,7 +1619,7 @@ fn main() -> Result<(), String> {
         return Err("Net provider ownership changed unexpectedly".into());
     }
     println!(
-        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved __mb_cur_max triggers an owned ExitRequested; cleanup pending and game main has not executed",
+        "PASS: real homebrew Rust execution clears {} BSS bytes and accepts all ten named dependencies; unresolved strtok_r triggers an owned ExitRequested; cleanup pending and game main has not executed",
         end - begin
     );
     if let Some(result) = presentation_result {

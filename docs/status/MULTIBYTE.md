@@ -1,5 +1,37 @@
 # C-locale multibyte conversion
 
+## Writable multibyte-width data
+
+`__mb_cur_max` is an executor-owned four-byte writable object initialized to 1,
+at `guest_locale::MB_CUR_MAX_ADDR`. It is mapped even when no locale service is
+registered, and is described as a writable object in the native module export
+record. The real `___mb_cur_max` and `___mb_cur_max_l` accessors at `0x1163c0`
+and `0x1163d0` load a pointer from GOT `0x26fb18`, then load a 32-bit integer.
+Neither the GOT slot nor the object is a function-service address.
+
+Writes persist across calls and remain private to each executor. As in FreeBSD
+11.4 `setlocale.c`/`setrunelocale.c`, queries, failures, unrelated categories and
+unchanged character-locale names preserve the value; an actual C↔POSIX change
+of LC_CTYPE (including LC_ALL) resets it to 1. The export is distinct from the
+conversion backend: changing the integer does not invent support for another
+encoding. Stateful/non-C locales remain unsupported.
+
+Native verification passes both actual accessors, direct low32 writes/reads,
+cross-call persistence, executor isolation, exact four-byte bounds and the
+locale transitions (`work/mb-cur-max-native/native.log`, session35248 exit0).
+The full entry runner includes the verifier. The integrated build passes 511
+library tests, three integration tests, strict Clippy and release compilation
+(`work/mb-cur-max-build.log`, session87033 exit0). Both active and suspended
+mapping paths include the object; the current native verifier exercises ordinary
+calls, not every suspension lifecycle.
+
+Startup-only assertions pass with the actual data GOT slot bound and 19,632
+dependency bytes retained at missing `strtok_r`
+(`work/arm64-prototype/mb-cur-max-verified.log`, session42691 exit0). That run
+skips component/Metal verification and has not executed game main. Native
+component checks and startup used release archive SHA-256
+`3abbbcac88c4452edf2e5487da230dd9b085a1fc74bb9409b5b8c86585260e47`.
+
 ## Legacy byte conversion
 
 `Service::Mbtowc` reuses the C/POSIX conversion plan but translates incomplete

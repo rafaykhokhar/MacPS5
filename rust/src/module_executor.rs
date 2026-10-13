@@ -1752,6 +1752,7 @@ pub struct NativeExecutor {
     stderr_file: [u8; 312],
     stderr_pointer: [u8; 8],
     locale_name: [u8; 2],
+    mb_cur_max: [u8; 4],
     pub audio: crate::audio_out::AudioOut<crate::audio_queue::AudioQueueBackend>,
     pub direct_memory: crate::direct_memory::DirectMemory,
     pub equeues: crate::equeue::Equeues,
@@ -2474,6 +2475,11 @@ impl NativeExecutor {
                 writable: false,
             });
         }
+        mapped_data.push(DataRegion {
+            address: crate::guest_locale::MB_CUR_MAX_ADDR,
+            bytes: &mut self.mb_cur_max,
+            writable: true,
+        });
         if self.services.values().any(|service| {
             matches!(
                 service,
@@ -2884,6 +2890,7 @@ impl NativeExecutor {
             stderr_file: crate::guest_stdio::stderr_file_bytes(),
             stderr_pointer: crate::guest_stdio::stderr_pointer_bytes(),
             locale_name: crate::guest_locale::C_NAME,
+            mb_cur_max: 1i32.to_le_bytes(),
             direct_memory: crate::direct_memory::DirectMemory::default(),
             system_service: crate::system_service::SystemService::default(),
             environment: 0,
@@ -3561,6 +3568,7 @@ impl NativeExecutor {
         {
             memory.add_service_data(LOCALE_NAME, &mut self.locale_name)?;
         }
+        memory.add(crate::guest_locale::MB_CUR_MAX_ADDR, &mut self.mb_cur_max, true, false)?;
         if self.services.values().any(|service| {
             matches!(
                 service,
@@ -5029,11 +5037,15 @@ impl NativeExecutor {
                         }
                         self.stdout.puts(&memory, cpu.registers[7])? as u32 as u64
                     } else if matches!(service, Service::Setlocale) {
-                        if self.locale.setlocale(
+                        let (accepted, ctype_changed) = self.locale.setlocale_with_ctype_transition(
                             &memory,
                             cpu.registers[7] as i32,
                             cpu.registers[6],
-                        )? {
+                        )?;
+                        if ctype_changed {
+                            memory.store(crate::guest_locale::MB_CUR_MAX_ADDR, 1, 4)?;
+                        }
+                        if accepted {
                             LOCALE_NAME
                         } else {
                             0

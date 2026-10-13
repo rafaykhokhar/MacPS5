@@ -13,6 +13,7 @@ pub const LC_NUMERIC: i32 = 4;
 pub const LC_TIME: i32 = 5;
 pub const LC_MESSAGES: i32 = 6;
 pub const C_NAME: [u8; 2] = *b"C\0";
+pub const MB_CUR_MAX_ADDR: u64 = 0x7fff00000210;
 pub const NAME_LIMIT: usize = 255;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EmptyEnvironmentPolicy {
@@ -25,8 +26,27 @@ pub enum EmptyEnvironmentPolicy {
 #[derive(Debug, Default)]
 pub struct GuestLocale {
     empty_environment: EmptyEnvironmentPolicy,
+    ctype_posix: bool,
 }
 impl GuestLocale {
+    /// FreeBSD loadlocale short-circuits an unchanged name. Only an actual
+    /// LC_CTYPE name transition resets the exported writable __mb_cur_max.
+    pub fn setlocale_with_ctype_transition(
+        &mut self,
+        memory: &Memory<'_>,
+        category: i32,
+        name: u64,
+    ) -> Result<(bool, bool)> {
+        let accepted = self.setlocale(memory, category, name)?;
+        if !accepted || name == 0 || !matches!(category, LC_ALL | LC_CTYPE) {
+            return Ok((accepted, false));
+        }
+        // Validation above admits only C, POSIX or an explicitly C environment.
+        let posix = memory.load(name, 1)? == u64::from(b'P');
+        let changed = posix != self.ctype_posix;
+        self.ctype_posix = posix;
+        Ok((true, changed))
+    }
     pub fn configure_empty_environment(&mut self, policy: EmptyEnvironmentPolicy) {
         self.empty_environment = policy;
     }
@@ -68,6 +88,29 @@ impl GuestLocale {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ctype_name_transitions_only_reset_on_change() {
+        let mut bytes = *b"C\0POSIX\0bad\0";
+        let mut memory = Memory::default();
+        memory.add(0x1000, &mut bytes, false, false).unwrap();
+        let mut locale = GuestLocale::default();
+        for (category, name, expected) in [
+            (LC_CTYPE, 0x1000, (true, false)),
+            (LC_TIME, 0x1002, (true, false)),
+            (LC_CTYPE, 0x1002, (true, true)),
+            (LC_CTYPE, 0x1002, (true, false)),
+            (LC_ALL, 0, (true, false)),
+            (LC_CTYPE, 0x1008, (false, false)),
+            (LC_ALL, 0x1000, (true, true)),
+        ] {
+            assert_eq!(
+                locale
+                    .setlocale_with_ctype_transition(&memory, category, name)
+                    .unwrap(),
+                expected
+            );
+        }
+    }
     #[test]
     fn categories_queries_c_and_posix_are_owned() {
         assert_eq!(
