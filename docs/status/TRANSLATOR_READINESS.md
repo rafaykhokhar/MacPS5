@@ -597,3 +597,28 @@ direct translation and production readiness remain unproved.
 Existing direct cross-block, internal-branch, immediate-arithmetic, memory-MOV
 and register-MOV native verifiers also pass against this runtime (process
 92757, exit 0; logs in the same directory).
+
+## Direct indirect calls
+
+Direct `CALL r/m64` resolves an absolute guest target from a general register or
+the existing guarded 8-byte memory-load helper. It publishes call state only
+after a successful pointer read. Faulting reads preserve target, continuation,
+registers and flags; they consume instruction fuel and report the memory fault.
+The dispatcher still owns destination validation and stack writes. `[RSP]`
+therefore reads its pointer before the return-address push. Existing unsupported
+FS/GS and 32-bit addressing restrictions remain explicit.
+
+`rust/verification/direct_indirect_call_native.rs` verifies 960 native cases:
+all 16 register operands and memory bases, unaligned/boundary/invalid addresses,
+zero/nonzero fuel and prior faults. Three real executor programs return 42 via
+register, RIP-relative pointer-table and `[RSP]` calls. The latter stores a
+pointer on the guest stack and discards it after return, also checking that the
+executor's call push did not overwrite the pointer before target resolution.
+
+687 library tests, three integration tests, strict Clippy and release build
+pass (process 20595, exit 0). The final strict-warning standalone verifier plus
+relative-call, cross-block branch, memory-MOV and register-MOV regressions pass
+(process 64054, exit 0). Reproduce with the release rlib/dependency flags above;
+the verifier takes no arguments. This expands explicit direct registration;
+automatic direct translation, indirect jumps and production readiness remain
+unfinished. No PS5 game execution is established by these checks.

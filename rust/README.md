@@ -1,10 +1,15 @@
 # Rust migration
 
+Direct indirect CALL64 now accepts general registers and guarded memory
+pointers. 960 native state/fault/fuel checks and executor register, RIP-relative
+and pre-push `[RSP]` calls pass. See
+[indirect-call evidence](../docs/status/TRANSLATOR_READINESS.md#direct-indirect-calls).
+
 Direct relative CALL64 now transfers through the executor's guarded guest stack
 handling. Native checks cover call state, nested calls with restored stacks,
 missing callees/continuations and invalid return stacks. CALL must end its
-registered span, with a separately registered continuation. Indirect calls and
-automatic direct translation remain unfinished. See
+registered span, with a separately registered continuation. Automatic direct
+translation remains unfinished. See
 [call evidence](../docs/status/TRANSLATOR_READINESS.md#direct-relative-calls).
 
 Direct JMP/Jcc can now hand off to separately registered blocks through the
