@@ -440,6 +440,19 @@ impl Emitter {
                     224 + dst * 32, 232 + dst * 32
                 ));
             }
+            M::Vmovd => {
+                if i.code() != iced_x86::Code::VEX_Vmovd_xmm_rm32 {
+                    return Err("Only VEX VMOVD r/m32-to-XMM is implemented".into());
+                }
+                let dst = vector(i.op_register(0))?;
+                self.read(i, 1, 32, 20)?;
+                // Integer bit-copy; VEX clears all modeled bits above bit31.
+                // Commit only after the complete guarded four-byte read.
+                self.emit(format!(
+                    "mov w20, w20\nstr x20, [x19, #{}]\nstr xzr, [x19, #{}]\nstr xzr, [x19, #{}]\nstr xzr, [x19, #{}]",
+                    208 + dst * 32, 216 + dst * 32, 224 + dst * 32, 232 + dst * 32
+                ));
+            }
             M::Vmovsd => {
                 if i.code() != iced_x86::Code::VEX_Vmovsd_xmm_m64 {
                     return Err("Only VEX VMOVSD m64-to-XMM is implemented".into());

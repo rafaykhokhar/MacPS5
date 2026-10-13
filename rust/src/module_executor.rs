@@ -1070,6 +1070,7 @@ pub enum Service {
     Strcat,
     Strcmp,
     Strcoll,
+    Strftime,
     Strncmp,
     Strlen,
     Ctype(crate::c_locale::Ctype),
@@ -1231,6 +1232,7 @@ impl Service {
             | Self::Vsnprintf
             | Self::Vasprintf
             | Self::Strcoll
+            | Self::Strftime
             | Self::Errno
             | Self::Getpid
             | Self::Syscall
@@ -5491,6 +5493,30 @@ impl NativeExecutor {
                                     validate_net_output(memory, address, length, sp, ret)
                                 },
                             )?
+                        }
+                    } else if matches!(service, Service::Strftime) {
+                        let timezone = if self.guest_time.utc_configured() {
+                            crate::guest_strftime::Timezone::Utc
+                        } else {
+                            crate::guest_strftime::Timezone::Unconfigured
+                        };
+                        let plan = crate::guest_strftime::plan(
+                            &memory,
+                            cpu.registers[7],
+                            cpu.registers[6],
+                            cpu.registers[2],
+                            cpu.registers[1],
+                            crate::guest_strftime::Policy { timezone },
+                        ).map_err(|fault| format!("Guest strftime fault: {fault:?}"))?;
+                        if !plan.bytes.is_empty() {
+                            validate_net_output(&memory, plan.destination, plan.bytes.len(), sp, ret)?;
+                        }
+                        plan.commit(&mut memory).map_err(|fault| format!("Guest strftime output fault: {fault:?}"))?;
+                        match plan.completion {
+                            crate::guest_strftime::Completion::Returned(value) => value,
+                            crate::guest_strftime::Completion::Unsupported(reason) => {
+                                return Err(format!("Guest strftime unsupported: {reason}"));
+                            }
                         }
                     } else if matches!(service, Service::Gettimeofday) {
                         let plan = self.guest_time.plan(cpu.registers[7], cpu.registers[6])?;

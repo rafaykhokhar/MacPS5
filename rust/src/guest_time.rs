@@ -65,6 +65,11 @@ impl GuestTime {
     pub fn configure_utc(&mut self) {
         self.utc_timezone = true;
     }
+    /// Shared libc time consumers must use the explicitly selected guest policy.
+    /// An unset policy must never fall back to the host's local timezone.
+    pub fn utc_configured(&self) -> bool {
+        self.utc_timezone
+    }
     /// Fixed source is for deterministic verification, not a ticking guest clock.
     pub fn set_source(&mut self, source: TimeSource) {
         self.source = source;
