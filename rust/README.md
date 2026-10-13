@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct byte-memory CMP/TEST now supports immediate and byte-register operands,
+including both CMP operand orders. 6193152 native cases and 143430 byte-register
+regression cases pass. Configured startup advances to memory ADD32 at 0x8e0.
+See [byte comparison evidence](../docs/status/TRANSLATOR_READINESS.md#direct-byte-memory-comparisons).
+
 Direct MOVSX/MOVSXD now sign-extends byte/word/dword register and guarded memory
 sources. 102400 native cases and 24608 MOVZX regression cases pass. Configured
 startup passes the block at 0x31e8 and reaches a byte-memory CMP gap at 0x880.

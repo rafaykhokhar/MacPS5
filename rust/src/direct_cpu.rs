@@ -116,6 +116,17 @@ fn vector_register(r: Register, size: u64) -> Result<usize> {
         .ok_or_else(|| "Invalid direct vector register".into())
 }
 fn byte_arithmetic(i: &Instruction) -> bool {
+    if matches!(
+        i.code(),
+        Code::Cmp_rm8_imm8
+            | Code::Cmp_rm8_r8
+            | Code::Cmp_r8_rm8
+            | Code::Test_rm8_imm8
+            | Code::Test_rm8_r8
+    ) && (i.op0_kind() == OpKind::Memory || i.op1_kind() == OpKind::Memory)
+    {
+        return true;
+    }
     matches!(
         i.mnemonic(),
         Mnemonic::Add
@@ -472,12 +483,45 @@ pub(crate) fn translate_span(
             continue;
         }
         if byte_arithmetic(i) {
-            let destination = byte_offset(i.op0_register())?;
-            c.emit(0x39400261 | (destination << 10))?; // ldrb w1,[x19,#offset]
-            if i.op1_kind() == OpKind::Register {
-                c.emit(0x39400262 | (byte_offset(i.op1_register())? << 10))?;
+            let destination = if i.op0_kind() == OpKind::Register {
+                byte_offset(i.op0_register())?
             } else {
-                c.load_u64(2, u64::from(i.immediate8()))?;
+                0
+            };
+            if i.op0_kind() == OpKind::Memory || i.op1_kind() == OpKind::Memory {
+                memory_address(&mut c, i)?;
+                c.emit(0xaa1303e0)?;
+                c.load_u64(2, 1)?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_load_v1 as *const () as u64,
+                )?;
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+                if i.op0_kind() == OpKind::Memory {
+                    c.emit(0xaa0003e1)?; // mov x1,x0; memory is first operand
+                    if i.op1_kind() == OpKind::Register {
+                        c.emit(0x39400262 | (byte_offset(i.op1_register())? << 10))?;
+                    } else {
+                        c.load_u64(2, u64::from(i.immediate8()))?;
+                    }
+                } else {
+                    c.emit(0xaa0003e2)?; // mov x2,x0; memory is second operand
+                    c.emit(0x39400261 | (destination << 10))?;
+                }
+            } else {
+                c.emit(0x39400261 | (destination << 10))?;
+                if i.op1_kind() == OpKind::Register {
+                    c.emit(0x39400262 | (byte_offset(i.op1_register())? << 10))?;
+                } else {
+                    c.load_u64(2, u64::from(i.immediate8()))?;
+                }
             }
             let (opcode, operation) = match i.mnemonic() {
                 Mnemonic::Add => (0x0b020023, 1),

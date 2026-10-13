@@ -1189,3 +1189,35 @@ exits 1 at the new observed block at image-relative 0x880:
 recorded. Logs are `/tmp/macps5-movsx-{tests,clippy,build,startup}.log`.
 The next CPU gap is byte-memory comparison; bootstrap and PS5 gameplay are still
 incomplete. The startup-only harness skips Metal presentation.
+
+## Direct byte memory comparisons
+
+Direct byte arithmetic selection now accepts memory CMP with an immediate or
+byte-register operand, CMP with a byte-register first and memory second, and
+memory TEST with an immediate or byte-register operand. The emitted sequence
+resolves and guards the one-byte memory read before loading the other operand
+and calculating flags. Explicit operand ordering preserves subtraction direction;
+legacy high bytes use the existing byte-offset mapping. Neither instruction
+writes GPRs or guest memory. A failed read exits before flag calculation.
+Byte memory arithmetic that modifies its destination is still unsupported.
+
+`rust/verification/direct_byte_compare_native.rs` uses independent signed and
+nibble arithmetic for expected flags. It exercises every memory-byte value,
+selected carry/sign/nibble-boundary operands, both register encodings, all GPR
+bases and byte registers, source/base aliases, immediate forms, read-only
+mappings, the final mapped byte and the first unmapped byte. Expected state
+includes all GPRs, flags, memory and fault/fuel/stop. The existing byte-register
+arithmetic verifier is rerun because its emission path is shared.
+
+Validation passes: 6193152 byte-memory comparison native cases, 143430 existing
+byte-register arithmetic cases, 687 library tests, three integration tests,
+strict Clippy and release build. Both standalone verifiers compile with warnings
+denied. Reproduce with the release rlib/dependency flags above using
+`direct_byte_compare_native.rs` and `direct_byte_arithmetic_native.rs`.
+
+Configured `--direct-startup` advances beyond the block at image-relative 0x880
+and exits 1 at 0x8e0 with `Direct lowering unsupported: Add_rm32_r32`.
+Logs are `/tmp/macps5-byte-compare-{tests,clippy,build,startup}.log` and still record
+the first real dlsym lookup. The next observed gap is memory-destination integer
+arithmetic, requiring guarded read-modify-write semantics. Bootstrap and PS5
+gameplay remain incomplete; the startup-only run skips Metal presentation.
