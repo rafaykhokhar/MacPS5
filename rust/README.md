@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct SHL/SHR/SAR32/64 now accepts CL counts, including ECX/RCX destination
+aliases. 589830 native immediate/CL shift checks pass, along with the library
+and integration suites and strict Clippy. Memory and narrow shifts remain a
+direct-backend gap. See [CL shift evidence](../docs/status/TRANSLATOR_READINESS.md#direct-cl-count-register-shifts).
+
 Direct VZEROUPPER/VZEROALL now passes 9216 native state checks. The direct
 translator reaches the same pinned homebrew startup boundary as the older AOT
 path: ten named dependencies accepted, then an unresolved `fscanf` triggers

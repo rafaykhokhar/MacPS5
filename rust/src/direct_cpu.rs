@@ -214,11 +214,12 @@ fn setcc(i: &Instruction) -> bool {
             | Code::Setg_rm8
     )
 }
-fn immediate_shift(i: &Instruction) -> bool {
+fn register_shift(i: &Instruction) -> bool {
     matches!(i.mnemonic(), Mnemonic::Shl | Mnemonic::Shr | Mnemonic::Sar)
         && i.op0_kind() == OpKind::Register
         && matches!(i.op0_register().size(), 4 | 8)
-        && i.op1_kind() == OpKind::Immediate8
+        && (i.op1_kind() == OpKind::Immediate8
+            || (i.op1_kind() == OpKind::Register && i.op1_register() == Register::CL))
 }
 fn arithmetic_supported(i: &Instruction) -> bool {
     if i.op0_kind() == OpKind::Memory
@@ -365,7 +366,7 @@ pub(crate) fn translate_span(
             Code::Call_rel32_64 | Code::Call_rm64 | Code::Jmp_rm64 => {}
             _ if arithmetic_supported(&i) => {}
             _ if byte_arithmetic(&i) => {}
-            _ if immediate_shift(&i) => {}
+            _ if register_shift(&i) => {}
             _ if vector_xor(&i).is_some() => {}
             _ if vector_move(&i).is_some() => {}
             Code::VEX_Vzeroupper | Code::VEX_Vzeroall => {}
@@ -1105,12 +1106,17 @@ pub(crate) fn translate_span(
             }
             continue;
         }
-        if immediate_shift(i) {
+        if register_shift(i) {
             let wide = i.op0_register().size() == 8;
             let destination = register(i.op0_register(), wide)?;
-            let count = u64::from(i.immediate8()) & if wide { 63 } else { 31 };
             c.context_access(1, 19, destination * 8, wide, false)?;
-            c.load_u64(2, count)?;
+            if i.op1_kind() == OpKind::Register {
+                c.context_access(2, 19, 8, false, false)?; // ECX, captured before a possible ECX/RCX write
+                c.emit(if wide { 0x53001442 } else { 0x53001042 })?; // UBFX w2,w2,#0,#6/#5
+            } else {
+                let count = u64::from(i.immediate8()) & if wide { 63 } else { 31 };
+                c.load_u64(2, count)?;
+            }
             let (opcode, operation) = match i.mnemonic() {
                 Mnemonic::Shl => (0x1ac22023, 0),
                 Mnemonic::Shr => (0x1ac22423, 1),

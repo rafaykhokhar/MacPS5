@@ -1632,3 +1632,29 @@ pending, game main has not executed, and PS5 gameplay remains unsupported.
 The startup-only run skips Metal presentation. CPU completeness remains the
 priority; reaching a library boundary does not justify calling the translator
 production-ready.
+
+## Direct CL-count register shifts
+
+Direct SHL/SHR/SAR on 32/64-bit registers now accepts CL counts as well as
+immediate counts. Both the original destination and ECX are captured before
+the destination changes, so shifts of ECX/RCX itself use the original count.
+ARM64 UBFX masks the count to five or six bits before the variable shift and
+the existing flag helper. Counts of zero preserve flags; undefined AF and
+multi-bit OF retain the existing deterministic policy of preserving old values.
+Memory destinations and 8/16-bit shifts remain unsupported by this direct path.
+
+The expanded `rust/verification/direct_shift_native.rs` compares both count
+forms against iterative one-bit shifts and independent flag rules. It covers
+all 256 CL values, every destination register including ECX/RCX, both widths,
+sign boundaries and nonzero bits above CL that must not affect the count.
+Immediate forms are checked alongside CL forms to protect the shared lowering;
+the existing implicit-one, budget and pre-existing-fault checks remain.
+Reproduce with the release rlib/dependency flags above using
+`direct_shift_native.rs`.
+
+Validation passes: 589830 native shift checks, 687 library tests, three
+integration tests, strict Clippy and release build. The standalone verifier
+compiles with warnings denied. Logs are
+`/tmp/macps5-clshift-{tests,clippy,build}.log`. These checks broaden CPU coverage
+beyond the pinned startup path; no new gameplay or startup claim follows from
+them. Full CPU translation and PS5 game execution remain incomplete.
