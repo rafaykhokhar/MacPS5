@@ -419,3 +419,30 @@ full verifier, including the executor memory read, pass (process 69500 exit 0,
 verifier with the preceding release rlib/dependency flags; no arguments required.
 Byte/word MOV, memory-immediate MOV and other instruction families remain outside
 this direct path. The backend remains opt-in and incomplete.
+
+## Direct guest control flow
+
+The direct translator now accepts short/near JMP and all 16 short/near Jcc
+conditions within the submitted block. It resolves guest targets against decoded
+instruction boundaries before emission. Instruction-interior and external
+targets fail explicitly; indirect JMP, LOOP and calls remain unsupported here.
+Conditional branches use the existing guest-flags condition helper, then branch
+on its result. Every iteration re-enters the target's guest PC/fuel checks.
+The block still must end in RET64; this does not implement arbitrary control-flow
+discovery or cross-block direct linking.
+
+`direct_branch_native.rs` passes 5120 independent truth-table/fuel cases:
+16 conditions × short/near × 32 flag combinations × five fuel budgets. It checks
+register preservation, flags, PC, consumed fuel and stop reason. Three backward
+loops (short/near JMP and JNE) exhaust fuel deterministically. Invalid target and
+unsupported-form rejection pass. An Image/NativeExecutor branch program returns
+7 instead of the skipped immediate 42. Direct memory MOV (10260 cases and image
+read) and register MOV (4128 cases, 512 invalid PCs, ownership and stale-byte
+checks) regressions also pass against the final build. 687 library tests, three
+integration tests, strict Clippy and release build pass (process 57795 exit 0;
+`work/direct-branch/` final logs). Compile/run the new standalone verifier with
+the preceding release rlib/dependency flags; no arguments required.
+
+This adds functional guest control flow to the opt-in backend. Arithmetic,
+cross-block translation, automatic discovery and retail gameplay remain
+unverified or unimplemented in this direct path.

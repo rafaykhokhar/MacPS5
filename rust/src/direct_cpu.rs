@@ -59,6 +59,7 @@ pub fn translate(bytes: &[u8], address: u64, instruction_limit: usize) -> Result
             Code::Nopd | Code::Nopq | Code::Retnq => {}
             Code::Mov_r32_imm32 | Code::Mov_r64_imm64 => {}
             Code::Mov_r32_rm32 | Code::Mov_rm32_r32 | Code::Mov_r64_rm64 | Code::Mov_rm64_r64 => {}
+            _ if i.is_jcc_short_or_near() || i.is_jmp_short_or_near() => {}
             _ => return Err(format!("Direct lowering unsupported: {:?}", i.code())),
         }
         offset += i.len();
@@ -70,17 +71,31 @@ pub fn translate(bytes: &[u8], address: u64, instruction_limit: usize) -> Result
     if decoded.last().is_none_or(|i| i.code() != Code::Retnq) {
         return Err("Direct block must end in RET64".into());
     }
+    const EXIT: u32 = u32::MAX;
+    const FUEL: u32 = u32::MAX - 1;
+    if decoded.len() >= FUEL as usize {
+        return Err("Too many direct labels".into());
+    }
+    let boundaries: std::collections::BTreeMap<_, _> = decoded
+        .iter()
+        .enumerate()
+        .map(|(index, i)| (i.ip(), index as u32))
+        .collect();
+    for i in &decoded {
+        if (i.is_jcc_short_or_near() || i.is_jmp_short_or_near())
+            && !boundaries.contains_key(&i.near_branch_target())
+        {
+            return Err(
+                "Direct branch target must be an instruction boundary within the block".into(),
+            );
+        }
+    }
     let limit = decoded
         .len()
         .checked_mul(48)
         .and_then(|n| n.checked_add(32))
         .ok_or("Direct emission budget overflow")?;
     let mut c = Arm64Code::new(limit);
-    const EXIT: u32 = u32::MAX;
-    const FUEL: u32 = u32::MAX - 1;
-    if decoded.len() >= FUEL as usize {
-        return Err("Too many direct labels".into());
-    }
     c.emit(0xa9bf7bf3)?; // stp x19,x30,[sp,#-16]!
     c.emit(0xaa0003f3)?; // mov x19,x0
     c.context_access(9, 19, 152, true, false)?;
@@ -116,6 +131,28 @@ pub fn translate(bytes: &[u8], address: u64, instruction_limit: usize) -> Result
         )?;
         c.emit(0xd1000529)?; // sub x9,x9,#1
         c.context_access(9, 19, 160, true, true)?;
+        if i.is_jmp_short_or_near() {
+            c.branch(boundaries[&i.near_branch_target()], Branch::Jump)?;
+            continue;
+        }
+        if i.is_jcc_short_or_near() {
+            let condition = (i.condition_code() as u64)
+                .checked_sub(1)
+                .filter(|cc| *cc < 16)
+                .ok_or("Invalid direct branch condition")?;
+            c.emit(0xaa1303e0)?; // mov x0,x19
+            c.load_u64(1, condition)?;
+            c.call_absolute(crate::condition::ffi::native_ps5_condition_v1 as *const () as u64)?;
+            c.branch(
+                boundaries[&i.near_branch_target()],
+                Branch::CompareZero {
+                    register: 0,
+                    wide: true,
+                    nonzero: true,
+                },
+            )?;
+            continue;
+        }
         match i.code() {
             Code::Nopd | Code::Nopq => {}
             Code::Retnq => {

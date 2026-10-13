@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct guest JMP/Jcc now resolve instruction-boundary targets and preserve
+fuel limits through loops. 5120 condition/fuel cases and an actual executor
+branch program pass, alongside direct register/memory regressions. Cross-block
+targets remain unsupported. See [control-flow evidence](../docs/status/TRANSLATOR_READINESS.md#direct-guest-control-flow).
+
 Direct translation now handles guarded memory MOV32/MOV64, including indexed
 and RIP-relative addresses. 10260 native cases and an actual executor image
 read pass. Faulting loads preserve destination registers; failed stores preserve
