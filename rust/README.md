@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct PDEP/PEXT32/64 now supports register and guarded-memory masks through
+a bounded native Rust helper. All 1589248 native state checks pass, alongside
+library/integration tests and strict Clippy. See
+[parallel bit evidence](../docs/status/TRANSLATOR_READINESS.md#direct-pdep-and-pext).
+
 Direct BZHI32/64 now emits ARM64 masking and flag updates with guarded memory
 sources. All 1605632 native state checks, library/integration tests and strict
 Clippy pass. See [BZHI evidence](../docs/status/TRANSLATOR_READINESS.md#direct-bzhi).

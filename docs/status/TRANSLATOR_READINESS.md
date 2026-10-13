@@ -2061,3 +2061,29 @@ warnings denied; reproduce using the release rlib/dependency flags above and
 `direct_bzhi_native.rs`. Logs are `/tmp/macps5-bzhi-{tests,clippy,build}.log`.
 This extends the direct CPU backend; it does not establish complete instruction
 coverage, production readiness, or PS5 gameplay.
+
+## Direct PDEP and PEXT
+
+Direct VEX PDEP/PEXT supports 32/64-bit operands, with a register value and a
+register or guarded-memory mask. A native Rust helper scatters or gathers bits
+by removing the mask's lowest set bit on each iteration, bounded by 64
+iterations. Inputs are captured before destination writes; dword inputs and
+outputs zero-extend. Guest flags remain unchanged, and memory-read faults
+preserve destination state. Semantics and operand ordering follow the
+[Intel instruction reference](https://cdrdv2-public.intel.com/868141/253667-089-sdm-vol-2b.pdf).
+
+`rust/verification/direct_parallel_bits_native.rs` constructs an independent
+list of selected bit positions and maps input bits to output positions. Native
+execution covers every destination/value/mask register triple, both widths and
+operations, register and memory aliases, zero/all-one/alternating/sparse masks,
+and valid, unaligned, short and overflowing reads. Additional sweeps exhaust
+all byte-sized value/mask pairs and every single-bit value/mask pair across
+64 bits. Full GPR, flags, RIP, memory and fault/fuel/stop state are checked.
+
+Validation passes: 1589248 native cases, 687 library tests, three integration
+tests, strict Clippy and release build. The standalone verifier compiles with
+warnings denied; reproduce using the release rlib/dependency flags above and
+`direct_parallel_bits_native.rs`. Logs are
+`/tmp/macps5-parallel-bits-{tests,clippy,build}.log`. These are correctness
+checks for this instruction family; helper performance, production translator
+readiness and PS5 gameplay are not established.

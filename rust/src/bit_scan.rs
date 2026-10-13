@@ -1,6 +1,27 @@
 //! Bit scans, counts and BMI1 lowest-bit operations with undefined-state preservation.
 use crate::legacy_cpu::Cpu;
 
+/// PDEP (deposit != 0) or PEXT (deposit == 0). Callers truncate both inputs
+/// for dword operations. Iteration is bounded by the mask's 64 set bits.
+pub extern "C" fn parallel_bits(mut mask: u64, source: u64, deposit: u64) -> u64 {
+    let mut packed = 1u64;
+    let mut result = 0;
+    while mask != 0 {
+        let selected = mask & mask.wrapping_neg();
+        let (input, output) = if deposit != 0 {
+            (packed, selected)
+        } else {
+            (selected, packed)
+        };
+        if source & input != 0 {
+            result |= output;
+        }
+        mask &= mask - 1;
+        packed = packed.wrapping_shl(1);
+    }
+    result
+}
+
 /// Operations 0=BSF, 1=BSR, 2=LZCNT, 3=TZCNT, 4=POPCNT, 5=BLSI, 6=BLSMSK, 7=BLSR.
 pub fn execute(cpu: &mut Cpu, value: u64, destination: u64, size: u64, operation: u64) {
     if cpu.fault != 0 {

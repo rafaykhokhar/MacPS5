@@ -466,6 +466,10 @@ pub(crate) fn translate_span(
                 if !i.has_lock_prefix() => {}
             Code::VEX_Bextr_r32_rm32_r32 | Code::VEX_Bextr_r64_rm64_r64 => {}
             Code::VEX_Bzhi_r32_rm32_r32 | Code::VEX_Bzhi_r64_rm64_r64 => {}
+            Code::VEX_Pdep_r32_r32_rm32
+            | Code::VEX_Pdep_r64_r64_rm64
+            | Code::VEX_Pext_r32_r32_rm32
+            | Code::VEX_Pext_r64_r64_rm64 => {}
             _ if bmi_shift(&i).is_some() => {}
             _ if movbe(&i) => {}
             _ if carry_arithmetic(&i) => {}
@@ -781,6 +785,10 @@ pub(crate) fn translate_span(
                 | Code::VEX_Bextr_r64_rm64_r64
                 | Code::VEX_Bzhi_r32_rm32_r32
                 | Code::VEX_Bzhi_r64_rm64_r64
+                | Code::VEX_Pdep_r32_r32_rm32
+                | Code::VEX_Pdep_r64_r64_rm64
+                | Code::VEX_Pext_r32_r32_rm32
+                | Code::VEX_Pext_r64_r64_rm64
                 | Code::VEX_Andn_r32_r32_rm32
                 | Code::VEX_Andn_r64_r64_rm64
                 | Code::VEX_Rorx_r32_rm32_imm8
@@ -793,8 +801,9 @@ pub(crate) fn translate_span(
             let dst = register(i.op0_register(), wide)?;
             let andn = i.mnemonic() == Mnemonic::Andn;
             let mulx = i.mnemonic() == Mnemonic::Mulx;
-            let data_operand = if andn || mulx { 2 } else { 1 };
-            let other_operand = if andn { 1 } else { 2 };
+            let permute = matches!(i.mnemonic(), Mnemonic::Pdep | Mnemonic::Pext);
+            let data_operand = if andn || mulx || permute { 2 } else { 1 };
+            let other_operand = if andn || permute { 1 } else { 2 };
             if i.op_kind(data_operand) == OpKind::Memory {
                 memory_address(&mut c, i)?;
                 c.emit(0xaa1303e0)?;
@@ -847,6 +856,12 @@ pub(crate) fn translate_span(
                 wide,
                 false,
             )?;
+            if permute {
+                c.load_u64(2, u64::from(i.mnemonic() == Mnemonic::Pdep))?;
+                c.call_absolute(crate::bit_scan::parallel_bits as *const () as u64)?;
+                c.context_access(0, 19, dst * 8, true, true)?;
+                continue; // PDEP/PEXT preserve every guest flag.
+            }
             if i.mnemonic() == Mnemonic::Bzhi {
                 c.emit(0xd3401c29)?; // ubfx x9,x1,#0,#8: only low index byte
                 c.load_u64(10, 1)?;
