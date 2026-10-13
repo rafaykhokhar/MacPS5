@@ -1,5 +1,10 @@
 # Rust migration
 
+On-demand direct translation now joins existing instruction boundaries when a
+new predecessor reaches cached code. Native checks verify exact instruction/fuel
+budgets and 40 cached repeats with no added JIT allocation. See
+[join evidence](../docs/status/TRANSLATOR_READINESS.md#joining-existing-direct-spans).
+
 The direct backend now supports opt-in observed-target translation from an
 immutable ELF source. A native executor test discovers its entry, callee, return
 continuation and indirect tail target on demand, returning 42 across 20 runs

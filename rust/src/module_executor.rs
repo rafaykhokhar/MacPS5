@@ -3210,7 +3210,7 @@ impl NativeExecutor {
         if self.direct_sources.contains_key(&image.bias) {
             return Err("Image owns automatic direct translation source".into());
         }
-        unsafe { self.publish_direct_in_image(image, offset, bytes, instruction_limit, arena) }
+        unsafe { self.publish_direct_in_image(image, offset, bytes, instruction_limit, arena, false) }
     }
     /// Retain an immutable ELF for bounded, observed-target direct translation.
     /// Enable `set_automatic_translation` separately. Unsupported instructions
@@ -3260,7 +3260,12 @@ impl NativeExecutor {
         let mut bytes = Vec::new();
         let mut count = 0;
         let mut entries = Vec::new();
+        let mut fallthrough = false;
         loop {
+            if count != 0 && self.image_blocks.contains_key(&(image.bias, pc)) {
+                fallthrough = true;
+                break;
+            }
             if count >= limit { return Err("Direct source instruction budget exhausted".into()); }
             let raw = elf.code(pc, 15)?;
             let instruction = crate::decode::instruction(raw, pc)?;
@@ -3282,7 +3287,7 @@ impl NativeExecutor {
         for (&(bias, _), block) in &self.image_blocks {
             if bias == image.bias { validate_translation_bytes(image, block.start, &block.bytes)?; }
         }
-        unsafe { self.publish_direct_in_image(image, start, &bytes, count, &arena)?; }
+        unsafe { self.publish_direct_in_image(image, start, &bytes, count, &arena, fallthrough)?; }
         // Every decoded instruction is a valid dispatcher entry into the same
         // generated function. Share backing bytes and the pinned JIT allocation.
         for pc in entries.into_iter().skip(1) {
@@ -3297,12 +3302,13 @@ impl NativeExecutor {
     unsafe fn publish_direct_in_image(
         &mut self, image: &Image, offset: u64, bytes: &[u8],
         instruction_limit: usize, arena: &crate::jit_memory::JitArena,
+        fallthrough: bool,
     ) -> Result<()> {
         if self.image_blocks.contains_key(&(image.bias,offset)) || self.translation_sources.contains_key(&image.bias) {
             return Err("Image translation already registered".into());
         }
         validate_translation_bytes(image,offset,bytes)?;
-        let words = crate::direct_cpu::translate(bytes,offset,instruction_limit)?;
+        let words = crate::direct_cpu::translate_span(bytes,offset,instruction_limit,fallthrough)?;
         // SAFETY: trusted direct lowering emits the Cpu ABI; caller provides
         // exclusive/quiescent publication and the block pins its code below.
         let code = unsafe { arena.publish(&words)? };

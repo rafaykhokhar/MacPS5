@@ -64,6 +64,16 @@ fn register(register: Register, wide: bool) -> Result<usize> {
     }
 }
 pub fn translate(bytes: &[u8], address: u64, instruction_limit: usize) -> Result<Vec<u32>> {
+    translate_span(bytes, address, instruction_limit, false)
+}
+/// Permit a dispatcher handoff at the end of a nonterminal span when discovery
+/// has verified that the following PC already has a registered translation.
+pub(crate) fn translate_span(
+    bytes: &[u8],
+    address: u64,
+    instruction_limit: usize,
+    fallthrough: bool,
+) -> Result<Vec<u32>> {
     let mut decoded = Vec::new();
     let mut offset = 0;
     while offset < bytes.len() {
@@ -99,7 +109,8 @@ pub fn translate(bytes: &[u8], address: u64, instruction_limit: usize) -> Result
         decoded.push(i);
     }
     if decoded.last().is_none_or(|i| {
-        i.code() != Code::Retnq
+        !(fallthrough && i.flow_control() == iced_x86::FlowControl::Next)
+            && i.code() != Code::Retnq
             && !matches!(
                 i.code(),
                 Code::Call_rel32_64 | Code::Call_rm64 | Code::Jmp_rm64
@@ -121,7 +132,7 @@ pub fn translate(bytes: &[u8], address: u64, instruction_limit: usize) -> Result
         .collect();
     let end = decoded.last().unwrap().next_ip();
     let mut external = std::collections::BTreeSet::new();
-    if decoded.last().unwrap().is_jcc_short_or_near() {
+    if fallthrough || decoded.last().unwrap().is_jcc_short_or_near() {
         external.insert(end);
     }
     for i in &decoded {
@@ -352,7 +363,7 @@ pub fn translate(bytes: &[u8], address: u64, instruction_limit: usize) -> Result
             }
         }
     }
-    if decoded.last().unwrap().is_jcc_short_or_near() {
+    if fallthrough || decoded.last().unwrap().is_jcc_short_or_near() {
         c.branch(boundaries[&end], Branch::Jump)?;
     }
     for target in external {

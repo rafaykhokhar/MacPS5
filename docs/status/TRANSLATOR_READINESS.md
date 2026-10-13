@@ -657,9 +657,9 @@ not covered by the new native verifier.
 
 Discovery scans one straight-line span through its first control-flow boundary.
 Each decoded instruction PC shares the emitted function's dispatcher and pinned
-allocation. New overlapping spans are rejected, including instruction-interior
-targets. This conservative rule also rejects valid newly discovered predecessors
-that run into an existing span; merging such spans remains unfinished. Live
+allocation. New overlapping instructions are rejected, including instruction-interior
+targets. The subsequent join change below allows newly discovered predecessors
+to hand off at an existing instruction boundary. Live
 executable bytes must match the immutable source before publication and execution.
 Unsupported instructions fail explicitly with no dylib fallback.
 
@@ -685,3 +685,26 @@ indirect-jump, cross-block and register-MOV native regressions pass (process 726
 exit 0). Reproduce the new verifier with the release rlib/dependency flags above;
 it takes no arguments. This is initial opt-in automatic direct execution, not
 production readiness or PS5 game compatibility.
+
+## Joining existing direct spans
+
+Observed-target discovery now stops before an already registered instruction PC.
+The direct emitter lowers the preceding nonterminal span with an explicit
+dispatcher fallthrough to that PC. The handoff adds no synthetic guest instruction
+and consumes no extra instruction fuel. Cached code and backing bytes remain
+pinned; instruction-interior or crossing overlaps still fail. Manual block
+registration retains its terminal-instruction requirement.
+
+`direct_join_native.rs` first translates a suffix, then discovers its predecessor
+at runtime. Two suffix boundaries and fuel limits 2/3/100 verify exact guest
+instruction accounting: a three-instruction program fits the source limit of
+three and returns 42 with fuel three, but stops with fuel two. Forty additional
+cached runs allocate no new arena bytes. Mutating an existing suffix rejects
+predecessor publication before any arena allocation.
+
+Process 18007 exited 0 after 687 library tests, three integration tests, strict
+Clippy, release build, the new strict-warning native verifier and automatic,
+indirect-call/jump and conditional-branch regressions. Reproduce the standalone
+verifier with the release rlib/dependency flags above; it takes no arguments.
+The direct backend remains opt-in with limited instruction coverage and a
+16-attempt source limit. PS5 game compatibility remains unverified.
