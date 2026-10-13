@@ -77,6 +77,7 @@ mod strftime_native;
 mod strtof_native;
 mod strtold_native;
 mod vmovd_native;
+mod vmovq_native;
 mod cvtsi2sd_native;
 mod vpxor_native;
 mod system_service_native;
@@ -182,6 +183,7 @@ fn main() -> Result<(), String> {
         strtof_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtof"))?;
         strtold_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtold"))?;
         vmovd_native::verify(Path::new(&archive), &Path::new(&directory).join("vmovd"))?;
+        vmovq_native::verify(Path::new(&archive), &Path::new(&directory).join("vmovq"))?;
         cvtsi2sd_native::verify(Path::new(&archive), &Path::new(&directory).join("cvtsi2sd"))?;
         vpxor_native::verify(Path::new(&archive), &Path::new(&directory).join("vpxor"))?;
         semaphore_native::verify(&file, Path::new(&archive), Path::new(&directory))?;

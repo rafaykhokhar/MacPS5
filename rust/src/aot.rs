@@ -37,6 +37,37 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn scalar_vector_moves_accept_exact_vex_forms() {
+        for bytes in [
+            &[0xc5, 0xf9, 0x6e, 0xc1][..],   // VMOVD xmm0,ecx
+            &[0xc5, 0xf9, 0x7e, 0xc1],       // VMOVD ecx,xmm0
+            &[0xc4, 0xe1, 0xf9, 0x6e, 0xc1], // VMOVQ xmm0,rcx
+            &[0xc4, 0xe1, 0xf9, 0x7e, 0xc1], // VMOVQ rcx,xmm0
+            &[0xc5, 0xfa, 0x7e, 0xc1],       // VMOVQ xmm0,xmm1
+            &[0xc5, 0xf9, 0xd6, 0xc1],       // VMOVQ xmm1,xmm0
+            &[0xc5, 0xfa, 0x7e, 0x07],       // VMOVQ xmm0,[rdi]
+            &[0xc5, 0xf9, 0xd6, 0x07],       // VMOVQ [rdi],xmm0
+        ] {
+            assert!(
+                super::translate_rust_memory_region(bytes, 0, "scalar_move").is_ok(),
+                "{bytes:x?}"
+            );
+        }
+        for bytes in [
+            &[0x66, 0x0f, 0xd6, 0xc1][..], // legacy MOVQ is distinct
+            &[0xc5, 0xfd, 0xd6, 0xc1],     // VEX.L=1
+            &[0x64, 0xc5, 0xfa, 0x7e, 0x07],
+            &[0x65, 0xc5, 0xf9, 0xd6, 0x07],
+            &[0x67, 0xc5, 0xfa, 0x7e, 0x07],
+            &[0x67, 0xc5, 0xf9, 0xd6, 0x04, 0x25, 0, 0, 0, 0],
+        ] {
+            assert!(
+                super::translate_rust_memory_region(bytes, 0, "unsupported_move").is_err(),
+                "{bytes:x?}"
+            );
+        }
+    }
+    #[test]
     fn unsigned_multiply_exact_forms_and_guards() {
         for (prefix, opcode) in [
             (&[][..], 0xf6),
@@ -808,18 +839,45 @@ impl Emitter {
                     dst + 24
                 ));
             }
-            M::Vmovd => {
-                if i.code() != iced_x86::Code::VEX_Vmovd_xmm_rm32 {
-                    return Err("Only VEX VMOVD r/m32-to-XMM is implemented".into());
+            M::Vmovd | M::Vmovq => {
+                use iced_x86::Code;
+                let scalar_width = match i.code() {
+                    Code::VEX_Vmovd_xmm_rm32 | Code::VEX_Vmovd_rm32_xmm => 32,
+                    Code::VEX_Vmovq_xmm_rm64
+                    | Code::VEX_Vmovq_rm64_xmm
+                    | Code::VEX_Vmovq_xmm_xmmm64
+                    | Code::VEX_Vmovq_xmmm64_xmm => 64,
+                    _ => return Err("Only VEX VMOVD/VMOVQ forms are implemented".into()),
+                };
+                if (i.op0_kind() == OpKind::Memory || i.op1_kind() == OpKind::Memory)
+                    && i.memory_base() == R::None
+                    && i.memory_index() == R::None
+                    && i.memory_displ_size() != 8
+                {
+                    return Err("32-bit absolute addressing is not implemented".into());
                 }
-                let dst = vector(i.op_register(0))?;
-                self.read(i, 1, 32, 20)?;
-                // Integer bit-copy; VEX clears all modeled bits above bit31.
-                // Commit only after the complete guarded four-byte read.
-                self.emit(format!(
-                    "mov w20, w20\nstr x20, [x19, #{}]\nstr xzr, [x19, #{}]\nstr xzr, [x19, #{}]\nstr xzr, [x19, #{}]",
-                    208 + dst * 32, 216 + dst * 32, 224 + dst * 32, 232 + dst * 32
-                ));
+                if i.op1_kind() == OpKind::Register && i.op1_register().is_xmm() {
+                    let src = 208 + vector(i.op1_register())? * 32;
+                    let register = if scalar_width == 32 { "w20" } else { "x20" };
+                    self.emit(format!("ldr {register}, [x19, #{src}]"));
+                } else {
+                    self.read(i, 1, scalar_width, 20)?;
+                }
+                // Snapshot input before aliases change. VEX vector destinations
+                // zero every modeled bit above the copied scalar; scalar stores
+                // leave the source vector untouched and use exact-width guards.
+                if i.op0_kind() == OpKind::Register && i.op0_register().is_xmm() {
+                    let dst = 208 + vector(i.op0_register())? * 32;
+                    if scalar_width == 32 {
+                        self.emit("mov w20, w20");
+                    }
+                    self.emit(format!(
+                        "str x20, [x19, #{dst}]\nstr xzr, [x19, #{}]\nstr xzr, [x19, #{}]\nstr xzr, [x19, #{}]",
+                        dst + 8, dst + 16, dst + 24
+                    ));
+                } else {
+                    self.write(i, 0, scalar_width, 20)?;
+                }
             }
             M::Vmovsd => {
                 if i.code() != iced_x86::Code::VEX_Vmovsd_xmm_m64 {

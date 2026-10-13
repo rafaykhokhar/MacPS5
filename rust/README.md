@@ -1,5 +1,12 @@
 # Rust migration
 
+VEX VMOVQ now supports all four encoding families; reverse VMOVD is supported
+too. The matching build passes 606 library tests, three integration tests,
+strict Clippy and 86,352 new native checks plus the 8,219 forward-VMOVD
+regressions. Homebrew discovery passes 16 former stops and reaches 54,266
+instructions. Startup still stops at missing `fscanf`, before game main.
+See [CPU evidence](../docs/status/CPU.md).
+
 Byte DIV/IDIV now translates with AX input, AL/AH outputs and atomic modeled
 divide errors. The matching build passes 605 library tests, three integration
 tests, strict Clippy, 1,120,336 native byte-division checks and 175,008 existing

@@ -1,5 +1,39 @@
 # CPU completion criteria
 
+## VEX scalar vector moves
+
+All four VEX VMOVQ encoding families now lower: GPR/m64 to XMM, XMM to
+GPR/m64, XMM/m64 to XMM and XMM to XMM/m64. Reverse VMOVD (XMM to GPR/m32)
+is also supported. Vector destinations clear modeled bits above the copied
+scalar; dword GPR destinations zero-extend. Inputs are captured before aliasing
+outputs change, stores preserve the source vector, and failed memory accesses
+leave destinations unchanged. Exact Code selection excludes legacy and EVEX
+forms. The decoder rejects reserved VEX.L=1; WIG variants remain accepted.
+Address32 and FS/GS remain rejected.
+
+Reference: retained AMD APM Volume 4 rev.3.24, pp.186–187 and222–223,
+MOVD/VMOVD and MOVQ/VMOVQ ([AMD manual landing page](https://docs.amd.com/v/u/en-US/26568_3.26_APM_Vol4)).
+
+The matching build passes 606 library tests, three integration tests, strict
+Clippy and release compilation (`work/vmovq-native/{tests,clippy,release}.log`,
+process 59874 exit 0). The [new verifier](../../rust/verification/vmovq_native.rs)
+passes 86,352 native ARM64 checks across 42 decoded forms, with independent
+byte-copy expectations, high registers, self-aliases, WIG encodings,
+unaligned/high/RIP-relative memory, short spans, readonly stores, flags/FP
+preservation and execution guards (`work/vmovq-native/native.log`, process
+25408 exit 0). The existing forward VMOVD suite also passes all 8,219 checks
+(`work/vmovq-native/vmovd-regression.log`, process 98946 exit 0); its obsolete
+reverse-direction rejection was removed because the new suite verifies it.
+
+Pinned homebrew discovery advances from 54,225 to 54,266 instructions and
+12,507 blocks. Sixteen previous boundaries disappear (15 VMOVQ and one reverse
+VMOVD); eighteen newly reachable boundaries appear, giving 208 total. This is
+discovery progress, not executed gameplay or a CPU coverage percentage.
+The combined verifier compiles and the startup-only run passes its existing
+boundary assertions (`work/vmovq-native/entry.log`, process 25408 exit 0):
+all ten named dependencies accepted, unresolved `fscanf`, 20,288 dependency
+bytes still owned, cleanup pending and game main not executed.
+
 ## Byte division
 
 DIV/IDIV r/m8 now translate through the Rust arithmetic helper. The dividend is

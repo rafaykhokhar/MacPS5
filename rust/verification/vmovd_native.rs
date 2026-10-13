@@ -31,7 +31,6 @@ pub fn verify(archive: &Path, directory: &Path) -> Result<(), String> {
         )?);
     }
     for bytes in [
-        &[0xc5, 0xf9, 0x7e, 0xc1][..],
         &[0x66, 0x0f, 0x6e, 0xc1][..],
         &[0xc5, 0xfd, 0x6e, 0xc1][..],
     ] {
