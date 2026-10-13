@@ -5,6 +5,16 @@ use crate::{
     decode,
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
+fn extending_move(i: &Instruction) -> Option<(u64, bool)> {
+    match i.code() {
+        Code::Movzx_r32_rm8 | Code::Movzx_r64_rm8 => Some((1, false)),
+        Code::Movzx_r32_rm16 | Code::Movzx_r64_rm16 => Some((2, false)),
+        Code::Movsx_r16_rm8 | Code::Movsx_r32_rm8 | Code::Movsx_r64_rm8 => Some((1, true)),
+        Code::Movsx_r32_rm16 | Code::Movsx_r64_rm16 => Some((2, true)),
+        Code::Movsxd_r64_rm32 => Some((4, true)),
+        _ => None,
+    }
+}
 fn conditional_move(i: &Instruction) -> bool {
     matches!(
         i.code(),
@@ -269,6 +279,7 @@ pub(crate) fn translate_span(
             | Code::Movzx_r64_rm8
             | Code::Movzx_r32_rm16
             | Code::Movzx_r64_rm16 => {}
+            _ if extending_move(&i).is_some() => {}
             Code::Mov_r32_rm32 | Code::Mov_rm32_r32 | Code::Mov_r64_rm64 | Code::Mov_rm64_r64 => {}
             _ if i.is_jcc_short_or_near() || i.is_jmp_short_or_near() => {}
             _ if setcc(&i) => {}
@@ -585,15 +596,11 @@ pub(crate) fn translate_span(
             c.context_access(1, 19, 152, true, true)?;
             continue;
         }
-        if matches!(
-            i.code(),
-            Code::Movzx_r32_rm8 | Code::Movzx_r64_rm8 | Code::Movzx_r32_rm16 | Code::Movzx_r64_rm16
-        ) {
-            let byte = matches!(i.code(), Code::Movzx_r32_rm8 | Code::Movzx_r64_rm8);
+        if let Some((source_size, signed)) = extending_move(i) {
             if i.op1_kind() == OpKind::Memory {
                 memory_address(&mut c, i)?;
                 c.emit(0xaa1303e0)?; // mov x0,x19
-                c.load_u64(2, if byte { 1 } else { 2 })?;
+                c.load_u64(2, source_size)?;
                 c.call_absolute(
                     crate::guest_memory::ffi::native_ps5_module_load_v1 as *const () as u64,
                 )?;
@@ -606,22 +613,34 @@ pub(crate) fn translate_span(
                         nonzero: true,
                     },
                 )?;
-            } else if byte {
+            } else if source_size == 1 {
                 c.emit(0x39400260 | (byte_offset(i.op1_register())? << 10))?; // ldrb w0,[x19,#offset]
-            } else {
+            } else if source_size == 2 {
                 let r = i.op1_register() as u32;
                 if !(Register::AX as u32..=Register::R15W as u32).contains(&r) {
                     return Err("Invalid direct word register".into());
                 }
                 c.emit(0x79400260 | (((r - Register::AX as u32) * 4) << 10))?; // ldrh w0,[x19,#reg*8]
+            } else {
+                c.context_access(0, 19, register(i.op1_register(), false)? * 8, false, false)?;
             }
-            c.context_access(
-                0,
-                19,
-                register(i.op0_register(), i.op0_register().size() == 8)? * 8,
-                true,
-                true,
-            )?;
+            let destination_size = i.op0_register().size();
+            if signed {
+                // SBFM aliases SXTB/SXTH/SXTW, with W writes zeroing host upper bits.
+                c.emit(
+                    (if destination_size == 8 {
+                        0x93400000
+                    } else {
+                        0x13000000
+                    }) | (((source_size as u32 * 8) - 1) << 10),
+                )?;
+            }
+            let dst = register(i.op0_register().full_register(), true)?;
+            if destination_size == 2 {
+                c.emit(0x79000260 | ((dst as u32 * 4) << 10))?; // strh w0
+            } else {
+                c.context_access(0, 19, dst * 8, true, true)?;
+            }
             continue;
         }
         if matches!(

@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct MOVSX/MOVSXD now sign-extends byte/word/dword register and guarded memory
+sources. 102400 native cases and 24608 MOVZX regression cases pass. Configured
+startup passes the block at 0x31e8 and reaches a byte-memory CMP gap at 0x880.
+See [signed move evidence](../docs/status/TRANSLATOR_READINESS.md#direct-sign-extending-moves).
+
 Direct CMOVcc now supports all 16 conditions at 16/32/64 bits, including guarded
 memory reads on false conditions. 2359300 native state checks pass. Configured
 startup translates past CMOVL in the block at 0x31e8 but now rejects MOVSXD;

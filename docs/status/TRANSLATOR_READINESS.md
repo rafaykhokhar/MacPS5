@@ -1157,3 +1157,35 @@ translation, but this entire block has not executed. Logs are
 `/tmp/macps5-cmov-{tests,clippy,build,startup}.log`. Sign-extending move lowering is
 the next observed CPU gap. Complete bootstrap and PS5 gameplay remain unproven;
 this startup-only run skips Metal presentation.
+
+## Direct sign-extending moves
+
+The direct backend now accepts MOVSX from byte sources to 16/32/64-bit
+registers, MOVSX from word sources to 32/64-bit registers, and MOVSXD from dword
+sources to 64-bit registers. Operand loading is shared with the existing MOVZX
+path. Memory reads are guarded before destination writes; register reads handle
+legacy high bytes and REX byte registers. ARM64 SBFM sign-extends to the requested
+width. A 16-bit destination write preserves surrounding bits, while a 32-bit write
+clears its upper half. Flags remain unchanged. Non-widening MOVSXD forms are not
+added by this change.
+
+The standalone `rust/verification/direct_movsx_native.rs` exercises every GPR
+source/destination pair for the six forms, sign boundaries from each source
+width, base/destination aliases, unaligned and exact-end memory operands,
+short reads and address overflow. An independent widened signed-arithmetic
+reference computes expected destination bits. All 256 legacy high-byte values
+are checked with both 16-bit and 32-bit destinations. The existing MOVZX native
+verifier is also rerun because its load path is shared.
+
+Validation passes: 102400 signed-move native cases, 24608 MOVZX regression cases,
+687 library tests, three integration tests, strict Clippy and release build.
+Both standalone verifiers compile with warnings denied. Reproduce using the
+release rlib/dependency flags above with `direct_movsx_native.rs` and
+`direct_movzx_native.rs`.
+
+Configured `--direct-startup` proceeds beyond the previous block at 0x31e8 and
+exits 1 at the new observed block at image-relative 0x880:
+`Direct lowering unsupported: Cmp_rm8_imm8`. The first real dlsym lookup remains
+recorded. Logs are `/tmp/macps5-movsx-{tests,clippy,build,startup}.log`.
+The next CPU gap is byte-memory comparison; bootstrap and PS5 gameplay are still
+incomplete. The startup-only harness skips Metal presentation.
