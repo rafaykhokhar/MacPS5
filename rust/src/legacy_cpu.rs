@@ -1,4 +1,6 @@
-//! Temporary layout shared with the retained C++ guest CPU. No pointer ownership.
+//! Rust CPU context retaining the historical C++ field offsets in its prefix.
+//! The appended x87 stack requires Rust-sized allocation; the historical C++
+//! context cannot be passed to helpers that access the extension.
 #[repr(C, align(16))]
 #[derive(Clone)]
 pub struct Cpu {
@@ -12,11 +14,12 @@ pub struct Cpu {
     pub target: u64,
     pub memory: u64,
     pub next_rip: u64,
-    /// Independent guest SIMD and x87 environments, preserving the720-byte ABI.
+    /// Independent guest SIMD and x87 environments in the historical prefix.
     pub mxcsr: u32,
     pub x87_control: u16,
     pub x87_status: u16,
     pub vectors: [[u8; 32]; 16],
+    pub x87: crate::x87_state::Stack,
 }
 impl Default for Cpu {
     fn default() -> Self {
@@ -35,6 +38,7 @@ impl Default for Cpu {
             x87_control: 0x037f,
             x87_status: 0,
             vectors: [[0; 32]; 16],
+            x87: Default::default(),
         }
     }
 }
@@ -44,7 +48,7 @@ mod tests {
     use std::mem::{align_of, offset_of, size_of};
     #[test]
     fn legacy_layout() {
-        assert_eq!(size_of::<Cpu>(), 720);
+        assert_eq!(size_of::<Cpu>(), 816);
         assert_eq!(align_of::<Cpu>(), 16);
         assert_eq!(offset_of!(Cpu, flags), 136);
         assert_eq!(offset_of!(Cpu, fault), 152);
@@ -53,5 +57,6 @@ mod tests {
         assert_eq!(offset_of!(Cpu, mxcsr), 200);
         assert_eq!(offset_of!(Cpu, x87_control), 204);
         assert_eq!(offset_of!(Cpu, x87_status), 206);
+        assert_eq!(offset_of!(Cpu, x87), 720);
     }
 }

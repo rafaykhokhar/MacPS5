@@ -72,7 +72,7 @@ pub struct Transfer {
     pub masked_stack_fault: bool,
 }
 /// Physical register order R0..R7, with two tag bits per physical register.
-/// `repr(C)` gives an 82-byte appendable payload; this does not change Cpu yet.
+/// `repr(C)` gives an 82-byte payload appended to the Rust CPU context.
 #[repr(C)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stack {

@@ -1,5 +1,24 @@
 # CPU completion criteria
 
+## x87 context integration
+
+The Rust CPU now owns eight raw 80-bit registers and physical tags. Its size is
+816 bytes, with the stack at offset 720; all historical prefix offsets remain
+unchanged. Historical C++ 720-byte allocations are not valid extended contexts.
+Native runners and runtime archives must be rebuilt together.
+
+Continuation and abort snapshots retain the full stack. A dispatcher regression
+seeds a nonzero TOP and precision beyond binary64, overwrites the handler state,
+and checks exact restoration. Child creation now copies the stack along with its
+control/status words, rather than combining inherited TOP with empty tags. This
+is an explicit runtime inheritance policy pending PS5-specific verification.
+
+Validation: 484 library tests, three integration tests, strict all-target Clippy,
+release build, and the matching native arithmetic suite pass. Native arithmetic
+checks preserve compatibility of the existing prefix; they do not verify x87
+instruction execution. x87 arithmetic, architectural exception delivery and
+callable `strtold` remain incomplete.
+
 **CPU completion is unproven. No overall CPU percentage is available.** The existing progress graphic tracks selected checkpoints, not the complete instruction set. Instruction discovery counts from one executable are not a compatibility denominator, and discovered instructions are not necessarily executed instructions.
 
 The [initial form inventory](CPU_INVENTORY.md) now maps implemented families to focused verification evidence and groups the pinned executable's observed static lowering boundaries. It records exact source/artifact hashes. It remains a starting audit, not an exhaustive target ISA inventory.

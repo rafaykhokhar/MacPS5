@@ -1530,6 +1530,14 @@ pub enum ThreadOperation {
         thread: u64,
     },
 }
+/// Runtime inheritance policy: preserve the x87 environment and register stack
+/// together. Exact PS5 kernel inheritance remains to be independently verified.
+#[derive(Clone)]
+pub struct X87Environment {
+    control: u16,
+    status: u16,
+    stack: crate::x87_state::Stack,
+}
 pub struct ThreadRequest {
     owner: Rc<()>,
     continuation: Option<Continuation>,
@@ -1580,13 +1588,17 @@ impl ThreadRequest {
             .cpu
             .mxcsr)
     }
-    pub fn x87_environment(&self) -> Result<(u16, u16)> {
+    pub fn x87_environment(&self) -> Result<X87Environment> {
         let cpu = &self
             .continuation
             .as_ref()
             .ok_or("Thread request already consumed")?
             .cpu;
-        Ok((cpu.x87_control, cpu.x87_status))
+        Ok(X87Environment {
+            control: cpu.x87_control,
+            status: cpu.x87_status,
+            stack: cpu.x87.clone(),
+        })
     }
 }
 pub enum Execution {
@@ -2191,7 +2203,7 @@ impl NativeExecutor {
         &mut self,
         image: &Image,
         dependencies: &[&mut Image],
-        setup: (u64, u64, u64, u32, u64, (u16, u16)),
+        setup: (u64, u64, u64, u32, u64, X87Environment),
         data: &mut [DataRegion<'_>],
     ) -> Result<QuantumYield> {
         let (thread, entry, argument, mxcsr, stack_size, x87) = setup;
@@ -2263,8 +2275,9 @@ impl NativeExecutor {
             rip: entry - owner.bias,
             fuel: self.fuel,
             mxcsr,
-            x87_control: x87.0,
-            x87_status: x87.1,
+            x87_control: x87.control,
+            x87_status: x87.status,
+            x87: x87.stack,
             ..Cpu::default()
         };
         cpu.registers[4] = address + stack_size - 8;
@@ -7209,6 +7222,12 @@ mod abort_dispatch_tests {
         );
         let mut state = pending(&image);
         state.quantum = Some(1);
+        // Keep precision beyond binary64 and a nonzero TOP across the handler.
+        state.cpu.x87.push_raw(
+            0x037f,
+            &mut state.cpu.x87_status,
+            [1, 0, 0, 0, 0, 0, 0, 0x80, 0xff, 0x3f],
+        ).unwrap();
         let original = state.cpu.clone();
         let Execution::QuantumYield(mut wait) = n
             .execute_flow(
@@ -7246,6 +7265,7 @@ mod abort_dispatch_tests {
         saved.cpu.mxcsr = 0;
         saved.cpu.x87_control = 0;
         saved.cpu.x87_status = 0;
+        saved.cpu.x87 = Default::default();
         saved.cpu.vectors.fill([0; 32]);
         saved.cpu.registers[7] = 99;
         saved.cpu.fuel = 9;
@@ -7260,6 +7280,7 @@ mod abort_dispatch_tests {
         assert_eq!(restored.mxcsr, original.mxcsr);
         assert_eq!(restored.x87_control, original.x87_control);
         assert_eq!(restored.x87_status, original.x87_status);
+        assert_eq!(restored.x87, original.x87);
         assert_eq!(restored.vectors, original.vectors);
         assert_eq!(restored.fuel, 9);
         assert_eq!(

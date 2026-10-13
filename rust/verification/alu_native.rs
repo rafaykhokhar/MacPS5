@@ -183,7 +183,7 @@ fn reference(old: u64, a: u64, b: u64, bits: u32, borrow: u64) -> (u64, u64) {
     (result, flags)
 }
 fn main() {
-    assert_eq!(size_of::<Cpu>(), 720);
+    assert_eq!(size_of::<Cpu>(), 816);
     assert_eq!(offset_of!(Cpu, flags), 136);
     assert_eq!(offset_of!(Cpu, fault), 152);
     assert_eq!(offset_of!(Cpu, vectors), 208);
@@ -227,6 +227,7 @@ fn main() {
                         x87_control: 0x037f,
                         x87_status: 0,
                         vectors: [[0; 32]; 16],
+                        x87: Default::default(),
                     };
                     // Install operands before deriving expected results, so aliases and
                     // AH/AL overlap have their architectural meaning.
