@@ -241,9 +241,27 @@ pub(crate) fn compile_incremental(
     };
     let source = library.directory.join("module.S");
     let output = library.directory.join("module.dylib");
+    let exports = library.directory.join("exports.txt");
+    // Only block entry points are resolved through dlsym. Hiding archive
+    // symbols lets ld remove runtime functions unreachable from those roots.
+    // Referenced helpers and their transitive dependencies remain live.
+    let symbols: String = artifacts
+        .manifest
+        .blocks
+        .iter()
+        .map(|block| format!("_module_aot_{:x}\n", block.start))
+        .collect();
+    std::fs::write(&exports, symbols).map_err(|e| e.to_string())?;
     std::fs::write(&source, assembly).map_err(|e| e.to_string())?;
     let build = Command::new("xcrun")
         .args(["clang", "-arch", "arm64", "-dynamiclib"])
+        .args([
+            "-Wl,-dead_strip",
+            "-Xlinker",
+            "-exported_symbols_list",
+            "-Xlinker",
+        ])
+        .arg(&exports)
         .arg(&source)
         .arg(&archive)
         .args(RUNTIME_LINK_ARGS)

@@ -161,3 +161,33 @@ original loop entry, while warm timing includes the additional CALL/RET batch.
 No native reference ratio, game FPS, SIMD/memory workload coverage, peak RSS,
 16 GB fit or production readiness follows from this tiny integer loop. The
 baseline makes compilation overhead measurable before replacing the backend.
+
+## Generated-library export pruning
+
+The module compiler now exports only the `_module_aot_<block start>` symbols
+that it resolves with `dlsym`, and passes `-dead_strip` to Apple's linker.
+Runtime helpers remain private; functions and data reachable from block entries
+remain linked. Export names are generated from the emitted batch manifest,
+written inside the owned temporary directory, and removed with the library.
+The installed Apple `ld(1)` manual documents both `-exported_symbols_list` and
+`-dead_strip`. This retains clang compilation and the matching archive contract.
+
+The same five-sample benchmark now charges 458752 bytes for its two libraries,
+down from 4915200 bytes in the preceding baseline (90.7% less mapped segment
+space for this fixture). Initial compilation ranges from 605–631 ms and
+extensions from 611–644 ms. The runs are not controlled enough to claim a timing
+speedup, and they still expose substantial compilation latency. The mapped-byte
+reduction is not an RSS or whole-game memory reduction.
+
+`incremental_translation_native.rs` also inspects the initial generated dylib
+with `nm -gjU` and verifies that only its expected block entry is exported.
+Its execution, cumulative-budget, rejection-preservation and complete-retirement
+checks pass. The benchmark's 505 checked executions and retirement checks pass.
+682 library tests, three integration tests, strict Clippy and release build pass
+(`work/translation-link-pruning/`; build process 25428, benchmark/incremental
+process 35394, both exit 0). No new instruction coverage is claimed.
+Explicit and automatic translation regressions also pass, including cross-image
+CALL/JMP/RET, cached-target reuse and exactly-once effects. The homebrew
+startup-only check still accepts ten dependencies and stops at missing `fscanf`
+before game main (process 25355 exit 0, `regression.log` and `entry.log` in the
+same directory). This does not verify retail games or graphics.

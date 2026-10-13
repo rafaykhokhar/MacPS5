@@ -37,6 +37,13 @@ fn main() {
     returned(&mut n, &mut image, 0x100100, 42);
     let original = artifacts(&directory);
     assert_eq!(original.len(), 1);
+    let generated = original.keys().next().unwrap().parent().unwrap();
+    let symbols = std::process::Command::new("xcrun")
+        .args(["nm", "-gjU"]).arg(generated.join("module.dylib"))
+        .output().unwrap();
+    assert!(symbols.status.success());
+    assert_eq!(String::from_utf8(symbols.stdout).unwrap().trim(), "_module_aot_100",
+        "Generated library exports only its block entry; runtime helpers stay private");
     let initial_usage = n.translation_cache_usage();
     assert_eq!(initial_usage.libraries, 1);
     assert!(initial_usage.mapped_bytes > 0);

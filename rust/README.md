@@ -1,5 +1,12 @@
 # Rust migration
 
+Generated translation libraries now export only translated block entries and
+discard unreachable runtime code. The checked synthetic benchmark retains
+458752 mapped bytes across two libraries, versus 4915200 before this change.
+Compilation still takes roughly 0.6 seconds per tiny batch. See
+[readiness evidence](../docs/status/TRANSLATOR_READINESS.md#generated-library-export-pruning)
+for scope and verification; this is not a whole-game memory or speed claim.
+
 A reproducible Rust translation benchmark now measures compilation, incremental
 publication and checked warm execution on Apple Silicon. Five M5 Pro samples
 took 637–675 ms for initial compilation and 613–632 ms for an additional batch;
