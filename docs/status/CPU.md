@@ -1,5 +1,36 @@
 # CPU completion criteria
 
+## Packed scalar extraction
+
+VEX VPEXTRB/W/D/Q now read the immediate-selected source lane into a GPR or
+exact-width memory destination. Both word encodings are supported, including
+the register-only 0F C5 encoding with reversed ModRM fields. B/W W0 and W1
+results zero-extend into the entire GPR; memory stores remain 1/2/4/8 bytes.
+The complete source YMM and flags/FP state remain unchanged. Immediate lane
+masks are 15/7/3/1. Reserved L/vvvv, legacy/EVEX and FS/GS/address32 forms
+remain rejected.
+
+Reference: AMD APM Volume 4 rev.3.24, pp.328–335
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)).
+The build passes 609 library tests, three integration tests, strict Clippy and
+release compilation (`work/packed-extract-native/{tests,clippy,release}.log`,
+process 94594 exit 0). The [native verifier](../../rust/verification/packed_extract_native.rs)
+passes 33,072 independent lane-byte comparisons over 2,648 decoded fixtures:
+all immediate values, both word encodings, W0/W1, high registers, complete
+source preservation, exact-end/high/unaligned/RIP stores, adjacent-byte
+sentinels, every short span, readonly faults, flags/FP and execution guards
+(`work/packed-extract-native/native.log`, process 22246 exit 0).
+
+Pinned homebrew discovery passes the former VPEXTRD stop at 0x1a7e8a and
+reaches 55,551 instructions in 12,667 blocks, an increase of 353 instructions.
+Three new stops become reachable, leaving 207 unsupported boundaries.
+The combined verifier compiles and startup-only execution retains its expected
+missing `fscanf` exit: ten named dependencies accepted, 20,288 dependency bytes
+owned, cleanup pending and game main not executed
+(`work/packed-extract-native/entry.log`, process 22246 exit 0).
+Native reference checks do not establish hardware differential equivalence,
+full CPU coverage or retail-game execution.
+
 ## Packed scalar insertion
 
 VEX VPINSRB/W/D/Q now insert the scalar into the immediate-selected lane of

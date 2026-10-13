@@ -37,6 +37,39 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn packed_extract_forms_and_guards() {
+        for (map, opcode) in [(0xe3, 0x14), (0xe3, 0x15), (0xe3, 0x16), (0xe1, 0xc5)] {
+            for w in [0, 0x80] {
+                for operand in [0xc1, 0xc0, 0x07] {
+                    if opcode == 0xc5 && operand == 0x07 {
+                        continue; // The 0F C5 encoding has no memory destination.
+                    }
+                    for index in [0, 1, 7, 15, 128, 255] {
+                        let bytes = [0xc4, map, 0x79 | w, opcode, operand, index];
+                        assert!(super::translate_rust_memory_region(&bytes, 0, "extract").is_ok());
+                        for prefix in [0x7d | w, 0x71 | w] {
+                            let invalid = [0xc4, map, prefix, opcode, operand, index];
+                            assert!(
+                                super::translate_rust_memory_region(&invalid, 0, "invalid")
+                                    .is_err()
+                            );
+                        }
+                    }
+                }
+                if opcode != 0xc5 {
+                    for prefix in [0x64, 0x65, 0x67] {
+                        let invalid = [prefix, 0xc4, map, 0x79 | w, opcode, 0x07, 0];
+                        assert!(
+                            super::translate_rust_memory_region(&invalid, 0, "address").is_err()
+                        );
+                    }
+                    let invalid = [0x67, 0xc4, map, 0x79 | w, opcode, 0x04, 0x25, 0, 0, 0, 0, 0];
+                    assert!(super::translate_rust_memory_region(&invalid, 0, "address").is_err());
+                }
+            }
+        }
+    }
+    #[test]
     fn packed_insert_forms_and_guards() {
         for (map, opcode) in [(0xe3, 0x20), (0xe1, 0xc4), (0xe3, 0x22)] {
             for w in [0, 0x80] {
@@ -866,6 +899,40 @@ impl Emitter {
                     208 + dst * 32,
                     224 + dst * 32
                 ));
+            }
+            M::Vpextrb | M::Vpextrw | M::Vpextrd | M::Vpextrq => {
+                use iced_x86::Code;
+                let (scalar_width, load, register) = match i.code() {
+                    Code::VEX_Vpextrb_r32m8_xmm_imm8 | Code::VEX_Vpextrb_r64m8_xmm_imm8 => {
+                        (8, "ldrb", "w20")
+                    }
+                    Code::VEX_Vpextrw_r32_xmm_imm8
+                    | Code::VEX_Vpextrw_r64_xmm_imm8
+                    | Code::VEX_Vpextrw_r32m16_xmm_imm8
+                    | Code::VEX_Vpextrw_r64m16_xmm_imm8 => (16, "ldrh", "w20"),
+                    Code::VEX_Vpextrd_rm32_xmm_imm8 => (32, "ldr", "w20"),
+                    Code::VEX_Vpextrq_rm64_xmm_imm8 => (64, "ldr", "x20"),
+                    _ => return Err("Only VEX packed integer extraction is implemented".into()),
+                };
+                if i.op0_kind() == OpKind::Memory
+                    && i.memory_base() == R::None
+                    && i.memory_index() == R::None
+                    && i.memory_displ_size() != 8
+                {
+                    return Err("32-bit absolute addressing is not implemented".into());
+                }
+                let lane = usize::from(i.immediate8()) & (128 / scalar_width - 1);
+                let src = 208 + vector(i.op1_register())? * 32 + lane * (scalar_width / 8);
+                // Read only the selected lane, zero-extending narrow results.
+                // A memory destination writes exactly the scalar width; the
+                // source vector is never modified, including its upper half.
+                self.emit(format!("{load} {register}, [x19, #{src}]"));
+                let write_width = if i.op0_kind() == OpKind::Register {
+                    bits(i, 0)
+                } else {
+                    scalar_width
+                };
+                self.write(i, 0, write_width, 20)?;
             }
             M::Vpinsrb | M::Vpinsrw | M::Vpinsrd | M::Vpinsrq => {
                 use iced_x86::Code;

@@ -1,5 +1,11 @@
 # Rust migration
 
+VEX packed scalar extraction supports B/W/D/Q, both word encodings, zero-extended
+GPR results and exact-width guarded stores. The build passes 609 library tests,
+three integration tests, strict Clippy and 33,072 native checks. Discovery reaches
+55,551 instructions; startup still stops at missing `fscanf`, before game main.
+See [CPU evidence](../docs/status/CPU.md).
+
 VEX byte/word/dword/quadword insertion now preserves merge lanes, masks the
 immediate index and clears the upper YMM half after a successful scalar read.
 The matching build passes 608 library tests, three integration tests, strict

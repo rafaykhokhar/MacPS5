@@ -75,6 +75,7 @@ mod packed_compare_shift_native;
 mod vpbroadcastd_native;
 mod packed_broadcast_native;
 mod packed_insert_native;
+mod packed_extract_native;
 mod strftime_native;
 mod strtof_native;
 mod strtold_native;
@@ -183,6 +184,7 @@ fn main() -> Result<(), String> {
         vpbroadcastd_native::verify(Path::new(&archive), &Path::new(&directory).join("vpbroadcastd"))?;
         packed_broadcast_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-broadcast"))?;
         packed_insert_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-insert"))?;
+        packed_extract_native::verify(Path::new(&archive), &Path::new(&directory).join("packed-extract"))?;
         strftime_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strftime"))?;
         strtof_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtof"))?;
         strtold_native::verify(&file, Path::new(&archive), &Path::new(&directory).join("strtold"))?;
