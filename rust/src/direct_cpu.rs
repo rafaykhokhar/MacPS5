@@ -349,6 +349,7 @@ pub(crate) fn translate_span(
             _ if bmi_shift(&i).is_some() => {}
             _ if movbe(&i) => {}
             Code::VEX_Andn_r32_r32_rm32 | Code::VEX_Andn_r64_r64_rm64 => {}
+            Code::VEX_Rorx_r32_rm32_imm8 | Code::VEX_Rorx_r64_rm64_imm8 => {}
             _ => return Err(format!("Direct lowering unsupported: {:?}", i.code())),
         }
         offset += i.len();
@@ -638,6 +639,8 @@ pub(crate) fn translate_span(
                 | Code::VEX_Bextr_r64_rm64_r64
                 | Code::VEX_Andn_r32_r32_rm32
                 | Code::VEX_Andn_r64_r64_rm64
+                | Code::VEX_Rorx_r32_rm32_imm8
+                | Code::VEX_Rorx_r64_rm64_imm8
         ) || bmi_shift(i).is_some()
         {
             let wide = i.op0_register().size() == 8;
@@ -669,6 +672,12 @@ pub(crate) fn translate_span(
                     wide,
                     false,
                 )?;
+            }
+            if i.mnemonic() == Mnemonic::Rorx {
+                let count = u32::from(i.immediate8()) & if wide { 63 } else { 31 };
+                c.emit((if wide { 0x93c00000 } else { 0x13800000 }) | (count << 10))?; // ror x0/w0,x0/w0,#count
+                c.context_access(0, 19, dst * 8, true, true)?;
+                continue; // RORX does not modify guest flags.
             }
             c.context_access(
                 1,

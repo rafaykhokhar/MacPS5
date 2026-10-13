@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct RORX32/64 now emits ARM64 immediate rotation with guarded memory sources
+and flag preservation. 137760 native cases pass. Configured startup passes RORX
+and reaches MULX64 at 0x38ed. See
+[RORX evidence](../docs/status/TRANSLATOR_READINESS.md#direct-rorx-immediate-rotation).
+
 Direct ANDN32/64 now uses ARM64 BIC with guarded memory sources and the required
 flag behavior. 1359872 native cases plus BEXTR/BMI-shift regressions pass.
 Startup translates past ANDN in the block at 0xcd2 but now rejects RORX32;

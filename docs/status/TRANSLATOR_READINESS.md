@@ -1445,3 +1445,30 @@ translation, but this entire span has not executed. Logs are
 `/tmp/macps5-andn-{tests,clippy,build,startup}.log` and retain the first real dlsym
 lookup. RORX is the next CPU gap. Bootstrap and PS5 gameplay remain incomplete;
 this startup-only run skips Metal presentation.
+
+## Direct RORX immediate rotation
+
+Direct lowering now accepts VEX RORX32/64 from a register or guarded memory
+source. The immediate count is masked to five/six bits and emitted as ARM64
+ROR (EXTR alias). Dword results zero-extend, all guest flags remain unchanged,
+and aliases are resolved before writing the destination. Memory sources are
+read even for a masked-zero count; faults preserve destination and flags.
+
+`rust/verification/direct_rorx_native.rs` uses repeated single-bit rotation
+(arithmetic division and reinsertion of the low bit) as its independent oracle.
+It checks all 256 immediate counts with six input patterns at both widths,
+count boundaries across all GPR source/destination pairs, aliases including
+address bases, high source bits, unaligned/short/unmapped reads, and address
+overflow. All arithmetic flags start set so preservation is checked explicitly.
+Expected state includes every GPR, flags, mapped bytes and fault/fuel/stop.
+Reproduce with the standalone release rlib/dependency flags above using
+`direct_rorx_native.rs`.
+
+Validation passes: 137760 native RORX cases, 687 library tests, three integration
+tests, strict Clippy and release build. The standalone verifier compiles with
+warnings denied. Configured `--direct-startup` passes the former block at 0xcd2
+and exits 1 at image-relative 0x38ed with
+`Direct lowering unsupported: VEX_Mulx_r64_r64_rm64`. Logs are
+`/tmp/macps5-rorx-{tests,clippy,build,startup}.log` and retain the first real dlsym
+lookup. MULX is the next CPU gap. Bootstrap and PS5 gameplay remain incomplete;
+this startup-only run skips Metal presentation.
