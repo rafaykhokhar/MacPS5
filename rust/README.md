@@ -1,5 +1,13 @@
 # Rust migration
 
+VEX VPBLENDW/VPBLENDD now support 128/256-bit integer vector blending, including
+guarded full-width memory operands and alias-safe ARM64 register lowering.
+The matching build passes 655 library tests, three integration tests, strict
+Clippy and 111,360 native checks. Discovery reaches 57,282 instructions and
+156 unsupported sites; startup still stops at missing `fscanf`, before game
+main. See [CPU evidence](../docs/status/CPU.md). These counts do not establish
+CPU completion, production readiness or retail gameplay.
+
 VEX VPERMD/VPERMQ now support permutation across a full 256-bit source, including
 guarded memory operands. The matching build passes 651 library tests, three
 integration tests, strict Clippy and 66,192 native checks. Discovery reaches

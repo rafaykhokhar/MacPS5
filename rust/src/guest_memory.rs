@@ -758,6 +758,48 @@ pub fn vector_cmpgtd256(
     vectors[destination as usize] = result;
     Ok(())
 }
+/// Immediate-controlled packed word/dword selection from two source vectors.
+#[derive(Clone, Copy)]
+pub struct VectorBlend {
+    pub destination: u64,
+    pub first: u64,
+    pub size: u64,
+    pub lane_size: u64,
+    pub immediate: u64,
+}
+pub fn vector_blend(
+    memory: &Memory<'_>,
+    vectors: &mut [[u8; 32]; 16],
+    address: u64,
+    operation: VectorBlend,
+) -> Result<()> {
+    let VectorBlend {
+        destination,
+        first,
+        size,
+        lane_size,
+        immediate,
+    } = operation;
+    vector_operand(address, destination, size, 0)?;
+    if first >= 16 || ![2, 4].contains(&lane_size) || immediate > 255 {
+        return Err("Invalid packed blend operand".into());
+    }
+    // A zero selector still accesses the complete encoded memory operand.
+    let source = memory.read(address, size as usize)?;
+    let mut result = [0; 32];
+    let width = lane_size as usize;
+    for (lane, output) in result[..size as usize].chunks_exact_mut(width).enumerate() {
+        let start = lane * width;
+        let selected = if immediate & (1 << (lane % 8)) != 0 {
+            &source[start..start + width]
+        } else {
+            &vectors[first as usize][start..start + width]
+        };
+        output.copy_from_slice(selected);
+    }
+    vectors[destination as usize] = result;
+    Ok(())
+}
 /// Permute all eight dwords using the low three bits of each index dword.
 pub fn vector_permd(
     memory: &Memory<'_>,
@@ -1201,6 +1243,43 @@ pub mod ffi {
                 destination,
                 first,
                 size,
+            )
+            .is_ok()
+        {
+            return;
+        }
+        cpu.fault = 1;
+    }
+    /// # Safety
+    /// Same live, exclusive CPU/Memory contract as native_ps5_module_vector_load_v1.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn native_ps5_module_vector_blend_v1(
+        cpu: *mut Cpu,
+        address: u64,
+        destination: u64,
+        first: u64,
+        size: u64,
+        lane_size: u64,
+        immediate: u64,
+    ) {
+        let Some(cpu) = (unsafe { cpu.as_mut() }) else {
+            return;
+        };
+        if cpu.fault != 0 {
+            return;
+        }
+        if cpu.memory != 0
+            && vector_blend(
+                unsafe { &*(cpu.memory as *const Memory<'_>) },
+                &mut cpu.vectors,
+                address,
+                VectorBlend {
+                    destination,
+                    first,
+                    size,
+                    lane_size,
+                    immediate,
+                },
             )
             .is_ok()
         {
@@ -2119,6 +2198,167 @@ mod tests {
         assert_eq!(memory.read(0x1001, 16).unwrap(), &original[15][16..]);
         assert_eq!(cpu.vectors, original);
         assert_eq!(cpu.flags, u64::MAX);
+    }
+    #[test]
+    fn packed_blend_all_masks_widths_and_aliases() {
+        for size in [16usize, 32] {
+            for width in [2usize, 4] {
+                for immediate in 0..=255u64 {
+                    for destination in [3usize, 15] {
+                        let mut vectors = [[0xa5; 32]; 16];
+                        vectors[15] = std::array::from_fn(|i| (i + 1) as u8);
+                        let mut data: [u8; 32] = std::array::from_fn(|i| (i + 65) as u8);
+                        let mut expected = vectors;
+                        expected[destination] = [0; 32];
+                        // Consume mask bits in order, restarting at the second
+                        // 128-bit half only for word blends.
+                        let period = if width == 2 { 16 } else { 32 };
+                        for base in (0..size).step_by(period) {
+                            let mut mask = immediate;
+                            for start in (base..(base + period).min(size)).step_by(width) {
+                                let chosen = if mask % 2 == 1 { &data } else { &vectors[15] };
+                                expected[destination][start..start + width]
+                                    .copy_from_slice(&chosen[start..start + width]);
+                                mask /= 2;
+                            }
+                        }
+                        let mut memory = Memory::default();
+                        memory
+                            .add(0x1_0000_0001, &mut data[..size], false, false)
+                            .unwrap();
+                        vector_blend(
+                            &memory,
+                            &mut vectors,
+                            0x1_0000_0001,
+                            VectorBlend {
+                                destination: destination as u64,
+                                first: 15,
+                                size: size as u64,
+                                lane_size: width as u64,
+                                immediate,
+                            },
+                        )
+                        .unwrap();
+                        assert_eq!(vectors, expected);
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn packed_blend_zero_mask_still_guards_full_span_and_bad_parameters() {
+        let original = [[0xa5; 32]; 16];
+        for size in [16u64, 32] {
+            for lane_size in [2, 4] {
+                for immediate in [0, 255] {
+                    for length in 0..size as usize {
+                        let mut data = vec![0; length];
+                        let mut memory = Memory::default();
+                        if length != 0 {
+                            memory.add(0x1001, &mut data, false, false).unwrap();
+                        }
+                        let mut vectors = original;
+                        assert!(
+                            vector_blend(
+                                &memory,
+                                &mut vectors,
+                                0x1001,
+                                VectorBlend {
+                                    destination: 0,
+                                    first: 0,
+                                    size,
+                                    lane_size,
+                                    immediate,
+                                }
+                            )
+                            .is_err()
+                        );
+                        assert_eq!(vectors, original);
+                    }
+                }
+            }
+        }
+        let mut data = [0; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        for (destination, first, size, lane_size, immediate) in [
+            (16, 0, 16, 2, 0),
+            (u64::MAX, 0, 16, 2, 0),
+            (0, 16, 16, 2, 0),
+            (0, u64::MAX, 16, 2, 0),
+            (0, 0, 0, 2, 0),
+            (0, 0, 8, 2, 0),
+            (0, 0, 64, 2, 0),
+            (0, 0, u64::MAX, 2, 0),
+            (0, 0, 16, 0, 0),
+            (0, 0, 16, 1, 0),
+            (0, 0, 16, 3, 0),
+            (0, 0, 16, 8, 0),
+            (0, 0, 16, u64::MAX, 0),
+            (0, 0, 16, 2, 256),
+            (0, 0, 16, 2, u64::MAX),
+        ] {
+            let mut vectors = original;
+            assert!(
+                vector_blend(
+                    &memory,
+                    &mut vectors,
+                    0x1001,
+                    VectorBlend {
+                        destination,
+                        first,
+                        size,
+                        lane_size,
+                        immediate,
+                    }
+                )
+                .is_err()
+            );
+            assert_eq!(vectors, original);
+        }
+    }
+    #[test]
+    #[allow(unsafe_code)]
+    fn packed_blend_ffi_preserves_faults_flags_and_fp_environment() {
+        use crate::legacy_cpu::Cpu;
+        unsafe { ffi::native_ps5_module_vector_blend_v1(std::ptr::null_mut(), 0, 0, 0, 16, 2, 0) };
+        let mut cpu = Cpu {
+            vectors: [[0x55; 32]; 16],
+            flags: u64::MAX,
+            mxcsr: 0xffff,
+            x87_control: 0x137f,
+            x87_status: 0x5555,
+            ..Cpu::default()
+        };
+        for fault in [0, 2, 13] {
+            cpu.fault = fault;
+            unsafe { ffi::native_ps5_module_vector_blend_v1(&mut cpu, 0x1001, 0, 0, 16, 2, 0) };
+            assert_eq!(cpu.fault, if fault == 0 { 1 } else { fault });
+            assert_eq!(cpu.vectors, [[0x55; 32]; 16]);
+            assert_eq!(
+                (cpu.flags, cpu.mxcsr, cpu.x87_control, cpu.x87_status),
+                (u64::MAX, 0xffff, 0x137f, 0x5555)
+            );
+        }
+        let mut data = [0xcc; 32];
+        let mut memory = Memory::default();
+        memory.add(0x1001, &mut data, false, false).unwrap();
+        cpu.memory = (&mut memory as *mut Memory<'_>) as u64;
+        cpu.fault = 0;
+        unsafe { ffi::native_ps5_module_vector_blend_v1(&mut cpu, 0x1001, 0, 0, 16, 4, 2) };
+        assert_eq!(cpu.fault, 0);
+        assert_eq!(&cpu.vectors[0][..4], &[0x55; 4]);
+        assert_eq!(&cpu.vectors[0][4..8], &[0xcc; 4]);
+        assert_eq!(&cpu.vectors[0][8..16], &[0x55; 8]);
+        assert_eq!(&cpu.vectors[0][16..], &[0; 16]);
+        let before = cpu.vectors;
+        unsafe { ffi::native_ps5_module_vector_blend_v1(&mut cpu, 0x1001, 0, 0, 16, 4, 256) };
+        assert_eq!(cpu.fault, 1);
+        assert_eq!(cpu.vectors, before);
+        assert_eq!(
+            (cpu.flags, cpu.mxcsr, cpu.x87_control, cpu.x87_status),
+            (u64::MAX, 0xffff, 0x137f, 0x5555)
+        );
     }
     #[test]
     fn vector_permutations_cross_halves_and_ignore_index_high_bits() {

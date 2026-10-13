@@ -1,5 +1,37 @@
 # CPU completion criteria
 
+## Immediate integer vector blending
+
+VEX VPBLENDW and VPBLENDD now select word/dword lanes from two sources in
+128-bit and 256-bit forms. Word selection repeats the eight mask bits in each
+128-bit half; dword selection uses one bit per lane across the full vector.
+Register lowering snapshots both inputs before writing the result. Memory
+helpers guard the full 16/32-byte operand even for a zero selection mask, then
+commit atomically. XMM results clear the upper half; flags and FP state are
+preserved. Exact VEX forms are required, with word WIG and dword W0 handling.
+
+Reference: AMD APM Volume 4 rev.3.24 pp.295–296 and 698–699
+([manual](https://kib.kiev.ua/x86docs/AMD/AMD64/26568_APM_v4-r3.24.pdf)).
+Architectural alignment-control behavior and full exception delivery remain
+outside the current guard model.
+
+The matching build passes 655 library tests, three integration tests, strict
+Clippy and release compilation (`work/packed-blend-native/{tests,clippy,release}.log`,
+process 61173 exit 0). The [native verifier](../../rust/verification/packed_blend_native.rs)
+passes 111,360 checks across 2,208 decoded fixtures, including every immediate,
+independent lane-selection expectations, aliases/high registers, word WIG,
+readonly high/unaligned/RIP operands, every short span, and flags/FP/fuel/prior
+fault preservation (`work/packed-blend-native/native.log`, process 83976 exit 0).
+
+Discovery reaches 57,282 instructions and 12,988 blocks with 156 unsupported
+sites: eight former stops removed and two later stops exposed. These counts
+are not CPU completion percentages. The entry runner compiles with warnings
+denied; startup-only verification still reaches missing `fscanf`, with ten
+accepted dependencies, 20,288 owned dependency bytes and pending cleanup.
+Game main has not executed (`work/packed-blend-native/entry.log`, process 92491
+exit 0). No full GPU suite was run for this CPU change. Production readiness
+and retail gameplay remain unverified.
+
 ## Full-width integer permutations
 
 VEX VPERMD and VPERMQ now select values across the complete 256-bit source.

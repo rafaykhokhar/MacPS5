@@ -37,6 +37,28 @@ pub(crate) fn rust_memory_helpers(assembly: String) -> Result<String> {
 #[cfg(test)]
 mod rust_memory_tests {
     #[test]
+    fn packed_blend_absolute_address_guard() {
+        for opcode in [0x02, 0x0e] {
+            for length in [0, 4] {
+                let bytes = [
+                    0x67,
+                    0xc4,
+                    0xe3,
+                    0x79 | length,
+                    opcode,
+                    0x04,
+                    0x25,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ];
+                assert!(super::translate_rust_memory_region(&bytes, 0, "address").is_err());
+            }
+        }
+    }
+    #[test]
     fn packed_permute_absolute_address_guard() {
         for (map, control, opcode) in [(2, 0x7d, 0x36), (3, 0xfd, 0)] {
             let bytes = [
@@ -1118,6 +1140,74 @@ impl Emitter {
                     216 + merge * 32, 208 + dst * 32, 216 + dst * 32,
                     224 + dst * 32, 232 + dst * 32
                 ));
+            }
+            M::Vpblendw | M::Vpblendd => {
+                use iced_x86::Code;
+                let (lane_size, wide) = match i.code() {
+                    Code::VEX_Vpblendw_xmm_xmm_xmmm128_imm8 => (2, false),
+                    Code::VEX_Vpblendw_ymm_ymm_ymmm256_imm8 => (2, true),
+                    Code::VEX_Vpblendd_xmm_xmm_xmmm128_imm8 => (4, false),
+                    Code::VEX_Vpblendd_ymm_ymm_ymmm256_imm8 => (4, true),
+                    _ => {
+                        return Err("Only VEX128/256 packed word/dword blend is implemented".into());
+                    }
+                };
+                let dst = vector(i.op0_register())?;
+                let first = vector(i.op1_register())?;
+                if i.op2_kind() == OpKind::Memory {
+                    if i.memory_base() == R::None
+                        && i.memory_index() == R::None
+                        && i.memory_displ_size() != 8
+                    {
+                        return Err("32-bit absolute addressing is not implemented".into());
+                    }
+                    self.address(i)?;
+                    self.emit(format!(
+                        "mov x0, x19\nmov x2, #{dst}\nmov x3, #{first}\nmov x4, #{}\nmov x5, #{lane_size}\nmov x6, #{}\nbl _native_ps5_module_vector_blend_v1",
+                        if wide { 32 } else { 16 }, i.immediate8()
+                    ));
+                    self.fault();
+                } else {
+                    let second = vector(i.op2_register())?;
+                    // Load both inputs before assembling either result, so all
+                    // alias classes retain the old source values.
+                    self.emit(format!(
+                        "ldr q0, [x19, #{}]\nldr q1, [x19, #{}]",
+                        208 + first * 32,
+                        208 + second * 32
+                    ));
+                    if wide {
+                        self.emit(format!(
+                            "ldr q2, [x19, #{}]\nldr q3, [x19, #{}]",
+                            224 + first * 32,
+                            224 + second * 32
+                        ));
+                    } else {
+                        self.emit("movi v5.16b, #0");
+                    }
+                    let lanes = 16 / lane_size;
+                    let element = if lane_size == 2 { "h" } else { "s" };
+                    for half in 0..if wide { 2 } else { 1 } {
+                        for lane in 0..lanes {
+                            let bit = if lane_size == 2 {
+                                lane
+                            } else {
+                                half * lanes + lane
+                            };
+                            let select = usize::from((i.immediate8() >> bit) & 1);
+                            self.emit(format!(
+                                "ins v{}.{element}[{lane}], v{}.{element}[{lane}]",
+                                4 + half,
+                                half * 2 + select
+                            ));
+                        }
+                    }
+                    self.emit(format!(
+                        "str q4, [x19, #{}]\nstr q5, [x19, #{}]",
+                        208 + dst * 32,
+                        224 + dst * 32
+                    ));
+                }
             }
             M::Vpermd | M::Vpermq => {
                 let qword = match i.code() {
