@@ -1,5 +1,21 @@
 # Stdout integration gaps
 
+## Registered stream rendering adapter
+
+`printf_stream::run` connects the typed renderer to the fixed temporary buffer.
+It reads guest vectors as each batch is traversed, reports logical counts for
+`%n`, and flushes the pending tail only after successful rendering and cleanup.
+Already accepted output survives subsequent failures. Actual stream errors
+carry optional errno separately from capture-policy diagnostics; a zero write
+does not invent errno. The caller still owns FILE preparation and error flags.
+
+The integrated debug suite passes 544 library tests and three integration tests
+(`work/printf-stream-integrated-tests.log`). Five adapter tests cover deferred
+aliases, buffer boundaries, partial failures, and wide/hex temporary cleanup.
+This registration does not enable guest `printf` or `vprintf`: their executor
+dispatch, FILE transitions, and native ABI checks remain to be connected.
+The existing release archive predates this adapter registration.
+
 ## Rendering target and fixed temporary buffer
 
 The existing printf renderer now submits borrowed batches through a generic
@@ -24,8 +40,8 @@ Matching native integer/text/wide and hexadecimal asprintf-wrapper regressions
 pass (`work/printf-target-native/native.log`, 6839 exit0), including cursor,
 allocation/cleanup, `%n` alias, FP register/stack argument and rounding effects.
 The fixed buffer has boundary/chunk-trace and short-write/failure-injection
-tests. The stream target and guest printf services are still being connected;
-this checkpoint does not claim that printf works in guest startup.
+tests. These results describe the preceding buffer/target checkpoint; the
+registered adapter above is newer. Guest printf services remain unconnected.
 
 ## Owned byte-output checkpoint
 

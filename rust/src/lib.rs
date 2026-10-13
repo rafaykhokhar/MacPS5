@@ -12,6 +12,7 @@ pub mod printf_args;
 mod printf_args_memory;
 pub mod printf_output;
 pub mod printf_stream_buffer;
+pub mod printf_stream;
 pub mod printf_float;
 pub mod printf_float_effects;
 pub mod printf_float_field;

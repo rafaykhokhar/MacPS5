@@ -9,6 +9,9 @@ pub enum Kind {
     Allocation(u32),
     /// Source-defined libc failure such as EILSEQ; not a runtime limitation.
     Libc(u32),
+    /// Actual stream delivery failure. None preserves existing errno when the
+    /// backend supplied no error code; capture policy faults use Runtime.
+    Stream(Option<u32>),
     Runtime(String),
     OutputLimit,
     PrivateStorageAlias,
