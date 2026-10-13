@@ -1,13 +1,22 @@
 # Rust migration
 
+The printf renderer now has a batch-preserving target abstraction, with the
+existing allocating adapter unchanged. A tested 1,024-byte temporary stream
+buffer handles source chunking, short writes and failure prefixes. The matching
+release passes 539 library tests, three integration tests, strict Clippy, and
+native integer/wide/hex asprintf regressions. Stdout byte exports are registered;
+startup-only ownership assertions pass at missing `printf` with 19,856 dependency
+bytes (`work/arm64-prototype/printf-target-verified.log`). The stream adapter and
+guest printf services remain unfinished. See [stdout status](../docs/status/STDOUT.md).
+
 Owned stdout FILE byte output is integrated: `Fputc`, `Putchar` and `Swbuf`
 share capture state with Puts and validate unbuffered FILE transitions. Native
 checks pass the actual banner inline decrement/Swbuf sequence, writable pointer
 behavior, metadata and capture-failure guards; existing Puts/abort native
 regressions also pass. The matching build passes 527 library tests, three
 integration tests and strict Clippy. See [stdout status](../docs/status/STDOUT.md).
-Formatted stdout and startup export registration remain unfinished; the last
-verified startup boundary is still missing `printf`. No game main has executed.
+Formatted stdout remains unfinished; the verified startup boundary is still
+missing `printf`. No game main has executed.
 
 `strtok_r` now uses a bounded Rust plan with exact separator/save-pointer writes.
 Direct and actual SDL-wrapper native checks pass, including continuation,

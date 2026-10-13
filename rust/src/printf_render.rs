@@ -8,7 +8,7 @@ use crate::{
     printf_args::{Class, Cursor, Value},
     printf_buffer::{Buffer, Error, Kind},
     printf_float,
-    printf_output::{Output, Vector},
+    printf_output::{Batch, Output, Vector},
     printf_spec::{self, Conversion, Host, Item, Length, Parser},
 };
 #[derive(Clone, Copy, Debug)]
@@ -48,11 +48,32 @@ fn owned(bytes: &[u8]) -> Result<Vector, Error> {
     v.extend_from_slice(bytes);
     Ok(Vector::Owned(v))
 }
-fn sink(buffer: &mut Buffer<'_, '_>, vector: &Vector) -> Result<(), Error> {
-    match vector {
-        Vector::Guest { address, length } => buffer.append_guest(*address, *length),
-        Vector::Owned(bytes) => buffer.append(bytes),
-        Vector::Pad { byte, length } => buffer.append(&[*byte; 16][..*length]),
+/// Rendering storage and submission boundary. Snapshots must cover the full
+/// current owned allocation, including allocator padding, without borrowing memory.
+pub(crate) trait Target<'a> {
+    type Ranges: AsRef<[(u64, usize)]>;
+    fn memory(&mut self) -> &mut Memory<'a>;
+    fn private_ranges(&self) -> Result<Self::Ranges, Error>;
+    fn validate_external_write(&self, address: u64, length: usize) -> Result<(), Error>;
+    fn submit_batch(&mut self, batch: Batch<'_>) -> Result<(), Error>;
+}
+impl<'a> Target<'a> for Buffer<'_, 'a> {
+    type Ranges = [(u64, usize); 1];
+    fn memory(&mut self) -> &mut Memory<'a> {
+        Buffer::memory(self)
+    }
+    fn private_ranges(&self) -> Result<Self::Ranges, Error> {
+        Ok([self.private_span()?])
+    }
+    fn validate_external_write(&self, address: u64, length: usize) -> Result<(), Error> {
+        Buffer::validate_external_write(self, address, length)
+    }
+    fn submit_batch(&mut self, batch: Batch<'_>) -> Result<(), Error> {
+        batch.submit(|vector| match vector {
+            Vector::Guest { address, length } => self.append_guest(*address, *length),
+            Vector::Owned(bytes) => self.append(bytes),
+            Vector::Pad { byte, length } => self.append(&[*byte; 16][..*length]),
+        })
     }
 }
 fn output_error(error: crate::printf_output::Error<Error>) -> Error {
@@ -62,23 +83,29 @@ fn output_error(error: crate::printf_output::Error<Error>) -> Error {
         crate::printf_output::Error::Poisoned => Kind::Poisoned.into(),
     }
 }
-fn print(output: &mut Output, buffer: &mut Buffer<'_, '_>, vector: Vector) -> Result<(), Error> {
+fn print<'a>(
+    output: &mut Output,
+    buffer: &mut impl Target<'a>,
+    vector: Vector,
+) -> Result<(), Error> {
     output
-        .print(vector, |v| sink(buffer, v))
+        .print_batch(vector, |batch| buffer.submit_batch(batch))
         .map_err(output_error)
 }
-fn pad(
+fn pad<'a>(
     output: &mut Output,
-    buffer: &mut Buffer<'_, '_>,
+    buffer: &mut impl Target<'a>,
     byte: u8,
     length: usize,
 ) -> Result<(), Error> {
     output
-        .pad(byte, length, |v| sink(buffer, v))
+        .pad_batch(byte, length, |batch| buffer.submit_batch(batch))
         .map_err(output_error)
 }
-fn flush(output: &mut Output, buffer: &mut Buffer<'_, '_>) -> Result<(), Error> {
-    output.flush(|v| sink(buffer, v)).map_err(output_error)
+fn flush<'a>(output: &mut Output, buffer: &mut impl Target<'a>) -> Result<(), Error> {
+    output
+        .flush_batch(|batch| buffer.submit_batch(batch))
+        .map_err(output_error)
 }
 /// Explicit source-backed hexadecimal context; the default render entry remains
 /// unchanged. State and pool mappings must belong to this executor.
@@ -113,14 +140,14 @@ fn ranges(state: &crate::guest_gdtoa::State) -> Result<Vec<(u64, usize)>, Error>
 struct ArgumentMemory<'m, 'a, 'r> {
     memory: &'m mut Memory<'a>,
     ranges: &'r [(u64, usize)],
-    output: (u64, usize),
+    output: &'r [(u64, usize)],
     wide: Option<(u64, usize)>,
 }
 impl crate::printf_args::Memory for ArgumentMemory<'_, '_, '_> {
     type Error = String;
     fn read(&self, address: u64, out: &mut [u8]) -> crate::Result<()> {
         disjoint(address, out.len(), self.ranges)?;
-        disjoint(address, out.len(), &[self.output])?;
+        disjoint(address, out.len(), self.output)?;
         if let Some(wide) = self.wide {
             disjoint(address, out.len(), &[wide])?;
         }
@@ -129,7 +156,7 @@ impl crate::printf_args::Memory for ArgumentMemory<'_, '_, '_> {
     }
     fn validate_write(&self, address: u64, length: usize) -> crate::Result<()> {
         disjoint(address, length, self.ranges)?;
-        disjoint(address, length, &[self.output])?;
+        disjoint(address, length, self.output)?;
         if let Some(wide) = self.wide {
             disjoint(address, length, &[wide])?;
         }
@@ -140,16 +167,16 @@ impl crate::printf_args::Memory for ArgumentMemory<'_, '_, '_> {
         self.memory.write(address, bytes)
     }
 }
-struct Context<'b, 'm, 'a, G> {
-    buffer: &'b mut Buffer<'m, 'a>,
+struct Context<'b, T, G> {
+    buffer: &'b mut T,
     cursor: Cursor,
     guard: &'b mut G,
     wide: Option<u64>,
     gdtoa_ranges: Vec<(u64, usize)>,
 }
-impl<G: FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>> Context<'_, '_, '_, G> {
+impl<'a, T: Target<'a>, G: FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>> Context<'_, T, G> {
     fn fetch(&mut self, class: Class) -> Result<Value, Error> {
-        let (base, length) = self.buffer.private_span()?;
+        let output_ranges = self.buffer.private_ranges()?;
         let wide = self
             .wide
             .map(|base| {
@@ -164,7 +191,7 @@ impl<G: FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>> Context<'_, '_, '_,
             let mut memory = ArgumentMemory {
                 memory: self.buffer.memory(),
                 ranges: &self.gdtoa_ranges,
-                output: (base, length),
+                output: output_ranges.as_ref(),
                 wide,
             };
             return self
@@ -178,7 +205,11 @@ impl<G: FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>> Context<'_, '_, '_,
                 let end = address
                     .checked_add(count as u64)
                     .ok_or("Printf cursor write overflow")?;
-                if address < base + length as u64 && base < end {
+                if output_ranges
+                    .as_ref()
+                    .iter()
+                    .any(|&(base, length)| address < base + length as u64 && base < end)
+                {
                     return Err("Printf cursor aliases private output storage".into());
                 }
                 if wide.is_some_and(|(base, length)| address < base + length as u64 && base < end) {
@@ -234,7 +265,7 @@ impl<G: FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>> Context<'_, '_, '_,
         }
         disjoint(address, 2, &self.gdtoa_ranges)?;
         if !self.gdtoa_ranges.is_empty() {
-            disjoint(address, 2, &[self.buffer.private_span()?])?;
+            disjoint(address, 2, self.buffer.private_ranges()?.as_ref())?;
         }
         Ok(self.buffer.memory().load(address, 2)? as u16)
     }
@@ -317,12 +348,14 @@ impl<G: FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>> Context<'_, '_, '_,
         }
     }
 }
-impl<G: FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>> Host for Context<'_, '_, '_, G> {
+impl<'a, T: Target<'a>, G: FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>> Host
+    for Context<'_, T, G>
+{
     type Fault = Error;
     fn read_byte(&mut self, address: u64) -> Result<u8, Error> {
         disjoint(address, 1, &self.gdtoa_ranges)?;
         if !self.gdtoa_ranges.is_empty() {
-            disjoint(address, 1, &[self.buffer.private_span()?])?;
+            disjoint(address, 1, self.buffer.private_ranges()?.as_ref())?;
         }
         Ok(self.buffer.memory().load(address, 1)? as u8)
     }
@@ -413,9 +446,9 @@ fn integer(spec: Conversion, raw: u64) -> Result<Field, Error> {
         zero: spec.flags.zero && spec.precision.is_none(),
     })
 }
-fn emit(
+fn emit<'a>(
     output: &mut Output,
-    buffer: &mut Buffer<'_, '_>,
+    buffer: &mut impl Target<'a>,
     spec: Conversion,
     field: Field,
 ) -> Result<(), Error> {
@@ -455,7 +488,7 @@ pub fn render(
     options: Options,
     guard: impl FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>,
 ) -> Result<(), Error> {
-    render_internal(buffer, format, va, options, None, guard)
+    render_target(buffer, format, va, options, None, guard).map(|_| ())
 }
 /// Source-backed a/A rendering, with all gdtoa ranges excluded from guest
 /// format/argument/count accesses. Decimal/extended floats stay unsupported.
@@ -468,16 +501,17 @@ pub fn render_with_hdtoa(
     hex: HexContext<'_>,
     guard: impl FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>,
 ) -> Result<(), Error> {
-    render_internal(buffer, format, va, options, Some(hex), guard)
+    render_target(buffer, format, va, options, Some(hex), guard).map(|_| ())
 }
-fn render_internal(
-    buffer: &mut Buffer<'_, '_>,
+/// Render through an owned target, returning the logical count after cleanup.
+pub(crate) fn render_target<'a>(
+    buffer: &mut impl Target<'a>,
     format: u64,
     va: u64,
     options: Options,
     mut hex: Option<HexContext<'_>>,
     mut guard: impl FnMut(&Memory<'_>, u64, usize) -> crate::Result<()>,
-) -> Result<(), Error> {
+) -> Result<usize, Error> {
     let initial_ranges = hex
         .as_ref()
         .map(|h| ranges(h.state))
@@ -534,7 +568,7 @@ fn render_internal(
                 if !b"aA".contains(&spec.conversion) {
                     return Err(fault("Source decimal gdtoa allocation sequencing pending"));
                 }
-                let output_range = context.buffer.private_span()?;
+                let output_ranges = context.buffer.private_ranges()?;
                 let wide = context
                     .wide
                     .map(|base| {
@@ -558,7 +592,7 @@ fn render_internal(
                         let mut memory = ArgumentMemory {
                             memory,
                             ranges: private,
-                            output: output_range,
+                            output: output_ranges.as_ref(),
                             wide,
                         };
                         match cursor
@@ -579,7 +613,7 @@ fn render_internal(
                 context.gdtoa_ranges = ranges(h.state)?;
                 converted
                     .field
-                    .emit(&mut output, |v| sink(context.buffer, v))
+                    .emit_batch(&mut output, |batch| context.buffer.submit_batch(batch))
                     .map_err(|e| match e {
                         crate::printf_float_field::EmitError::Output(e) => output_error(e),
                         crate::printf_float_field::EmitError::Limit => Kind::OutputLimit.into(),
@@ -732,7 +766,7 @@ fn render_internal(
             }
         };
     }
-    result
+    result.map(|()| output.total())
 }
 
 #[cfg(test)]
@@ -766,6 +800,100 @@ mod tests {
     }
     fn guard(_: &Memory<'_>, _: u64, _: usize) -> crate::Result<()> {
         Ok(())
+    }
+    struct Trace<'b, 'm, 'a> {
+        buffer: &'b mut Buffer<'m, 'a>,
+        batches: Vec<(usize, Vec<usize>)>,
+    }
+    impl<'a> Target<'a> for Trace<'_, '_, 'a> {
+        type Ranges = [(u64, usize); 1];
+        fn memory(&mut self) -> &mut Memory<'a> {
+            self.buffer.memory()
+        }
+        fn private_ranges(&self) -> Result<Self::Ranges, Error> {
+            self.buffer.private_ranges()
+        }
+        fn validate_external_write(&self, a: u64, n: usize) -> Result<(), Error> {
+            self.buffer.validate_external_write(a, n)
+        }
+        fn submit_batch(&mut self, batch: Batch<'_>) -> Result<(), Error> {
+            self.batches
+                .push((batch.residual(), batch.vectors().map(Vector::len).collect()));
+            self.buffer.submit_batch(batch)
+        }
+    }
+    #[test]
+    fn target_batches_keep_count_write_before_deferred_literal_read() {
+        let mut data = setup(b"abc%hhn%040uZ\0", &[FMT, 7], &[]);
+        let mut owner = OwnedMappings::default();
+        let mut memory = Memory::default();
+        memory.add(SLOT, &mut data, true, false).unwrap();
+        memory.attach_owned(&mut owner).unwrap();
+        let n = printf_buffer::run(&mut memory, SLOT, 65536, guard, |buffer| {
+            let mut target = Trace {
+                buffer,
+                batches: Vec::new(),
+            };
+            assert_eq!(
+                render_target(&mut target, FMT, VA, Options::default(), None, guard)?,
+                44
+            );
+            assert_eq!(target.batches, [(43, vec![3, 16, 16, 7, 1]), (1, vec![1])]);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(n, 44);
+        let address = memory.load(SLOT, 8).unwrap();
+        assert_eq!(memory.read(address, 3).unwrap(), &[3, b'b', b'c']);
+        assert_eq!(memory.read(address + 42, 3).unwrap(), b"7Z\0");
+    }
+    #[test]
+    fn source_hex_uses_target_batches_and_releases_retained_storage() {
+        let mut data = setup(b"L%300.140aR\0", &[], &[1.0f64.to_bits()]);
+        let mut owner = OwnedMappings::default();
+        let mut store = crate::guest_gdtoa::Store::new(0x9000).unwrap();
+        let (pool, state) = store.split_mut();
+        let mut retained = crate::guest_gdtoa::Retained::default();
+        let mut control = 0x1f80;
+        let mut memory = Memory::default();
+        memory.add(SLOT, &mut data, true, false).unwrap();
+        memory
+            .add_runtime_data(0x9000, pool, state.runtime_owner())
+            .unwrap();
+        memory.attach_owned(&mut owner).unwrap();
+        let count = printf_buffer::run(&mut memory, SLOT, 65536, guard, |buffer| {
+            let mut target = Trace {
+                buffer,
+                batches: Vec::new(),
+            };
+            let count = render_target(
+                &mut target,
+                FMT,
+                VA,
+                Options::default(),
+                Some(HexContext {
+                    state,
+                    retained: &mut retained,
+                    mxcsr: &mut control,
+                }),
+                guard,
+            )?;
+            assert_eq!(count, 302);
+            assert_eq!(target.batches.len(), 3);
+            assert_eq!(target.batches[0].1.len(), 8);
+            assert_eq!(target.batches.last(), Some(&(1, vec![1])));
+            assert_eq!(target.batches.iter().map(|b| b.0).sum::<usize>(), count);
+            assert!(target.batches.iter().flat_map(|b| &b.1).any(|&n| n == 16));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 302);
+        let address = memory.load(SLOT, 8).unwrap();
+        assert_eq!(memory.read(address + 154, 4).unwrap(), b"0x1.");
+        assert_eq!(memory.read(address + 298, 5).unwrap(), b"p+0R\0");
+        assert!(retained.current().is_none());
+        assert_eq!(control, 0x1f80);
+        assert_eq!(state.owned_ranges().count(), 1);
     }
     #[test]
     fn source_hex_cursor_flags_output_and_retained_cleanup() {

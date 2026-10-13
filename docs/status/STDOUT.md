@@ -1,5 +1,32 @@
 # Stdout integration gaps
 
+## Rendering target and fixed temporary buffer
+
+The existing printf renderer now submits borrowed batches through a generic
+target. Its allocating Buffer adapter and public vasprintf entry points retain
+their previous behavior. Batch submission preserves deferred guest reads,
+eight-vector flushing, padding boundaries, logical `%n` counts and poisoning
+after failure. Hexadecimal fields use the same batch path. Private-range
+snapshots preserve allocation-padding guards without adding host allocations
+to the Buffer adapter.
+
+The registered `printf_stream_buffer` model implements the 1,024-byte temporary
+buffer used by the source's unbuffered formatted-output path. An exact fill of
+a partially filled buffer remains pending; exceeding the remaining space
+flushes it. An empty buffer sends full-size chunks directly. Short writes
+advance only by accepted bytes; zero/error results stop later writes. Render
+failure discards pending bytes while retaining already emitted prefixes.
+It does not allocate guest output memory or flush on Drop.
+
+The combined build passes 539 library tests, three integration tests, strict
+Clippy and release compilation (`work/printf-target-build.log`, 34567 exit0).
+Matching native integer/text/wide and hexadecimal asprintf-wrapper regressions
+pass (`work/printf-target-native/native.log`, 6839 exit0), including cursor,
+allocation/cleanup, `%n` alias, FP register/stack argument and rounding effects.
+The fixed buffer has boundary/chunk-trace and short-write/failure-injection
+tests. The stream target and guest printf services are still being connected;
+this checkpoint does not claim that printf works in guest startup.
+
 ## Owned byte-output checkpoint
 
 The Rust executor now owns a writable stdout FILE at `0x7fff00001400` and
@@ -33,9 +60,12 @@ replaced before this passing build. The compiler used is still Rust1.99, not
 an actual Rust1.85 build.
 
 The full entry runner includes the byte verifier. The native startup export
-table has not yet enabled these new stdout imports; formatted output remains
-unfinished and the last verified startup boundary is missing `printf`. No
-gameplay or new Metal presentation result is established by this checkpoint.
+table now advertises `__stdoutp` as a writable pointer object and putc, fputc,
+putchar and __swbuf as services. Startup still stops earlier at missing `printf`,
+so this does not prove those later imports were resolved or executed. Updated
+startup-only ownership assertions pass with 19,856 dependency bytes
+(`work/arm64-prototype/printf-target-verified.log`, 52403 exit0). No gameplay
+or new Metal presentation result is established by this checkpoint.
 
 ## Remaining formatted-stream integration
 

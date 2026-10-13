@@ -125,6 +125,14 @@ impl Prepared {
         output: &mut Output,
         mut sink: impl FnMut(&Vector) -> Result<(), E>,
     ) -> Result<(), EmitError<E>> {
+        self.emit_batch(output, |batch| batch.submit(&mut sink))
+    }
+    /// Submit each source __sprint batch without flattening its vectors.
+    pub fn emit_batch<E>(
+        &self,
+        output: &mut Output,
+        mut sink: impl FnMut(printf_output::Batch<'_>) -> Result<(), E>,
+    ) -> Result<(), EmitError<E>> {
         let value = &self.converted.value;
         let size = value
             .body
@@ -142,7 +150,7 @@ impl Prepared {
         let padding = field - size;
         if !self.left && !self.zero {
             output
-                .pad(b' ', padding, &mut sink)
+                .pad_batch(b' ', padding, &mut sink)
                 .map_err(EmitError::Output)?;
         }
         if let Some(sign) = self.sign {
@@ -153,36 +161,36 @@ impl Prepared {
         }
         if !self.left && self.zero {
             output
-                .pad(b'0', padding, &mut sink)
+                .pad_batch(b'0', padding, &mut sink)
                 .map_err(EmitError::Output)?;
         }
         for piece in &self.converted.pieces {
             match piece {
                 Piece::Print(range) => emit_print(output, &value.body[range.clone()], &mut sink)?,
                 Piece::ZeroPad(count) => output
-                    .pad(b'0', *count, &mut sink)
+                    .pad_batch(b'0', *count, &mut sink)
                     .map_err(EmitError::Output)?,
             }
         }
         if self.left {
             output
-                .pad(b' ', padding, &mut sink)
+                .pad_batch(b' ', padding, &mut sink)
                 .map_err(EmitError::Output)?;
         }
-        output.flush(&mut sink).map_err(EmitError::Output)
+        output.flush_batch(&mut sink).map_err(EmitError::Output)
     }
 }
 fn emit_print<E>(
     output: &mut Output,
     bytes: &[u8],
-    sink: impl FnMut(&Vector) -> Result<(), E>,
+    sink: impl FnMut(printf_output::Batch<'_>) -> Result<(), E>,
 ) -> Result<(), EmitError<E>> {
     let mut copy = Vec::new();
     copy.try_reserve_exact(bytes.len())
         .map_err(|_| EmitError::Allocation)?;
     copy.extend_from_slice(bytes);
     output
-        .print(Vector::Owned(copy), sink)
+        .print_batch(Vector::Owned(copy), sink)
         .map_err(EmitError::Output)
 }
 

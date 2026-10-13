@@ -28,6 +28,29 @@ pub enum Error<E> {
     Poisoned,
 }
 
+/// Borrowed source batch. Guest bytes remain unread until the target consumes it.
+#[derive(Clone, Copy)]
+pub struct Batch<'a> {
+    vectors: &'a [Option<Vector>],
+    residual: usize,
+}
+impl Batch<'_> {
+    pub fn vectors(&self) -> impl Iterator<Item = &Vector> {
+        self.vectors
+            .iter()
+            .map(|v| v.as_ref().expect("queued output vector"))
+    }
+    pub fn residual(&self) -> usize {
+        self.residual
+    }
+    pub fn submit<E>(&self, mut sink: impl FnMut(&Vector) -> Result<(), E>) -> Result<(), E> {
+        for vector in self.vectors().filter(|v| !v.is_empty()) {
+            sink(vector)?;
+        }
+        Ok(())
+    }
+}
+
 pub struct Output {
     vectors: [Option<Vector>; NIOV],
     queued: usize,
@@ -50,10 +73,10 @@ impl Output {
         self.total
     }
 
-    pub fn print<E>(
+    pub fn print_batch<E>(
         &mut self,
         vector: Vector,
-        mut sink: impl FnMut(&Vector) -> Result<(), E>,
+        mut sink: impl FnMut(Batch<'_>) -> Result<(), E>,
     ) -> Result<(), Error<E>> {
         if self.poisoned {
             return Err(Error::Poisoned);
@@ -70,15 +93,15 @@ impl Output {
         self.vectors[self.queued] = Some(vector);
         self.queued += 1;
         if self.queued == NIOV {
-            self.flush(&mut sink)?;
+            self.flush_batch(&mut sink)?;
         }
         Ok(())
     }
-    pub fn pad<E>(
+    pub fn pad_batch<E>(
         &mut self,
         byte: u8,
         count: usize,
-        mut sink: impl FnMut(&Vector) -> Result<(), E>,
+        mut sink: impl FnMut(Batch<'_>) -> Result<(), E>,
     ) -> Result<(), Error<E>> {
         if self.poisoned {
             return Err(Error::Poisoned);
@@ -86,9 +109,50 @@ impl Output {
         let mut remaining = count;
         while remaining != 0 {
             let length = remaining.min(PADSIZE);
-            self.print(Vector::Pad { byte, length }, &mut sink)?;
+            self.print_batch(Vector::Pad { byte, length }, &mut sink)?;
             remaining -= length;
         }
+        Ok(())
+    }
+    pub fn print<E>(
+        &mut self,
+        vector: Vector,
+        mut sink: impl FnMut(&Vector) -> Result<(), E>,
+    ) -> Result<(), Error<E>> {
+        self.print_batch(vector, |batch| batch.submit(&mut sink))
+    }
+    pub fn pad<E>(
+        &mut self,
+        byte: u8,
+        count: usize,
+        mut sink: impl FnMut(&Vector) -> Result<(), E>,
+    ) -> Result<(), Error<E>> {
+        self.pad_batch(byte, count, |batch| batch.submit(&mut sink))
+    }
+    pub fn flush_batch<E>(
+        &mut self,
+        mut sink: impl FnMut(Batch<'_>) -> Result<(), E>,
+    ) -> Result<(), Error<E>> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        let residual = self.vectors[..self.queued]
+            .iter()
+            .map(|v| v.as_ref().expect("queued output vector").len())
+            .sum();
+        if residual != 0 {
+            if let Err(error) = sink(Batch {
+                vectors: &self.vectors[..self.queued],
+                residual,
+            }) {
+                self.poisoned = true;
+                return Err(Error::Sink(error));
+            }
+        }
+        for vector in &mut self.vectors[..self.queued] {
+            *vector = None;
+        }
+        self.queued = 0;
         Ok(())
     }
     pub fn flush<E>(
@@ -121,6 +185,93 @@ impl Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn batch_boundary_preserves_vectors_residual_and_deferred_guest_source() {
+        let mut output = Output::new(100);
+        let mut guest = *b"a";
+        let mut traces = Vec::new();
+        for _ in 0..7 {
+            output
+                .print_batch(
+                    Vector::Guest {
+                        address: 0,
+                        length: 1,
+                    },
+                    |_| -> Result<(), ()> { panic!("early batch") },
+                )
+                .unwrap();
+        }
+        guest[0] = b'z';
+        output
+            .pad_batch(b' ', 33, |batch| {
+                traces.push((
+                    batch.residual(),
+                    batch.vectors().map(Vector::len).collect::<Vec<_>>(),
+                ));
+                let mut bytes = Vec::new();
+                batch.submit(|v| {
+                    if let Vector::Guest { address, length } = v {
+                        bytes.extend_from_slice(
+                            &guest[*address as usize..*address as usize + length],
+                        );
+                    }
+                    Ok::<_, ()>(())
+                })?;
+                assert_eq!(bytes, b"zzzzzzz");
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        output
+            .flush_batch(|batch| {
+                traces.push((batch.residual(), batch.vectors().map(Vector::len).collect()));
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert_eq!(
+            traces,
+            [(23, vec![1, 1, 1, 1, 1, 1, 1, 16]), (17, vec![16, 1])]
+        );
+    }
+    #[test]
+    fn zero_residual_batches_skip_submission_and_partial_failure_never_replays() {
+        let mut output = Output::new(100);
+        for _ in 0..8 {
+            output
+                .print_batch(
+                    Vector::Guest {
+                        address: u64::MAX,
+                        length: 0,
+                    },
+                    |_| -> Result<(), ()> { panic!("empty residual") },
+                )
+                .unwrap();
+        }
+        for byte in 0..3 {
+            output
+                .print_batch(Vector::Owned(vec![byte]), |_| Ok::<_, i32>(()))
+                .unwrap();
+        }
+        let mut observed = Vec::new();
+        assert_eq!(
+            output.flush_batch(|batch| batch.submit(|vector| {
+                let Vector::Owned(bytes) = vector else {
+                    unreachable!()
+                };
+                if bytes[0] == 1 {
+                    return Err(7);
+                }
+                observed.push(bytes[0]);
+                Ok(())
+            })),
+            Err(Error::Sink(7))
+        );
+        assert_eq!(observed, [0]);
+        assert_eq!(
+            output.flush_batch(|_| panic!("replay")),
+            Err::<(), Error<i32>>(Error::Poisoned)
+        );
+        assert_eq!(output.total(), 3);
+    }
     #[test]
     fn eighth_vector_flushes_and_padding_keeps_source_chunk_sizes() {
         let mut output = Output::new(1024);

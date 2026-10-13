@@ -415,6 +415,7 @@ fn main() -> Result<(), String> {
         ("__stderrp", native_ps5::guest_stdio::STDERR_PTR_ADDR),
         ("__stdinp", native_ps5::stdio_file::STDIN_PTR_ADDR),
         ("__mb_cur_max", native_ps5::guest_locale::MB_CUR_MAX_ADDR),
+        ("__stdoutp", native_ps5::stdout_file::STDOUT_PTR_ADDR),
     ];
     for (index, (name, service)) in [
         ("strcpy", Service::Strcpy),
@@ -560,6 +561,10 @@ fn main() -> Result<(), String> {
         ("mbrlen", Service::Mbrlen),
         ("mbtowc", Service::Mbtowc),
         ("strtok_r", Service::StrtokR),
+        ("putc", Service::Fputc),
+        ("__swbuf", Service::Swbuf),
+        ("fputc", Service::Fputc),
+        ("putchar", Service::Putchar),
     ]
     .into_iter()
     .enumerate()
@@ -680,11 +685,13 @@ fn main() -> Result<(), String> {
     let mut stderr_pointer = native_ps5::guest_stdio::stderr_pointer_bytes();
     let mut stdin_pointer = native_ps5::stdio_file::stdin_pointer_bytes();
     let mut mb_cur_max = 1i32.to_le_bytes();
+    let mut stdout_pointer = native_ps5::stdout_file::FILE_ADDR.to_le_bytes();
     let libc = {
         use native_ps5::kernel_module::{Export, Kind};
         let mut user = native_ps5::guest_memory::Memory::default();
         user.add(0x30003000, &mut isthreaded, true, false)?;
         user.add(native_ps5::guest_locale::MB_CUR_MAX_ADDR, &mut mb_cur_max, true, false)?;
+        user.add(native_ps5::stdout_file::STDOUT_PTR_ADDR, &mut stdout_pointer, true, false)?;
         user.add(
             native_ps5::guest_stdio::STDERR_PTR_ADDR,
             &mut stderr_pointer,
@@ -703,6 +710,8 @@ fn main() -> Result<(), String> {
                         size: 4,
                         writable: true,
                     }
+                } else if *address == native_ps5::stdout_file::STDOUT_PTR_ADDR {
+                    Kind::Object { size: 8, writable: true }
                 } else if *address == native_ps5::guest_stdio::STDERR_PTR_ADDR
                     || *address == native_ps5::stdio_file::STDIN_PTR_ADDR {
                     Kind::Object {
@@ -724,6 +733,7 @@ fn main() -> Result<(), String> {
             |address| {
                 address != 0x30003000
                     && address != native_ps5::guest_locale::MB_CUR_MAX_ADDR
+                    && address != native_ps5::stdout_file::STDOUT_PTR_ADDR
                     && address != native_ps5::guest_stdio::STDERR_PTR_ADDR
                     && address != native_ps5::stdio_file::STDIN_PTR_ADDR
                     && libc_exports.iter().any(|(_, target)| *target == address)
@@ -1547,10 +1557,10 @@ fn main() -> Result<(), String> {
                 }
             }
             if segment.bytes[index..index + 8] != 0x750000u64.to_le_bytes()
-                // 147 libc exports: (147+1)*24=3552 symbol bytes
-                // and 1+147*12=1765 NID bytes (rounded1776).
-                // StrtokR adds32bytes to19632.
-                || native.bytes_allocated() != 19664
+                // 152 libc exports: (152+1)*24=3672 symbol bytes (rounded3680)
+                // and 1+152*12=1825 NID bytes (rounded1840).
+                // Five stdout exports add192bytes to19664; printf is still missing.
+                || native.bytes_allocated() != 19856
                 || native.bytes_allocated() > 32 * 1024
                 || guest_logs
                     != [b"<118>[crispy-doom.elf] Unable to resolve 'printf'\n".to_vec()]
