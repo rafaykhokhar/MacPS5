@@ -1,5 +1,10 @@
 # Rust migration
 
+Directory-stream groundwork now enumerates the owned namespace and encodes
+guest directory entries, with 572 library tests, three integration tests and
+strict Clippy passing. `opendir` still needs descriptor and stream integration;
+it remains the startup blocker. See [directory status](../docs/status/DIRECTORY_STREAMS.md).
+
 Guest `Sscanf` now shares the bounded scanner with `Vsscanf`, supplying four
 register destination pointers and subsequent stack arguments without a guest
 va_list. The matching build passes 569 library tests, three integration tests

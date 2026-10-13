@@ -16,6 +16,65 @@ use std::{
 };
 
 pub const STAT_SIZE: usize = 120;
+#[cfg(test)]
+mod directory_entry_tests {
+    use super::*;
+    #[test]
+    fn listing_is_immediate_ordered_and_preserves_inode_identity() {
+        let mut files = Files::default();
+        files.register(b"/data/z", vec![]).unwrap();
+        files.register(b"/data/sub/nested", vec![]).unwrap();
+        files.register(b"/data/a", vec![]).unwrap();
+        let listing = files.directory_entries(b"./data/", Some(b"/\0")).unwrap();
+        assert_eq!(listing.iter().map(|e| e.name.as_slice()).collect::<Vec<_>>(), [b".".as_slice(), b"..", b"a", b"sub", b"z"]);
+        assert_eq!(listing.iter().map(|e| e.directory).collect::<Vec<_>>(), [true, true, false, true, false]);
+        assert_eq!(listing[0].inode, files.directories[b"/data".as_slice()].inode);
+        assert_eq!(listing[1].inode, 1);
+        assert_eq!(listing[2].inode, files.files[b"/data/a".as_slice()].inode);
+        let root = files.directory_entries(b"/", None).unwrap();
+        assert_eq!(root.len(), 3);
+        assert_eq!(root[0].inode, root[1].inode);
+        // Snapshots are owned: future namespace additions cannot alter them.
+        files.register(b"/data/b", vec![]).unwrap();
+        assert_eq!(listing.len(), 5);
+        assert_eq!(files.directory_entries(b"/data", None).unwrap().len(), 6);
+    }
+    #[test]
+    fn listing_permissions_and_lookup_errors() {
+        let mut files = Files::default();
+        files.register_directory(b"/read", 0o400, true).unwrap();
+        assert!(files.directory_entries(b"/read", None).is_ok());
+        assert_eq!(files.directory_entries(b"/read/.", None), Err(13));
+        files.register_directory(b"/search", 0o100, false).unwrap();
+        assert_eq!(files.directory_entries(b"/search", None), Err(13));
+        files.register(b"/regular", vec![]).unwrap();
+        assert_eq!(files.directory_entries(b"/regular", None), Err(20));
+        assert_eq!(files.directory_entries(b"/regular/", None), Err(20));
+        assert_eq!(files.directory_entries(b"/absent", None), Err(2));
+        assert_eq!(files.directory_entries(b"", None), Err(2));
+        assert_eq!(files.directory_entries(b"relative", None), Err(2));
+        files.register_directory(b"/hidden/child", 0o555, false).unwrap();
+        files.register_directory(b"/hidden", 0o400, false).unwrap();
+        assert_eq!(files.directory_entries(b"/hidden/child", None), Err(13));
+    }
+    #[test]
+    fn dirent_layout_padding_and_name_limits() {
+        for length in 1..=255 {
+            let entry = DirectoryEntry { inode: 0x12345678, directory: length % 2 == 0, name: vec![0xff; length] };
+            let record = entry.record().unwrap();
+            assert_eq!(&record[..4], &[0x78, 0x56, 0x34, 0x12]);
+            assert_eq!(u16::from_le_bytes(record[4..6].try_into().unwrap()) as usize, record.len());
+            assert_eq!(record.len() % 4, 0);
+            assert_eq!(record[6], if entry.directory { 4 } else { 8 });
+            assert_eq!(record[7] as usize, length);
+            assert_eq!(&record[8..8 + length], &entry.name);
+            assert!(record[8 + length..].iter().all(|byte| *byte == 0));
+        }
+        for name in [vec![], vec![b'x'; 256], b"a/b".to_vec(), b"a\0".to_vec()] {
+            assert!(DirectoryEntry { inode: 1, directory: false, name }.record().is_err());
+        }
+    }
+}
 const PATH_MAX: usize = 1024;
 const MAX_FILES: usize = 256;
 const MAX_DIRECTORIES: usize = 256;
@@ -134,6 +193,32 @@ pub struct MkdirPlan {
     next_inode: u32,
     revision: u64,
     owner: Rc<()>,
+}
+/// Owned namespace enumeration, before any descriptor cursor or guest copy.
+/// A snapshot is not a retained directory handle across namespace mutations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryEntry {
+    pub inode: u32,
+    pub directory: bool,
+    pub name: Vec<u8>,
+}
+impl DirectoryEntry {
+    /// FreeBSD 11.4 dirent ABI: u32 inode, u16 record length, u8 type,
+    /// u8 name length, NUL-terminated name padded to a four-byte boundary.
+    /// https://raw.githubusercontent.com/freebsd/freebsd-src/releng/11.4/sys/sys/dirent.h
+    pub fn record(&self) -> Result<Vec<u8>> {
+        if self.name.is_empty() || self.name.len() > 255 || self.name.contains(&0) || self.name.contains(&b'/') {
+            return Err("Invalid directory entry name".into());
+        }
+        let length = 8 + (self.name.len() + 1).next_multiple_of(4);
+        let mut bytes = vec![0; length];
+        bytes[..4].copy_from_slice(&self.inode.to_le_bytes());
+        bytes[4..6].copy_from_slice(&(length as u16).to_le_bytes());
+        bytes[6] = if self.directory { 4 } else { 8 };
+        bytes[7] = self.name.len() as u8;
+        bytes[8..8 + self.name.len()].copy_from_slice(&self.name);
+        Ok(bytes)
+    }
 }
 /// Prepared namespace replacement. Rc file contents remain shared, but no
 /// destination link count changes until an owner/revision-checked commit.
@@ -325,6 +410,36 @@ impl Files {
             current.push(b'/');
         }
         Ok(current)
+    }
+    /// Enumerate the owned namespace only. Ancestors require search access;
+    /// the final directory requires read access, not write permission.
+    /// Dot entries precede byte-sorted immediate children. Ordering is a
+    /// virtual filesystem policy, not an assertion about console disk order.
+    pub fn directory_entries(&self, path: &[u8], cwd: Option<&[u8]>) -> std::result::Result<Vec<DirectoryEntry>, u32> {
+        let resolved = self.resolve(path, cwd)?;
+        let path = trimmed(&resolved);
+        let directory = self.directories.get(path).ok_or(if self.files.contains_key(path) { 20u32 } else { 2 })?;
+        if !self.access(directory, 4) {
+            return Err(13);
+        }
+        let parent_directory = self.directories.get(parent(path)).ok_or(2u32)?;
+        let mut entries = vec![
+            DirectoryEntry { inode: directory.inode, directory: true, name: b".".to_vec() },
+            DirectoryEntry { inode: parent_directory.inode, directory: true, name: b"..".to_vec() },
+        ];
+        let mut children = BTreeMap::new();
+        for (name, node) in &self.directories {
+            if name.as_slice() != path && parent(name) == path {
+                children.insert(name.rsplit(|b| *b == b'/').next().unwrap().to_vec(), (node.inode, true));
+            }
+        }
+        for (name, node) in &self.files {
+            if parent(name) == path {
+                children.insert(name.rsplit(|b| *b == b'/').next().unwrap().to_vec(), (node.inode, false));
+            }
+        }
+        entries.extend(children.into_iter().map(|(name, (inode, directory))| DirectoryEntry { inode, directory, name }));
+        Ok(entries)
     }
     fn materialize(
         &self,
