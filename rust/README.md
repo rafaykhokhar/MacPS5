@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct MOVD/MOVQ now supports GPR/XMM/memory transfers and XMM qword moves,
+with 33792 native cases passing. The compiled integer workload still passes;
+the new compiled memory workload currently stops at missing PSHUFD support.
+See [scalar/vector transfer evidence](../docs/status/TRANSLATOR_READINESS.md#direct-scalarvector-transfers-and-compiled-memory-probe).
+
 A compiled Rust x86-64 integer workload now passes 120 independent result
 checks through automatic ARM64 translation, with stable warm-cache usage and
 verified fuel exhaustion. The measured build used 54 translated instructions,

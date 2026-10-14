@@ -2034,6 +2034,41 @@ dependency flags using `direct_bit_scan_native.rs`. Build/test logs are
 coverage; complete translation, production readiness and gameplay remain
 unverified.
 
+## Direct scalar/vector transfers and compiled memory probe
+
+Direct legacy/VEX MOVD/MOVQ supports 32/64-bit GPR-to-XMM and XMM-to-GPR
+transfers, guarded memory loads/stores and the separate XMM qword move
+encodings. XMM results clear unused low-128-bit space; legacy forms preserve
+the upper YMM half while VEX forms clear it. Dword GPR writes zero-extend.
+Memory stores capture their source before effective-address scratch use.
+Faults preserve register and memory state; flags and MXCSR remain unchanged.
+
+`rust/verification/direct_scalar_vector_native.rs` checks all register/base
+pairs, both encoding families, both widths and directions, register aliases,
+unaligned and short reads, overflow and read-only stores. It compares all
+modeled vectors, GPRs, flags, MXCSR, memory, RIP and fault/fuel/stop state.
+All 33792 native cases pass, alongside 687 library tests, three integration
+tests, strict Clippy and release build. Logs are
+`/tmp/macps5-scalar-vector-{tests,clippy,build}.log`.
+
+The compiler/extraction utility was shared as `compiled_workload_support.rs`.
+The integer workload was rerun and still passes all 120 results, warm-cache
+and fuel checks with 54 instructions, seven attempts and 7328 JIT bytes.
+
+The new `compiled_memory_guest.rs` performs an in-place u64 transform and a
+checksum; `compiled_memory_native.rs` checks full buffers and returns across
+aligned and unaligned pointers. This integration probe is **not passing yet**.
+Its first missing form was `Movq_xmm_rm64`, now implemented and independently
+tested. It currently fails at a translation span starting at `0x10011f` with
+`Direct lowering unsupported: Pshufd_xmm_xmmm128_imm8`. The probe deliberately
+fails on that error; it does not count reaching the boundary as success.
+
+Reproduce each standalone verifier with the release rlib/dependency flags
+above. Run `compiled_memory_native` with the path to `compiled_memory_guest.rs`
+to reproduce the pending integration gap. The compiled-memory fixture and
+PSHUFD integration remain work in progress; no gameplay or full CPU-readiness
+claim follows from the completed MOVD/MOVQ checks.
+
 ## Direct BZHI
 
 Direct BZHI supports 32/64-bit register and guarded-memory sources with native

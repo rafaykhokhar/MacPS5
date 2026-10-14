@@ -5,6 +5,23 @@ use crate::{
     decode,
 };
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
+fn scalar_vector_move(i: &Instruction) -> bool {
+    matches!(
+        i.code(),
+        Code::Movd_xmm_rm32
+            | Code::Movq_xmm_rm64
+            | Code::VEX_Vmovd_xmm_rm32
+            | Code::VEX_Vmovq_xmm_rm64
+            | Code::Movd_rm32_xmm
+            | Code::Movq_rm64_xmm
+            | Code::VEX_Vmovd_rm32_xmm
+            | Code::VEX_Vmovq_rm64_xmm
+            | Code::Movq_xmm_xmmm64
+            | Code::VEX_Vmovq_xmm_xmmm64
+            | Code::Movq_xmmm64_xmm
+            | Code::VEX_Vmovq_xmmm64_xmm
+    )
+}
 fn packed_addsub(i: &Instruction) -> Option<(u64, u64, bool, bool)> {
     let legacy = i.encoding() == iced_x86::EncodingKind::Legacy;
     if !legacy && i.encoding() != iced_x86::EncodingKind::VEX {
@@ -556,6 +573,7 @@ pub(crate) fn translate_span(
             _ if byte_arithmetic(&i) => {}
             _ if register_shift(&i) => {}
             _ if vector_logic(&i).is_some() => {}
+            _ if scalar_vector_move(&i) => {}
             _ if packed_addsub(&i).is_some() => {}
             _ if vector_move(&i).is_some() => {}
             Code::VEX_Vzeroupper | Code::VEX_Vzeroall => {}
@@ -703,6 +721,66 @@ pub(crate) fn translate_span(
                 for offset in (first_byte..32).step_by(8) {
                     c.context_access(9, 19, 208 + reg * 32 + offset, true, true)?;
                 }
+            }
+            continue;
+        }
+        if scalar_vector_move(i) {
+            let wide = matches!(i.mnemonic(), Mnemonic::Movq | Mnemonic::Vmovq);
+            let xmm = |r: Register| (Register::XMM0..=Register::XMM15).contains(&r);
+            if i.op1_kind() == OpKind::Memory {
+                memory_address(&mut c, i)?;
+                c.emit(0xaa1303e0)?;
+                c.load_u64(2, if wide { 8 } else { 4 })?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_load_v1 as *const () as u64,
+                )?;
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+                c.emit(0xaa0003e9)?;
+            } else {
+                let reg = i.op1_register();
+                let offset = if xmm(reg) {
+                    208 + vector_register(reg, 16)? * 32
+                } else {
+                    register(reg, wide)? * 8
+                };
+                c.context_access(9, 19, offset, wide, false)?;
+            }
+            if i.op0_kind() == OpKind::Memory {
+                c.emit(0xaa0903e2)?; // retain source before effective-address scratch use
+                memory_address(&mut c, i)?;
+                c.emit(0xaa1303e0)?;
+                c.load_u64(3, if wide { 8 } else { 4 })?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_store_v1 as *const () as u64,
+                )?;
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+            } else if xmm(i.op0_register()) {
+                let offset = 208 + vector_register(i.op0_register(), 16)? * 32;
+                c.context_access(9, 19, offset, true, true)?;
+                c.load_u64(9, 0)?;
+                c.context_access(9, 19, offset + 8, true, true)?;
+                if i.encoding() == iced_x86::EncodingKind::VEX {
+                    c.context_access(9, 19, offset + 16, true, true)?;
+                    c.context_access(9, 19, offset + 24, true, true)?;
+                }
+            } else {
+                c.context_access(9, 19, register(i.op0_register(), wide)? * 8, true, true)?;
             }
             continue;
         }
