@@ -2422,3 +2422,43 @@ Reproduce with the release rlib/dependency compiler flags above using
 `compiled_integer_native.rs`. Pass the corresponding `compiled_*_guest.rs`
 source path to each compiled workload verifier; the x86_64-apple-darwin Rust
 target must be installed. All verifier builds use `-Dwarnings`.
+
+## Direct scalar floating-point moves
+
+Direct MOVSS/MOVSD now supports legacy register and memory forms, plus VEX
+three-register merges, loads and stores, including both register opcodes.
+Legacy register moves preserve the destination bits above the scalar; legacy
+loads clear the rest of the low 128 bits and preserve the upper YMM half.
+VEX register forms merge the non-scalar low-128 bits from their first source
+and clear upper YMM bits; VEX loads clear every bit above the scalar. Stores
+write only the scalar bytes. The scalar source is captured before merge
+writes so every source/destination alias remains valid. No host floating-point
+arithmetic is used for these bit-preserving moves. Semantics follow the MOVSS
+and MOVSD sections of the
+[Intel reference](https://cdrdv2-public.intel.com/789581/325383-sdm-vol-2abcd.pdf).
+
+`rust/verification/direct_float_move_native.rs` passes 41984 native state
+checks, covering every register pair/triple, both opcodes and both scalar
+widths. Memory cases include unaligned accesses, final valid spans, short
+spans, address overflow and read-only stores. The verifier compares all
+vectors, GPRs, flags, MXCSR, memory bytes and RIP/fault/fuel/stop state. The
+33792 existing MOVD/MOVQ checks also pass after extending their shared lowering.
+All 687 library tests, three integration tests, strict Clippy and release
+build pass; logs are `/tmp/macps5-float-move-{tests,clippy,build}.log`.
+
+The new `compiled_float_guest.rs` is a no_std optimized Rust recurrence that
+loads and multiplies f64 elements, writes each cumulative product, and returns
+a fold of the final result's bits. `compiled_float_native.rs` supplies exact
+powers of two and alternating signs, and constructs expected IEEE binary64
+bits using integer exponent/sign arithmetic. Its intended 72 cases cover
+12 lengths, three alignments and cold/warm passes, checking every buffer byte
+and the return value. This test targets compiled control/data flow; it does
+not exercise rounding, NaNs, subnormals or floating-point exceptions.
+
+The probe initially stopped at `Movsd_xmm_xmmm64`. With these moves it reaches
+the explicit `Mulsd_xmm_xmmm64` gap, reported for the translation span starting
+at `0x10016e`. It still fails and is not counted as a passing workload. Run it
+using the release rlib/dependency compiler flags above, passing the path to
+`rust/verification/compiled_float_guest.rs`. The new native move verifier uses
+the same compiler flags. EVEX moves and full CPU/game readiness remain outside
+the proven scope.

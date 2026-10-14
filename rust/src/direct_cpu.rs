@@ -20,6 +20,18 @@ fn scalar_vector_move(i: &Instruction) -> bool {
             | Code::VEX_Vmovq_xmm_xmmm64
             | Code::Movq_xmmm64_xmm
             | Code::VEX_Vmovq_xmmm64_xmm
+            | Code::Movss_xmm_xmmm32
+            | Code::Movss_xmmm32_xmm
+            | Code::Movsd_xmm_xmmm64
+            | Code::Movsd_xmmm64_xmm
+            | Code::VEX_Vmovss_xmm_xmm_xmm
+            | Code::VEX_Vmovss_xmm_xmm_xmm_0F11
+            | Code::VEX_Vmovss_xmm_m32
+            | Code::VEX_Vmovss_m32_xmm
+            | Code::VEX_Vmovsd_xmm_xmm_xmm
+            | Code::VEX_Vmovsd_xmm_xmm_xmm_0F11
+            | Code::VEX_Vmovsd_xmm_m64
+            | Code::VEX_Vmovsd_m64_xmm
     )
 }
 fn packed_qword_right_immediate(i: &Instruction) -> bool {
@@ -831,7 +843,15 @@ pub(crate) fn translate_span(
             continue;
         }
         if scalar_vector_move(i) {
-            let wide = matches!(i.mnemonic(), Mnemonic::Movq | Mnemonic::Vmovq);
+            let float_move = matches!(
+                i.mnemonic(),
+                Mnemonic::Movss | Mnemonic::Vmovss | Mnemonic::Movsd | Mnemonic::Vmovsd
+            );
+            let wide = matches!(
+                i.mnemonic(),
+                Mnemonic::Movq | Mnemonic::Vmovq | Mnemonic::Movsd | Mnemonic::Vmovsd
+            );
+            let merge = float_move && i.op_count() == 3;
             let xmm = |r: Register| (Register::XMM0..=Register::XMM15).contains(&r);
             if i.op1_kind() == OpKind::Memory {
                 memory_address(&mut c, i)?;
@@ -851,7 +871,7 @@ pub(crate) fn translate_span(
                 )?;
                 c.emit(0xaa0003e9)?;
             } else {
-                let reg = i.op1_register();
+                let reg = i.op_register(if merge { 2 } else { 1 });
                 let offset = if xmm(reg) {
                     208 + vector_register(reg, 16)? * 32
                 } else {
@@ -878,9 +898,24 @@ pub(crate) fn translate_span(
                 )?;
             } else if xmm(i.op0_register()) {
                 let offset = 208 + vector_register(i.op0_register(), 16)? * 32;
-                c.context_access(9, 19, offset, true, true)?;
+                if merge {
+                    let from = 208 + vector_register(i.op1_register(), 16)? * 32;
+                    // Capture the scalar source first so all three operands may alias.
+                    if !wide {
+                        c.context_access(10, 19, from + 4, false, false)?;
+                        c.context_access(10, 19, offset + 4, false, true)?;
+                    }
+                    c.context_access(10, 19, from + 8, true, false)?;
+                    c.context_access(10, 19, offset + 8, true, true)?;
+                }
+                c.context_access(9, 19, offset, !float_move || wide, true)?;
                 c.load_u64(9, 0)?;
-                c.context_access(9, 19, offset + 8, true, true)?;
+                if !float_move || i.op1_kind() == OpKind::Memory {
+                    if float_move && !wide {
+                        c.context_access(9, 19, offset + 4, false, true)?;
+                    }
+                    c.context_access(9, 19, offset + 8, true, true)?;
+                }
                 if i.encoding() == iced_x86::EncodingKind::VEX {
                     c.context_access(9, 19, offset + 16, true, true)?;
                     c.context_access(9, 19, offset + 24, true, true)?;

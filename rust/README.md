@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct MOVSS/MOVSD and VEX scalar moves now pass 41984 native state checks,
+including all register aliases and guarded memory. Existing MOVD/MOVQ checks
+still pass. A new compiled Rust floating-point probe reaches missing MULSD;
+it remains a failing integration probe, not a passing floating-point workload.
+See [scalar floating-point move evidence](../docs/status/TRANSLATOR_READINESS.md#direct-scalar-floating-point-moves).
+
 The compiled Rust memory workload now passes all 72 return/full-buffer checks
 through automatic ARM64 translation, including unaligned buffers and stable
 warm-cache usage. Direct immediate PSRLQ/VPSRLQ adds 540672 native state checks
