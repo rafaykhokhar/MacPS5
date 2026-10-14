@@ -2059,7 +2059,7 @@ The new `compiled_memory_guest.rs` performs an in-place u64 transform and a
 checksum; `compiled_memory_native.rs` checks full buffers and returns across
 aligned and unaligned pointers. This integration probe is **not passing yet**.
 Its first missing form was `Movq_xmm_rm64`, now implemented and independently
-tested. It currently fails at a translation span starting at `0x10011f` with
+tested. At that checkpoint it failed at a translation span starting at `0x10011f` with
 `Direct lowering unsupported: Pshufd_xmm_xmmm128_imm8`. The probe deliberately
 fails on that error; it does not count reaching the boundary as success.
 
@@ -2358,3 +2358,31 @@ target must be installed. Both verifier and guest compile with warnings denied.
 This adds evidence for mixed compiler-generated CPU execution and cache reuse;
 full instruction coverage, architectural fault delivery and gameplay remain
 unverified.
+
+## Direct packed dword shuffle
+
+Direct PSHUFD/VPSHUFD supports legacy SSE128 and VEX128/256 register and
+guarded-memory sources. Register lowering captures all four source dwords
+before writing a 128-bit half, preserving source/destination aliases. Each
+256-bit half shuffles independently. Legacy forms preserve upper YMM bits;
+VEX128 clears them. The legacy memory wrapper requires 16-byte alignment and
+preserves upper bits; failed reads preserve all vectors. These rules follow
+the [Intel instruction reference](https://cdrdv2-public.intel.com/774492/325383-sdm-vol-2abcd.pdf).
+
+`rust/verification/direct_shufd_native.rs` independently decodes the immediate
+as four base-four selectors and copies bytes from the selected dwords. It
+covers all 256 controls, every source/destination or base pair, all three
+encoding/width forms, aliases, independent halves and nonzero upper lanes.
+Memory cases cover alignment, unaligned VEX reads, last-valid spans, short
+reads and overflow. All modeled vectors, GPRs, flags, MXCSR, memory, RIP and
+fault/fuel/stop state are compared.
+
+Validation passes: 1376256 native cases, 687 library tests, three integration
+tests, strict Clippy and release build. The standalone verifier compiles with
+warnings denied; reproduce with the release rlib/dependency flags above using
+`direct_shufd_native.rs`. Logs are `/tmp/macps5-shufd-{tests,clippy,build}.log`.
+
+The compiled memory workload was rerun against the new release. Its next
+explicit missing form is `Psrlq_xmm_imm8`, reported for the translation span
+at `0x10011f`. It remains a failing integration probe; passing shuffle checks
+does not establish a successful compiled-memory result or PS5 gameplay.

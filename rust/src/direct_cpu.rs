@@ -573,6 +573,9 @@ pub(crate) fn translate_span(
             _ if byte_arithmetic(&i) => {}
             _ if register_shift(&i) => {}
             _ if vector_logic(&i).is_some() => {}
+            Code::Pshufd_xmm_xmmm128_imm8
+            | Code::VEX_Vpshufd_xmm_xmmm128_imm8
+            | Code::VEX_Vpshufd_ymm_ymmm256_imm8 => {}
             _ if scalar_vector_move(&i) => {}
             _ if packed_addsub(&i).is_some() => {}
             _ if vector_move(&i).is_some() => {}
@@ -720,6 +723,72 @@ pub(crate) fn translate_span(
             for reg in 0..16 {
                 for offset in (first_byte..32).step_by(8) {
                     c.context_access(9, 19, 208 + reg * 32 + offset, true, true)?;
+                }
+            }
+            continue;
+        }
+        if matches!(
+            i.code(),
+            Code::Pshufd_xmm_xmmm128_imm8
+                | Code::VEX_Vpshufd_xmm_xmmm128_imm8
+                | Code::VEX_Vpshufd_ymm_ymmm256_imm8
+        ) {
+            let size = i.op0_register().size() as u64;
+            let legacy = i.encoding() == iced_x86::EncodingKind::Legacy;
+            let dst = vector_register(i.op0_register(), size)?;
+            let control = i.immediate8();
+            if i.op1_kind() == OpKind::Memory {
+                memory_address(&mut c, i)?;
+                c.emit(0xaa1303e0)?;
+                c.load_u64(2, dst as u64)?;
+                if legacy {
+                    c.load_u64(3, control as u64)?;
+                    c.call_absolute(
+                        crate::guest_memory::ffi::native_legacy_vector_shufd as *const () as u64,
+                    )?;
+                } else {
+                    c.load_u64(3, size)?;
+                    c.load_u64(4, control as u64)?;
+                    c.call_absolute(
+                        crate::guest_memory::ffi::native_ps5_module_vector_shufd_v1 as *const ()
+                            as u64,
+                    )?;
+                }
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+            } else {
+                let src = vector_register(i.op1_register(), size)?;
+                for half in 0..size as usize / 16 {
+                    for lane in 0..4 {
+                        c.context_access(
+                            9 + lane as u8,
+                            19,
+                            208 + src * 32 + half * 16 + lane * 4,
+                            false,
+                            false,
+                        )?;
+                    }
+                    for lane in 0..4 {
+                        c.context_access(
+                            9 + ((control >> (lane * 2)) & 3),
+                            19,
+                            208 + dst * 32 + half * 16 + lane * 4,
+                            false,
+                            true,
+                        )?;
+                    }
+                }
+                if size == 16 && !legacy {
+                    c.load_u64(9, 0)?;
+                    c.context_access(9, 19, 224 + dst * 32, true, true)?;
+                    c.context_access(9, 19, 232 + dst * 32, true, true)?;
                 }
             }
             continue;

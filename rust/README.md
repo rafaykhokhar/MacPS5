@@ -1,8 +1,13 @@
 # Rust migration
 
+Direct PSHUFD/VPSHUFD now supports SSE128 and VEX128/256 with guarded memory
+and alias-safe shuffles. All 1376256 native cases, library/integration tests
+and strict Clippy pass. The compiled memory workload now stops at PSRLQ.
+See [shuffle evidence](../docs/status/TRANSLATOR_READINESS.md#direct-packed-dword-shuffle).
+
 Direct MOVD/MOVQ now supports GPR/XMM/memory transfers and XMM qword moves,
 with 33792 native cases passing. The compiled integer workload still passes;
-the new compiled memory workload currently stops at missing PSHUFD support.
+the new compiled memory workload initially stopped at missing PSHUFD support.
 See [scalar/vector transfer evidence](../docs/status/TRANSLATOR_READINESS.md#direct-scalarvector-transfers-and-compiled-memory-probe).
 
 A compiled Rust x86-64 integer workload now passes 120 independent result
