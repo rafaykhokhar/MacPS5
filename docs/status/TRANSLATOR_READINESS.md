@@ -2561,10 +2561,10 @@ stores its bits in place and returns a folded XOR checksum.
 `compiled_convert_native.rs` prepares signed limits and rounding-tie inputs
 with explicit expected bit patterns. It is intended to check 12 lengths,
 three alignments and two execution passes, with full-buffer/return comparisons
-and stable warm-cache usage. It currently fails at
+and stable warm-cache usage. At that checkpoint it failed at
 `Unpcklpd_xmm_xmmm128`, reported for the translation span at `0x10011c`.
-No successful compiled-conversion result is claimed. Do not alter the guest
-to avoid this compiler-generated instruction; it is the next integration gap.
+No successful compiled-conversion result was claimed at that checkpoint.
+The guest was retained unchanged to exercise this integration gap.
 
 All 687 library tests, three integration tests, strict Clippy and release build
 pass; logs are `/tmp/macps5-cvtsi2sd-{tests,clippy,build}.log`. Reproduce with the
@@ -2572,3 +2572,36 @@ release rlib/dependency flags above using `direct_cvtsi2sd_native.rs` and
 `compiled_convert_native.rs`, passing `compiled_convert_guest.rs` to the latter.
 Both verifier builds use `-Dwarnings`. Full CPU readiness and gameplay remain
 unproven.
+
+## Direct packed-double unpack and compiled conversion
+
+Direct UNPCKLPD/UNPCKHPD and VEX128/256 equivalents now interleave selected
+64-bit values independently in each 128-bit half. Register lowering captures
+both source values before writing each half, preserving all aliases. Legacy
+preserves upper YMM bits; VEX128 clears them. Memory lowering reuses guarded
+vector unpacking with a legacy wrapper for 16-byte alignment and upper-bit
+preservation. The complete declared memory operand must be readable before
+any destination is committed. These are bit operations; flags and MXCSR do
+not change. Instruction semantics are described in the
+[Intel unpack reference](https://cdrdv2-public.intel.com/671110/325383-sdm-vol-2abcd.pdf).
+
+`rust/verification/direct_double_unpack_native.rs` passes 185856 native state
+checks. It covers low/high unpack, SSE128 and VEX128/256, all register
+pairs/triples and base registers, all aliases, independent 256-bit halves,
+unaligned VEX reads, legacy alignment faults, last-valid spans, short and
+overflowing reads, plus prior-fault/zero-fuel guards. It compares every vector,
+GPR, flags, MXCSR, memory and RIP/fault/fuel/stop state against byte-copy
+expectations. EVEX forms remain outside this implementation.
+
+The unchanged compiled Rust conversion loop now passes all 72 return/full-buffer
+checks, including signed extrema and rounding ties at three buffer alignments.
+This build has 184 guest bytes, 52 discovered instructions, eight translation
+attempts and 6968 JIT bytes. Translation/arena usage remains unchanged on the
+warm pass, and no translation dylibs are loaded. This establishes the scoped
+compiled conversion result; it does not establish full CPU or game readiness.
+
+All 687 library tests, three integration tests, strict Clippy and release build
+pass. Logs are `/tmp/macps5-double-unpack-{tests,clippy,build}.log`. Reproduce
+with the release rlib/dependency flags above using `direct_double_unpack_native.rs`
+and `compiled_convert_native.rs`, passing `compiled_convert_guest.rs` to the
+latter. Both verifier compilations use `-Dwarnings`.

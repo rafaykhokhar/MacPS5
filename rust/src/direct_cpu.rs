@@ -40,6 +40,17 @@ fn packed_qword_right_immediate(i: &Instruction) -> bool {
         Code::Psrlq_xmm_imm8 | Code::VEX_Vpsrlq_xmm_xmm_imm8 | Code::VEX_Vpsrlq_ymm_ymm_imm8
     )
 }
+fn packed_double_unpack(i: &Instruction) -> bool {
+    matches!(
+        i.code(),
+        Code::Unpcklpd_xmm_xmmm128
+            | Code::Unpckhpd_xmm_xmmm128
+            | Code::VEX_Vunpcklpd_xmm_xmm_xmmm128
+            | Code::VEX_Vunpcklpd_ymm_ymm_ymmm256
+            | Code::VEX_Vunpckhpd_xmm_xmm_xmmm128
+            | Code::VEX_Vunpckhpd_ymm_ymm_ymmm256
+    )
+}
 fn packed_addsub(i: &Instruction) -> Option<(u64, u64, bool, bool)> {
     let legacy = i.encoding() == iced_x86::EncodingKind::Legacy;
     if !legacy && i.encoding() != iced_x86::EncodingKind::VEX {
@@ -606,6 +617,7 @@ pub(crate) fn translate_span(
             | Code::VEX_Vstmxcsr_m32 => {}
             _ if packed_addsub(&i).is_some() => {}
             _ if packed_qword_right_immediate(&i) => {}
+            _ if packed_double_unpack(&i) => {}
             _ if vector_move(&i).is_some() => {}
             Code::VEX_Vzeroupper | Code::VEX_Vzeroall => {}
             _ if conditional_move(&i) => {}
@@ -1004,6 +1016,58 @@ pub(crate) fn translate_span(
                 c.load_u64(9, 0)?;
                 c.context_access(9, 19, 224 + dst * 32, true, true)?;
                 c.context_access(9, 19, 232 + dst * 32, true, true)?;
+            }
+            continue;
+        }
+        if packed_double_unpack(i) {
+            let legacy = i.encoding() == iced_x86::EncodingKind::Legacy;
+            let size = i.op0_register().size() as u64;
+            let high = matches!(i.mnemonic(), Mnemonic::Unpckhpd | Mnemonic::Vunpckhpd);
+            let dst = vector_register(i.op0_register(), size)?;
+            let first = vector_register(i.op_register(if legacy { 0 } else { 1 }), size)?;
+            let second = if legacy { 1 } else { 2 };
+            if i.op_kind(second) == OpKind::Memory {
+                memory_address(&mut c, i)?;
+                c.emit(0xaa1303e0)?;
+                c.load_u64(2, dst as u64)?;
+                if legacy {
+                    c.load_u64(3, u64::from(high))?;
+                    c.call_absolute(
+                        crate::guest_memory::ffi::native_legacy_double_unpack as *const () as u64,
+                    )?;
+                } else {
+                    c.load_u64(3, first as u64)?;
+                    c.load_u64(4, size)?;
+                    c.load_u64(5, 8)?;
+                    c.load_u64(6, u64::from(high))?;
+                    c.call_absolute(
+                        crate::guest_memory::ffi::native_ps5_module_vector_unpack_v1 as *const ()
+                            as u64,
+                    )?;
+                }
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+            } else {
+                let src = vector_register(i.op_register(second), size)?;
+                for half in 0..size as usize / 16 {
+                    let at = half * 16 + if high { 8 } else { 0 };
+                    c.context_access(9, 19, 208 + first * 32 + at, true, false)?;
+                    c.context_access(10, 19, 208 + src * 32 + at, true, false)?;
+                    c.context_access(9, 19, 208 + dst * 32 + half * 16, true, true)?;
+                    c.context_access(10, 19, 216 + dst * 32 + half * 16, true, true)?;
+                }
+                if !legacy && size == 16 {
+                    c.load_u64(9, 0)?;
+                    c.context_access(9, 19, 224 + dst * 32, true, true)?;
+                    c.context_access(9, 19, 232 + dst * 32, true, true)?;
+                }
             }
             continue;
         }

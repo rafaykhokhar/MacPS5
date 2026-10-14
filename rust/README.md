@@ -1,9 +1,14 @@
 # Rust migration
 
+Direct UNPCKLPD/UNPCKHPD and VEX128/256 equivalents now pass 185856 native
+state checks. The unchanged compiled Rust conversion loop now passes all 72
+return/full-buffer checks with stable warm-cache usage. See
+[packed-double unpack evidence](../docs/status/TRANSLATOR_READINESS.md#direct-packed-double-unpack-and-compiled-conversion).
+
 Direct CVTSI2SD/VCVTSI2SD now supports signed 32/64-bit register and guarded
 memory inputs using guest rounding controls. All 3655680 native state checks
-pass. A new compiled conversion loop still fails at missing UNPCKLPD support;
-it is an integration probe, not a passing workload. See
+pass. At that checkpoint the compiled conversion loop failed at missing
+UNPCKLPD support, before the subsequent unpack implementation. See
 [conversion evidence](../docs/status/TRANSLATOR_READINESS.md#direct-signed-integer-to-binary64-conversion).
 
 Direct LDMXCSR/STMXCSR and their VEX forms now load and store guest SIMD
