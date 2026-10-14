@@ -596,6 +596,10 @@ pub(crate) fn translate_span(
             | Code::VEX_Vpshufd_ymm_ymmm256_imm8 => {}
             _ if scalar_vector_move(&i) => {}
             Code::Mulsd_xmm_xmmm64 | Code::VEX_Vmulsd_xmm_xmm_xmmm64 => {}
+            Code::Ldmxcsr_m32
+            | Code::Stmxcsr_m32
+            | Code::VEX_Vldmxcsr_m32
+            | Code::VEX_Vstmxcsr_m32 => {}
             _ if packed_addsub(&i).is_some() => {}
             _ if packed_qword_right_immediate(&i) => {}
             _ if vector_move(&i).is_some() => {}
@@ -840,6 +844,50 @@ pub(crate) fn translate_span(
                 c.load_u64(9, 0)?;
                 c.context_access(9, 19, 224 + dst * 32, true, true)?;
                 c.context_access(9, 19, 232 + dst * 32, true, true)?;
+            }
+            continue;
+        }
+        if matches!(
+            i.code(),
+            Code::Ldmxcsr_m32 | Code::Stmxcsr_m32 | Code::VEX_Vldmxcsr_m32 | Code::VEX_Vstmxcsr_m32
+        ) {
+            let load = matches!(i.mnemonic(), Mnemonic::Ldmxcsr | Mnemonic::Vldmxcsr);
+            memory_address(&mut c, i)?;
+            c.emit(0xaa1303e0)?;
+            if load {
+                c.load_u64(2, 4)?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_load_v1 as *const () as u64,
+                )?;
+            } else {
+                c.context_access(2, 19, 200, false, false)?;
+                c.load_u64(3, 4)?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_store_v1 as *const () as u64,
+                )?;
+            }
+            c.context_access(9, 19, 152, true, false)?;
+            c.branch(
+                EXIT,
+                Branch::CompareZero {
+                    register: 9,
+                    wide: true,
+                    nonzero: true,
+                },
+            )?;
+            if load {
+                c.emit(0xaa0003e1)?;
+                c.emit(0xaa1303e0)?;
+                c.call_absolute(crate::scalar_fp::native_ps5_load_mxcsr_v1 as *const () as u64)?;
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
             }
             continue;
         }

@@ -17,6 +17,7 @@ pub use truncate::{
 };
 pub const MXCSR_RESET: u32 = 0x1f80;
 pub const MXCSR_VALID: u32 = 0xffff;
+pub use abi::native_ps5_load_mxcsr_v1;
 /// Prototype diagnostic for invalid reserved MXCSR bits, representing #GP.
 /// Not a claim that a complete guest exception delivery mechanism exists.
 pub const CONTROL_FAULT: u64 = 14;

@@ -2505,3 +2505,33 @@ the release rlib/dependency flags above with `direct_mulsd_native.rs` and
 `compiled_float_native.rs`; pass `compiled_float_guest.rs` to the latter.
 Both verifier compilations use `-Dwarnings`. Full floating-point instruction
 coverage, production CPU readiness and PS5 gameplay remain unproven.
+
+## Direct guest MXCSR load and store
+
+Direct LDMXCSR/STMXCSR and VEX VLDMXCSR/VSTMXCSR now access the guest's 32-bit
+MXCSR through guarded memory. Loads call the existing Rust control validator;
+reserved bits cause diagnostic fault 14 and preserve the old control. Stores
+write exactly four bytes. Memory failures preserve controls and use the
+existing load/store diagnostic boundaries. This adds no host FPCR/FPSR changes
+and does not implement architectural guest exception delivery. The supported
+control mask remains the existing DAZ-enabled `0xffff` policy.
+
+`rust/verification/direct_mxcsr_native.rs` passes 4200325 native checks. For
+each of the four instruction forms and all 16 base registers it tests every
+supported 16-bit control value, each individual reserved high bit, and sampled
+unaligned/last-valid/short/overflowing/read-only accesses. It compares controls,
+GPRs, vectors, flags, x87 controls, memory and RIP/fault/fuel/stop state. Existing
+sticky flags combined with unmasking do not fault at control-load time. The
+verifier also checks prior-fault and zero-fuel guards for every generated form.
+
+Five integrated guest sequences execute LDMXCSR, MULSD and STMXCSR. They prove
+that all four rounding modes affect an inexact multiplication as expected and
+that its precision flag is stored to guest memory. An unmasked precision case
+stops at multiplication with the destination and later store untouched. The
+expected result bits and status words are explicit constants; this is not a
+hardware x86 differential comparison or proof of full exception delivery.
+
+All 687 library tests, three integration tests, strict Clippy and release build
+pass. Logs are `/tmp/macps5-mxcsr-{tests,clippy,build}.log`. Reproduce the native
+verifier with the release rlib/dependency flags above using
+`rust/verification/direct_mxcsr_native.rs`; compilation uses `-Dwarnings`.

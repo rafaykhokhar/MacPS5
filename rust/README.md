@@ -1,5 +1,11 @@
 # Rust migration
 
+Direct LDMXCSR/STMXCSR and their VEX forms now load and store guest SIMD
+controls through guarded memory. All 4200325 native checks pass, including
+every supported control value, reserved-bit rejection and guest-controlled
+rounding followed by multiplication/status storage. See
+[MXCSR evidence](../docs/status/TRANSLATOR_READINESS.md#direct-guest-mxcsr-load-and-store).
+
 Direct MULSD/VMULSD now uses the existing integer-only Rust binary64 model.
 All 379168 native state checks and 17408 fault/fuel guards pass. The compiled
 Rust floating-point workload now passes all 72 return/full-buffer checks with
