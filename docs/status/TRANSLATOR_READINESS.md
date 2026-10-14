@@ -2384,5 +2384,41 @@ warnings denied; reproduce with the release rlib/dependency flags above using
 
 The compiled memory workload was rerun against the new release. Its next
 explicit missing form is `Psrlq_xmm_imm8`, reported for the translation span
-at `0x10011f`. It remains a failing integration probe; passing shuffle checks
-does not establish a successful compiled-memory result or PS5 gameplay.
+at `0x10011f`. At that checkpoint it remained a failing integration probe;
+passing shuffle checks alone did not establish a compiled-memory result.
+
+## Direct packed qword shift and compiled memory execution
+
+Direct immediate PSRLQ/VPSRLQ supports legacy SSE128 and VEX128/256 register
+forms. Each 64-bit lane lowers to an ARM64 logical shift; counts at least 64
+produce zero, without scalar-style count masking. Legacy preserves upper YMM
+bits and VEX128 clears them. Source/destination aliases are safe because each
+lane is read before its corresponding write. Flags and MXCSR are unchanged.
+Register/memory-supplied counts, MMX and EVEX forms remain unsupported by this
+addition. Semantics follow the packed logical shift section of the
+[Intel instruction reference](https://cdrdv2-public.intel.com/774492/325383-sdm-vol-2abcd.pdf).
+
+`rust/verification/direct_psrlq_native.rs` uses an independent bit-by-bit
+reference for all 256 immediate counts, every valid source/destination pair,
+all three forms and four input patterns. It compares every vector and GPR,
+flags, MXCSR, RIP and fault/fuel/stop state. All 540672 result cases and 270336
+prior-fault/zero-fuel guards pass on the ARM64 host. The 687 library tests,
+three integration tests, strict Clippy and release build also pass.
+Logs: `/tmp/macps5-psrlq-{tests,clippy,build}.log`.
+
+The existing optimized Rust memory guest now executes successfully through
+the automatic direct translator. Its 72 checks cover 12 element counts,
+three buffer alignments and two execution passes. Each compares the return
+value and the entire output buffer, including surrounding sentinels, against
+the independent u128 arithmetic model. The measured guest is 200 bytes;
+translation uses 56 discovered instructions, eight attempts and 7144 JIT
+bytes, with unchanged translation/arena usage on the warm pass and zero
+translation dylibs. The compiled integer guest still passes all 120 cases
+and its fuel-exhaustion check. These are compiler-generated workload results,
+not proof of full instruction coverage, production readiness or gameplay.
+
+Reproduce with the release rlib/dependency compiler flags above using
+`direct_psrlq_native.rs`, `compiled_memory_native.rs` and
+`compiled_integer_native.rs`. Pass the corresponding `compiled_*_guest.rs`
+source path to each compiled workload verifier; the x86_64-apple-darwin Rust
+target must be installed. All verifier builds use `-Dwarnings`.

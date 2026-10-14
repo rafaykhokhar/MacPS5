@@ -1,8 +1,14 @@
 # Rust migration
 
+The compiled Rust memory workload now passes all 72 return/full-buffer checks
+through automatic ARM64 translation, including unaligned buffers and stable
+warm-cache usage. Direct immediate PSRLQ/VPSRLQ adds 540672 native state checks
+and 270336 fault/fuel guards. This proves these CPU workloads, not PS5 gameplay.
+See [packed shift and compiled memory evidence](../docs/status/TRANSLATOR_READINESS.md#direct-packed-qword-shift-and-compiled-memory-execution).
+
 Direct PSHUFD/VPSHUFD now supports SSE128 and VEX128/256 with guarded memory
 and alias-safe shuffles. All 1376256 native cases, library/integration tests
-and strict Clippy pass. The compiled memory workload now stops at PSRLQ.
+and strict Clippy pass. At that checkpoint the compiled memory workload stopped at PSRLQ.
 See [shuffle evidence](../docs/status/TRANSLATOR_READINESS.md#direct-packed-dword-shuffle).
 
 Direct MOVD/MOVQ now supports GPR/XMM/memory transfers and XMM qword moves,

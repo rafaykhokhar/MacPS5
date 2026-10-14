@@ -22,6 +22,12 @@ fn scalar_vector_move(i: &Instruction) -> bool {
             | Code::VEX_Vmovq_xmmm64_xmm
     )
 }
+fn packed_qword_right_immediate(i: &Instruction) -> bool {
+    matches!(
+        i.code(),
+        Code::Psrlq_xmm_imm8 | Code::VEX_Vpsrlq_xmm_xmm_imm8 | Code::VEX_Vpsrlq_ymm_ymm_imm8
+    )
+}
 fn packed_addsub(i: &Instruction) -> Option<(u64, u64, bool, bool)> {
     let legacy = i.encoding() == iced_x86::EncodingKind::Legacy;
     if !legacy && i.encoding() != iced_x86::EncodingKind::VEX {
@@ -578,6 +584,7 @@ pub(crate) fn translate_span(
             | Code::VEX_Vpshufd_ymm_ymmm256_imm8 => {}
             _ if scalar_vector_move(&i) => {}
             _ if packed_addsub(&i).is_some() => {}
+            _ if packed_qword_right_immediate(&i) => {}
             _ if vector_move(&i).is_some() => {}
             Code::VEX_Vzeroupper | Code::VEX_Vzeroall => {}
             _ if conditional_move(&i) => {}
@@ -790,6 +797,36 @@ pub(crate) fn translate_span(
                     c.context_access(9, 19, 224 + dst * 32, true, true)?;
                     c.context_access(9, 19, 232 + dst * 32, true, true)?;
                 }
+            }
+            continue;
+        }
+        if packed_qword_right_immediate(i) {
+            let legacy = i.encoding() == iced_x86::EncodingKind::Legacy;
+            let size = i.op0_register().size() as u64;
+            let dst = vector_register(i.op0_register(), size)?;
+            let src = vector_register(
+                if legacy {
+                    i.op0_register()
+                } else {
+                    i.op1_register()
+                },
+                size,
+            )?;
+            let count = i.immediate8();
+            for lane in 0..size as usize / 8 {
+                if count >= 64 {
+                    c.load_u64(9, 0)?;
+                } else {
+                    c.context_access(9, 19, 208 + src * 32 + lane * 8, true, false)?;
+                    // LSR x9,x9,#count (UBFM); packed counts do not wrap at 64.
+                    c.emit(0xd340fd29 | (u32::from(count) << 16))?;
+                }
+                c.context_access(9, 19, 208 + dst * 32 + lane * 8, true, true)?;
+            }
+            if size == 16 && !legacy {
+                c.load_u64(9, 0)?;
+                c.context_access(9, 19, 224 + dst * 32, true, true)?;
+                c.context_access(9, 19, 232 + dst * 32, true, true)?;
             }
             continue;
         }
