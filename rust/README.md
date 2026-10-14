@@ -1,9 +1,15 @@
 # Rust migration
 
+Direct MULSD/VMULSD now uses the existing integer-only Rust binary64 model.
+All 379168 native state checks and 17408 fault/fuel guards pass. The compiled
+Rust floating-point workload now passes all 72 return/full-buffer checks with
+stable warm-cache usage. Full guest exception delivery is still unfinished.
+See [scalar multiply evidence](../docs/status/TRANSLATOR_READINESS.md#direct-scalar-binary64-multiplication).
+
 Direct MOVSS/MOVSD and VEX scalar moves now pass 41984 native state checks,
 including all register aliases and guarded memory. Existing MOVD/MOVQ checks
-still pass. A new compiled Rust floating-point probe reaches missing MULSD;
-it remains a failing integration probe, not a passing floating-point workload.
+still pass. At that checkpoint the compiled Rust floating-point probe reached
+missing MULSD, before the subsequent multiplication implementation.
 See [scalar floating-point move evidence](../docs/status/TRANSLATOR_READINESS.md#direct-scalar-floating-point-moves).
 
 The compiled Rust memory workload now passes all 72 return/full-buffer checks

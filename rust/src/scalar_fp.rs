@@ -10,6 +10,7 @@ mod fma;
 pub use convert_i64::convert_i64_binary64;
 pub use fma::fma213_binary64;
 mod truncate;
+pub use arithmetic::abi::native_ps5_multiply_binary64_v1;
 pub use arithmetic::{FpResult, FpUnsupported, multiply_binary64};
 pub use truncate::{
     Truncate64Result, TruncateError, TruncateResult, truncate_binary64_i32, truncate_binary64_i64,

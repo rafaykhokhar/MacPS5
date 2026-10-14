@@ -349,11 +349,11 @@ mod tests {
 }
 
 #[allow(unsafe_code)]
-mod abi {
+pub(super) mod abi {
     use super::*;
     use crate::legacy_cpu::Cpu;
     /// # Safety
-    /// cpu is a live uniquely borrowed guest context matching the720byte ABI.
+    /// cpu is a live uniquely borrowed guest context matching the current Cpu ABI.
     /// Caller must check cpu.fault before committing returned bits to a register.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn native_ps5_multiply_binary64_v1(cpu: *mut Cpu, a: u64, b: u64) -> u64 {

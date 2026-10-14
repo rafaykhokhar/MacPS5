@@ -2457,8 +2457,51 @@ not exercise rounding, NaNs, subnormals or floating-point exceptions.
 
 The probe initially stopped at `Movsd_xmm_xmmm64`. With these moves it reaches
 the explicit `Mulsd_xmm_xmmm64` gap, reported for the translation span starting
-at `0x10016e`. It still fails and is not counted as a passing workload. Run it
+at `0x10016e`. At that checkpoint it failed and was not a passing workload. Run it
 using the release rlib/dependency compiler flags above, passing the path to
 `rust/verification/compiled_float_guest.rs`. The new native move verifier uses
 the same compiler flags. EVEX moves and full CPU/game readiness remain outside
 the proven scope.
+
+## Direct scalar binary64 multiplication
+
+Direct MULSD and VEX VMULSD now support register and guarded-memory second
+operands. Lowering calls the existing integer-only Rust
+`native_ps5_multiply_binary64_v1` model, checks its fault state before committing
+the result, and applies the legacy/VEX upper-bit rules. Legacy preserves all
+destination bits above the scalar; VEX copies bits 127:64 from its first source
+and clears upper YMM bits. All source/destination aliases are safe. Guarded
+memory failures occur before arithmetic or MXCSR updates. This is native Rust
+helper execution, not a new host floating-point fast path.
+
+The existing model handles rounding modes, DAZ/FTZ, signed zeros, infinities,
+NaNs and sticky exception status. Unmasked exceptions update MXCSR but leave
+the destination unchanged and stop with diagnostic fault 15. Reserved controls
+use diagnostic fault 14. These stops do not constitute complete architectural
+guest exception delivery. This change reuses the model without changing its
+arithmetic; its primary references and limitations remain documented in
+`rust/src/scalar_fp/arithmetic.rs` and earlier readiness checkpoints.
+
+`rust/verification/direct_mulsd_native.rs` passes 379168 native state checks and
+17408 prior-fault/zero-fuel guards. It checks every legacy register pair and
+VEX register triple, memory bases, source aliases, both forms' upper bits,
+short/overflowing reads, all four rounding controls, DAZ/FTZ, signaling/quiet
+NaN priority, invalid/denormal/overflow/precision exceptions and reserved
+controls. Expected arithmetic bits and status are specified explicitly rather
+than calculated with the helper under test. Every vector, GPR, flags, MXCSR,
+x87 controls, memory bytes and RIP/fault/fuel/stop state is checked. No hardware
+x86 differential comparison is claimed for this verifier.
+
+The compiled Rust floating-point recurrence now passes all 72 return and
+full-buffer checks. This build is 162 guest bytes and uses 42 discovered
+instructions, seven translation attempts and 6224 JIT bytes; warm-pass usage
+is unchanged and no translation dylibs are loaded. Its exact-power inputs
+validate compiled execution and memory integration, not broad numerical edge
+coverage; those edge cases are checked separately above.
+
+All 687 library tests, three integration tests, strict Clippy and the release
+build pass. Logs are `/tmp/macps5-mulsd-{tests,clippy,build}.log`. Reproduce using
+the release rlib/dependency flags above with `direct_mulsd_native.rs` and
+`compiled_float_native.rs`; pass `compiled_float_guest.rs` to the latter.
+Both verifier compilations use `-Dwarnings`. Full floating-point instruction
+coverage, production CPU readiness and PS5 gameplay remain unproven.
