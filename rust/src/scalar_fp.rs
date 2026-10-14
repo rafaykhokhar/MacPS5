@@ -7,6 +7,7 @@ use crate::legacy_cpu::Cpu;
 mod arithmetic;
 mod convert_i64;
 mod fma;
+pub use convert_i64::abi::native_ps5_convert_i64_binary64_v1;
 pub use convert_i64::convert_i64_binary64;
 pub use fma::fma213_binary64;
 mod truncate;

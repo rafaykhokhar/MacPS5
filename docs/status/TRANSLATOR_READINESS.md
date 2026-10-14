@@ -2535,3 +2535,40 @@ All 687 library tests, three integration tests, strict Clippy and release build
 pass. Logs are `/tmp/macps5-mxcsr-{tests,clippy,build}.log`. Reproduce the native
 verifier with the release rlib/dependency flags above using
 `rust/verification/direct_mxcsr_native.rs`; compilation uses `-Dwarnings`.
+
+## Direct signed integer to binary64 conversion
+
+Direct CVTSI2SD and VEX VCVTSI2SD now support signed 32/64-bit register and
+guarded-memory sources. Narrow inputs are explicitly sign-extended before
+calling the existing integer-only Rust binary64 conversion model. Legacy
+preserves destination bits above the scalar. VEX copies bits 127:64 from the
+merge source and clears upper YMM bits. Unmasked precision exceptions preserve
+the destination and stop at diagnostic fault 15; reserved controls use fault
+14. Memory faults take precedence over conversion and preserve MXCSR. This
+does not add architectural guest exception delivery or an FP hardware fast path.
+
+`rust/verification/direct_cvtsi2sd_native.rs` passes 3655680 native state checks.
+It covers all register combinations and memory bases, both widths/encodings,
+aliases, garbage high bits on 32-bit sources, signed limits, ties above 2^53,
+all four rounding modes, DAZ/FTZ, unmasked precision and already-sticky status,
+reserved controls, unaligned/short/overflowing reads, and prior-fault/fuel
+guards. Expected binary64 bits are explicit constants for each rounding mode;
+the conversion helper is not used as its own oracle. All GPRs, vectors, flags,
+MXCSR, x87 controls, memory bytes and RIP/fault/fuel/stop state are compared.
+
+The new optimized `compiled_convert_guest.rs` casts an i64 buffer to binary64,
+stores its bits in place and returns a folded XOR checksum.
+`compiled_convert_native.rs` prepares signed limits and rounding-tie inputs
+with explicit expected bit patterns. It is intended to check 12 lengths,
+three alignments and two execution passes, with full-buffer/return comparisons
+and stable warm-cache usage. It currently fails at
+`Unpcklpd_xmm_xmmm128`, reported for the translation span at `0x10011c`.
+No successful compiled-conversion result is claimed. Do not alter the guest
+to avoid this compiler-generated instruction; it is the next integration gap.
+
+All 687 library tests, three integration tests, strict Clippy and release build
+pass; logs are `/tmp/macps5-cvtsi2sd-{tests,clippy,build}.log`. Reproduce with the
+release rlib/dependency flags above using `direct_cvtsi2sd_native.rs` and
+`compiled_convert_native.rs`, passing `compiled_convert_guest.rs` to the latter.
+Both verifier builds use `-Dwarnings`. Full CPU readiness and gameplay remain
+unproven.

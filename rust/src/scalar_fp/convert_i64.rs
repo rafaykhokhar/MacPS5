@@ -43,7 +43,7 @@ pub fn convert_i64_binary64(value: i64, mxcsr: u32) -> Result<FpResult, FpUnsupp
 }
 
 #[allow(unsafe_code)]
-mod abi {
+pub(super) mod abi {
     use super::*;
     use crate::legacy_cpu::Cpu;
     /// # Safety

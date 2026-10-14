@@ -596,6 +596,10 @@ pub(crate) fn translate_span(
             | Code::VEX_Vpshufd_ymm_ymmm256_imm8 => {}
             _ if scalar_vector_move(&i) => {}
             Code::Mulsd_xmm_xmmm64 | Code::VEX_Vmulsd_xmm_xmm_xmmm64 => {}
+            Code::Cvtsi2sd_xmm_rm32
+            | Code::Cvtsi2sd_xmm_rm64
+            | Code::VEX_Vcvtsi2sd_xmm_xmm_rm32
+            | Code::VEX_Vcvtsi2sd_xmm_xmm_rm64 => {}
             Code::Ldmxcsr_m32
             | Code::Stmxcsr_m32
             | Code::VEX_Vldmxcsr_m32
@@ -935,6 +939,67 @@ pub(crate) fn translate_span(
             c.context_access(0, 19, 208 + dst * 32, true, true)?;
             if !legacy {
                 c.context_access(9, 19, 216 + first * 32, true, false)?;
+                c.context_access(9, 19, 216 + dst * 32, true, true)?;
+                c.load_u64(9, 0)?;
+                c.context_access(9, 19, 224 + dst * 32, true, true)?;
+                c.context_access(9, 19, 232 + dst * 32, true, true)?;
+            }
+            continue;
+        }
+        if matches!(
+            i.code(),
+            Code::Cvtsi2sd_xmm_rm32
+                | Code::Cvtsi2sd_xmm_rm64
+                | Code::VEX_Vcvtsi2sd_xmm_xmm_rm32
+                | Code::VEX_Vcvtsi2sd_xmm_xmm_rm64
+        ) {
+            let legacy = i.encoding() == iced_x86::EncodingKind::Legacy;
+            let wide = matches!(
+                i.code(),
+                Code::Cvtsi2sd_xmm_rm64 | Code::VEX_Vcvtsi2sd_xmm_xmm_rm64
+            );
+            let dst = vector_register(i.op0_register(), 16)?;
+            let src = if legacy { 1 } else { 2 };
+            if i.op_kind(src) == OpKind::Memory {
+                memory_address(&mut c, i)?;
+                c.emit(0xaa1303e0)?;
+                c.load_u64(2, if wide { 8 } else { 4 })?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_load_v1 as *const () as u64,
+                )?;
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+                c.emit(0xaa0003e1)?;
+            } else {
+                c.context_access(1, 19, register(i.op_register(src), wide)? * 8, wide, false)?;
+            }
+            if !wide {
+                c.emit(0x93407c21)?;
+            } // sxtw x1,w1
+            c.emit(0xaa1303e0)?;
+            c.call_absolute(
+                crate::scalar_fp::native_ps5_convert_i64_binary64_v1 as *const () as u64,
+            )?;
+            c.context_access(9, 19, 152, true, false)?;
+            c.branch(
+                EXIT,
+                Branch::CompareZero {
+                    register: 9,
+                    wide: true,
+                    nonzero: true,
+                },
+            )?;
+            c.context_access(0, 19, 208 + dst * 32, true, true)?;
+            if !legacy {
+                let merge = vector_register(i.op1_register(), 16)?;
+                c.context_access(9, 19, 216 + merge * 32, true, false)?;
                 c.context_access(9, 19, 216 + dst * 32, true, true)?;
                 c.load_u64(9, 0)?;
                 c.context_access(9, 19, 224 + dst * 32, true, true)?;
