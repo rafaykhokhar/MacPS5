@@ -607,6 +607,10 @@ pub(crate) fn translate_span(
             | Code::VEX_Vpshufd_ymm_ymmm256_imm8 => {}
             _ if scalar_vector_move(&i) => {}
             Code::Mulsd_xmm_xmmm64 | Code::VEX_Vmulsd_xmm_xmm_xmmm64 => {}
+            Code::Cvttsd2si_r32_xmmm64
+            | Code::Cvttsd2si_r64_xmmm64
+            | Code::VEX_Vcvttsd2si_r32_xmmm64
+            | Code::VEX_Vcvttsd2si_r64_xmmm64 => {}
             Code::Cvtsi2sd_xmm_rm32
             | Code::Cvtsi2sd_xmm_rm64
             | Code::VEX_Vcvtsi2sd_xmm_xmm_rm32
@@ -1069,6 +1073,55 @@ pub(crate) fn translate_span(
                     c.context_access(9, 19, 232 + dst * 32, true, true)?;
                 }
             }
+            continue;
+        }
+        if matches!(
+            i.code(),
+            Code::Cvttsd2si_r32_xmmm64
+                | Code::Cvttsd2si_r64_xmmm64
+                | Code::VEX_Vcvttsd2si_r32_xmmm64
+                | Code::VEX_Vcvttsd2si_r64_xmmm64
+        ) {
+            let wide = i.op0_register().size() == 8;
+            let dst = register(i.op0_register(), wide)?;
+            if i.op1_kind() == OpKind::Memory {
+                memory_address(&mut c, i)?;
+                c.emit(0xaa1303e0)?;
+                c.load_u64(2, 8)?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_load_v1 as *const () as u64,
+                )?;
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+                c.emit(0xaa0003e1)?;
+            } else {
+                let src = vector_register(i.op1_register(), 16)?;
+                c.context_access(1, 19, 208 + src * 32, true, false)?;
+            }
+            c.emit(0xaa1303e0)?;
+            c.call_absolute(if wide {
+                crate::scalar_fp::native_ps5_truncate_i64_v1 as *const () as u64
+            } else {
+                crate::scalar_fp::native_ps5_truncate_i32_v1 as *const () as u64
+            })?;
+            c.context_access(9, 19, 152, true, false)?;
+            c.branch(
+                EXIT,
+                Branch::CompareZero {
+                    register: 9,
+                    wide: true,
+                    nonzero: true,
+                },
+            )?;
+            // The 32-bit helper returns zero-extended architectural bits.
+            c.context_access(0, 19, dst * 8, true, true)?;
             continue;
         }
         if scalar_vector_move(i) {

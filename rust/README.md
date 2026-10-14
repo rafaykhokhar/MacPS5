@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct CVTTSD2SI/VCVTTSD2SI now truncates binary64 values to signed 32/64-bit
+integers through the existing Rust model. All 2584576 native state checks pass,
+including exceptional inputs, narrow zero-extension and guarded memory.
+See [truncation evidence](../docs/status/TRANSLATOR_READINESS.md#direct-binary64-to-signed-integer-truncation).
+
 Direct UNPCKLPD/UNPCKHPD and VEX128/256 equivalents now pass 185856 native
 state checks. The unchanged compiled Rust conversion loop now passes all 72
 return/full-buffer checks with stable warm-cache usage. See

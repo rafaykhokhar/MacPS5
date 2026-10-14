@@ -2605,3 +2605,33 @@ pass. Logs are `/tmp/macps5-double-unpack-{tests,clippy,build}.log`. Reproduce
 with the release rlib/dependency flags above using `direct_double_unpack_native.rs`
 and `compiled_convert_native.rs`, passing `compiled_convert_guest.rs` to the
 latter. Both verifier compilations use `-Dwarnings`.
+
+## Direct binary64 to signed integer truncation
+
+Direct CVTTSD2SI and VEX VCVTTSD2SI now support XMM and guarded-memory binary64
+sources with signed 32/64-bit integer results. Lowering uses the existing
+integer-only Rust truncation models, checks for faults before committing the
+GPR and zero-extends the architectural 32-bit result. Memory failures occur
+before arithmetic/status changes. Vector registers are unchanged, including
+upper YMM bits for VEX forms. The reused model ignores rounding direction,
+applies DAZ to subnormal input and reports invalid/precision status. Masked
+invalid conversion returns the architectural indefinite integer; unmasked
+exceptions preserve the destination and stop at diagnostic fault 15. Reserved
+controls use diagnostic fault 14. Full guest exception delivery remains absent.
+
+`rust/verification/direct_cvttsd2si_native.rs` passes 2584576 native state checks.
+Explicit input/result/status tuples cover signed zeros, positive/negative
+fractions, subnormals, integer boundaries, out-of-range values, infinities and
+quiet/signaling NaNs. Every register/base pair, both widths and both encodings
+run across all rounding modes, FTZ/DAZ settings, invalid/precision masks,
+sticky status and reserved controls. Memory checks cover unaligned and
+last-valid reads, short spans and address overflow, including a destination
+that aliases the address base. Prior-fault and zero-fuel guards also pass.
+Checks compare all GPRs/vectors, flags, MXCSR, x87 controls, memory and
+RIP/fault/fuel/stop state; the helper under test is not the result oracle.
+
+All 687 library tests, three integration tests, strict Clippy and release build
+pass. Logs are `/tmp/macps5-cvttsd2si-{tests,clippy,build}.log`. Reproduce the
+native verifier with the release rlib/dependency flags above using
+`rust/verification/direct_cvttsd2si_native.rs` and `-Dwarnings`. This adds
+instruction-level evidence, not a new compiled workload or game result.

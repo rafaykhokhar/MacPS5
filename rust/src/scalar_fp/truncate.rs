@@ -417,7 +417,7 @@ mod tests {
 /// Prototype #XM diagnostic; full guest exception delivery remains unimplemented.
 pub const TRUNCATE_SIMD_FAULT: u64 = 15;
 #[allow(unsafe_code)]
-mod abi {
+pub(super) mod abi {
     use super::*;
     use crate::legacy_cpu::Cpu;
     /// # Safety
