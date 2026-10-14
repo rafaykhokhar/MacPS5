@@ -2635,3 +2635,34 @@ pass. Logs are `/tmp/macps5-cvttsd2si-{tests,clippy,build}.log`. Reproduce the
 native verifier with the release rlib/dependency flags above using
 `rust/verification/direct_cvttsd2si_native.rs` and `-Dwarnings`. This adds
 instruction-level evidence, not a new compiled workload or game result.
+
+## Direct scalar binary64 comparisons
+
+Direct COMISD/UCOMISD and their VEX forms now compare XMM or guarded-memory
+binary64 inputs with a new integer-only Rust model. Successful comparisons set
+ZF/PF/CF to the ordered/unordered relation and clear OF/SF/AF, preserving other
+flags. Ordered comparison raises invalid for any NaN; unordered comparison
+raises invalid only for signaling NaNs. NaN handling precedes denormal
+processing. DAZ converts subnormal operands to signed zero; otherwise they
+raise denormal status. Unmasked exceptions publish MXCSR while preserving
+flags and stop at diagnostic fault 15. Reserved controls use fault 14.
+Memory failures preserve both flags and MXCSR. These rules follow the
+[Intel instruction reference](https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-2b-manual.pdf)
+and [exception priority rules](https://www.intel.com/content/dam/develop/external/us/en/documents-tps/253665-sdm-vol-11.pdf).
+
+`rust/verification/direct_comisd_native.rs` passes 714176 native state checks.
+Explicit cases cover positive/negative ordering, infinities, signed-zero
+equality, quiet/signaling NaNs, NaN/denormal priority and DAZ-dependent
+relations. Every register/base pair and all four forms run with masked and
+unmasked controls, sticky flags, unaligned/last-valid/short/overflowing memory
+reads and prior-fault/zero-fuel guards. Every vector, GPR, flags, MXCSR, x87
+controls, memory and RIP/fault/fuel/stop state is compared. A separate model
+test compares 20000 deterministic normal finite pairs against host f64
+comparisons and checks reflexive equality for each first operand. This is
+independent finite-order evidence, not an x86 hardware exception oracle.
+
+All 689 library tests, three integration tests, strict Clippy and release build
+pass. Logs are `/tmp/macps5-comisd-{tests,clippy,build}.log`. Reproduce the native
+verifier with the release rlib/dependency flags above using
+`rust/verification/direct_comisd_native.rs` and `-Dwarnings`. Full guest
+exception delivery, complete FP coverage and PS5 gameplay remain unfinished.

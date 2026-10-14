@@ -5,6 +5,8 @@
 //! Chosen guest feature policy supports DAZ, therefore valid bits are0..15.
 use crate::legacy_cpu::Cpu;
 mod arithmetic;
+mod compare;
+pub use compare::{compare_binary64, native_compare_binary64};
 mod convert_i64;
 mod fma;
 pub use convert_i64::abi::native_ps5_convert_i64_binary64_v1;

@@ -1,5 +1,10 @@
 # Rust migration
 
+Direct COMISD/UCOMISD and VEX equivalents now use an integer-only Rust
+comparison model with guest exception controls. All 714176 native state
+checks pass, plus finite ordering checks against 20000 host comparison pairs.
+See [comparison evidence](../docs/status/TRANSLATOR_READINESS.md#direct-scalar-binary64-comparisons).
+
 Direct CVTTSD2SI/VCVTTSD2SI now truncates binary64 values to signed 32/64-bit
 integers through the existing Rust model. All 2584576 native state checks pass,
 including exceptional inputs, narrow zero-extension and guarded memory.

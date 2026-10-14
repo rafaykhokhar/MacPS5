@@ -607,6 +607,10 @@ pub(crate) fn translate_span(
             | Code::VEX_Vpshufd_ymm_ymmm256_imm8 => {}
             _ if scalar_vector_move(&i) => {}
             Code::Mulsd_xmm_xmmm64 | Code::VEX_Vmulsd_xmm_xmm_xmmm64 => {}
+            Code::Comisd_xmm_xmmm64
+            | Code::Ucomisd_xmm_xmmm64
+            | Code::VEX_Vcomisd_xmm_xmmm64
+            | Code::VEX_Vucomisd_xmm_xmmm64 => {}
             Code::Cvttsd2si_r32_xmmm64
             | Code::Cvttsd2si_r64_xmmm64
             | Code::VEX_Vcvttsd2si_r32_xmmm64
@@ -1122,6 +1126,66 @@ pub(crate) fn translate_span(
             )?;
             // The 32-bit helper returns zero-extended architectural bits.
             c.context_access(0, 19, dst * 8, true, true)?;
+            continue;
+        }
+        if matches!(
+            i.code(),
+            Code::Comisd_xmm_xmmm64
+                | Code::Ucomisd_xmm_xmmm64
+                | Code::VEX_Vcomisd_xmm_xmmm64
+                | Code::VEX_Vucomisd_xmm_xmmm64
+        ) {
+            if i.op1_kind() == OpKind::Memory {
+                memory_address(&mut c, i)?;
+                c.emit(0xaa1303e0)?;
+                c.load_u64(2, 8)?;
+                c.call_absolute(
+                    crate::guest_memory::ffi::native_ps5_module_load_v1 as *const () as u64,
+                )?;
+                c.context_access(9, 19, 152, true, false)?;
+                c.branch(
+                    EXIT,
+                    Branch::CompareZero {
+                        register: 9,
+                        wide: true,
+                        nonzero: true,
+                    },
+                )?;
+                c.emit(0xaa0003e2)?;
+            } else {
+                c.context_access(
+                    2,
+                    19,
+                    208 + vector_register(i.op1_register(), 16)? * 32,
+                    true,
+                    false,
+                )?;
+            }
+            c.context_access(
+                1,
+                19,
+                208 + vector_register(i.op0_register(), 16)? * 32,
+                true,
+                false,
+            )?;
+            c.emit(0xaa1303e0)?;
+            c.load_u64(
+                3,
+                u64::from(matches!(
+                    i.mnemonic(),
+                    Mnemonic::Ucomisd | Mnemonic::Vucomisd
+                )),
+            )?;
+            c.call_absolute(crate::scalar_fp::native_compare_binary64 as *const () as u64)?;
+            c.context_access(9, 19, 152, true, false)?;
+            c.branch(
+                EXIT,
+                Branch::CompareZero {
+                    register: 9,
+                    wide: true,
+                    nonzero: true,
+                },
+            )?;
             continue;
         }
         if scalar_vector_move(i) {
